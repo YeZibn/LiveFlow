@@ -1,0 +1,75 @@
+name: liveflow
+
+# 中间件端口只映射到宿主机的回环地址，供本地运行的后端使用。
+services:
+  mysql:
+    image: mysql:8.4.13
+    environment:
+      MYSQL_DATABASE: ${LIVEFLOW_MYSQL_DATABASE:-liveflow}
+      MYSQL_USER: ${LIVEFLOW_MYSQL_USER:-liveflow}
+      MYSQL_PASSWORD: ${LIVEFLOW_MYSQL_PASSWORD:-liveflow_dev}
+      MYSQL_ROOT_PASSWORD: ${LIVEFLOW_MYSQL_ROOT_PASSWORD:-liveflow_root_dev}
+    ports:
+      - "127.0.0.1:${LIVEFLOW_MYSQL_PORT:-13306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 用应用账户通过 TCP 执行查询，确认数据库初始化完成。$$ 将变量展开留给容器内的 shell。
+      test: ["CMD-SHELL", 'MYSQL_PWD="$$MYSQL_PASSWORD" mysql --protocol=TCP -h 127.0.0.1 -u "$$MYSQL_USER" "$$MYSQL_DATABASE" -e "SELECT 1" >/dev/null']
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  redis:
+    image: redis:8.2.11-alpine
+    # AOF 写入挂载的数据卷，容器重建后可恢复已持久化的数据。
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:${LIVEFLOW_REDIS_PORT:-16379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:4.3.2
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      # 本地 KRaft 单节点同时承担 broker 和 controller 角色。
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:29093
+      # Kafka 会把这些地址返回给客户端。容器使用服务名，宿主机使用映射端口。
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:${LIVEFLOW_KAFKA_PORT:-19092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # 集群只有一个 broker，内部 Topic 的副本数也设为 1。
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # 由应用或运维显式建 Topic，以便指定分区和副本数。
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    ports:
+      - "127.0.0.1:${LIVEFLOW_KAFKA_PORT:-19092}:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 10s
+      timeout: 8s
+      retries: 10
+      start_period: 30s
+
+volumes:
+  mysql-data:
+  redis-data:
+  kafka-data:

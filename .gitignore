@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+*.iml
+.vscode/
+.devtools/
+*.log
+target/
+node_modules/
+dist/
+*.tsbuildinfo

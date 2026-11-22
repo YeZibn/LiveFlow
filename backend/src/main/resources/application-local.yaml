@@ -1,0 +1,10 @@
+management:
+  endpoint:
+    health:
+      # 开发检查页用组件状态区分 MySQL、Redis 和 Kafka 的连接问题。
+      show-components: always
+
+liveflow:
+  local:
+    # WebSocket 握手允许的页面来源，需与开发前端实际使用的协议、主机和端口一致。
+    frontend-origin: ${LIVEFLOW_FRONTEND_ORIGIN:http://127.0.0.1:5173}
