@@ -1,0 +1,41 @@
+# 本地后端默认只监听回环地址，并使用独立的 18080 端口，减少与其他开发服务的冲突。
+server:
+  address: ${LIVEFLOW_BIND_ADDRESS:127.0.0.1}
+  port: ${LIVEFLOW_PORT:18080}
+
+spring:
+  application:
+    name: liveflow
+  # 后端运行在宿主机，使用 Compose 映射到宿主机的端口连接 MySQL、Redis 和 Kafka。
+  datasource:
+    url: jdbc:mysql://${LIVEFLOW_MYSQL_HOST:127.0.0.1}:${LIVEFLOW_MYSQL_PORT:13306}/${LIVEFLOW_MYSQL_DATABASE:liveflow}
+    username: ${LIVEFLOW_MYSQL_USER:liveflow}
+    password: ${LIVEFLOW_MYSQL_PASSWORD:liveflow_dev}
+    hikari:
+      # 从连接池获取数据库连接最多等待 3 秒，单位为毫秒。
+      connection-timeout: 3000
+  data:
+    redis:
+      host: ${LIVEFLOW_REDIS_HOST:127.0.0.1}
+      port: ${LIVEFLOW_REDIS_PORT:16379}
+      connect-timeout: 2s
+      timeout: 2s
+  kafka:
+    # 可覆盖完整的 broker 地址列表，本地默认连接 Kafka 的 EXTERNAL 监听器。
+    bootstrap-servers: ${LIVEFLOW_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:${LIVEFLOW_KAFKA_PORT:19092}}
+
+# 健康接口用于探活，响应隐藏异常和底层连接信息。
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
+liveflow:
+  auth:
+    # 使用部署环境注入的 Base64 随机密钥，解码后至少 32 字节。
+    signing-key: ${LIVEFLOW_JWT_SIGNING_KEY:}
+    secure-cookie: true

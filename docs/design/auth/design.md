@@ -1,0 +1,71 @@
+# 登录认证 V1 设计
+
+## 背景、目标与范围
+
+LiveFlow 的 Vue 客户端需要在页面重新打开后恢复登录，并在用户换设备或退出时阻止旧会话发起新的受保护请求。本模块为已有账号提供密码登录、HTTP 鉴权、续期、当前用户查询和退出。WebSocket Ticket 与长连接认证归入后续实时连接设计。
+
+## 方案选择与设计思路
+
+- **JWT 与服务端会话共同鉴权。** JWT 用于 HTTP Bearer 调用，Redis 提供账号当前会话的权威状态。每次受保护请求多一次 Redis 查询，从而能在旧 Access Token 尚未过期时识别会话替换或撤销。Redis 不可用时，受保护请求拒绝放行。
+- **账号与会话分别存储。** MySQL 持久化账号和密码哈希，按用户名读取登录所需数据。Redis 管理会话到期和原子变更，让多个应用实例按同一份当前状态判断登录有效性。
+- **Access Token 与 Refresh Token 分工。** 前端在内存中持有短期 Access Token，通过 Refresh Cookie 恢复登录并续期。续期轮换 Refresh Token，服务端保留同一会话内的已消费凭证记录，用于识别重放。凭证格式和时长见 [凭证与 Redis 会话](session.md#凭证格式)。
+- **单登录按会话裁决。** 用户在另一台设备完成密码登录时，可以直接接管当前会话。同一浏览器的多个标签页可以共享这一会话。退出绑定页面所指的会话，避免旧页面的动作撤销新登录。
+
+## MVC 分层
+
+后端在同一个 Spring Boot 应用内按业务模块组织。认证模块内部使用 Spring MVC、Service 和 Repository 分层，Vue 提供视图。
+
+| 层 | 组件 | 职责 |
+| --- | --- | --- |
+| Security | `SecurityFilterChain`、JWT 和会话校验 | 在进入 MVC 前校验 Bearer 凭证和适用的 CSRF 规则，将认证身份写入安全上下文 |
+| Controller | `AuthController`、请求和响应 DTO | 处理请求格式、Cookie 和 HTTP 响应，调用 Service，从安全上下文获取当前用户身份 |
+| Service | `AuthService`、`AccessTokenService` | 编排密码认证、会话替换、刷新和退出，签发 Access Token |
+| Repository | `UserMapper`、`AuthSessionRepository` | 通过 MyBatis-Plus 读取 MySQL 账号，通过 Redis Lua 执行原子会话变更 |
+| View | Vue | 在内存维护 Access Token 和会话标识，协调跨标签页认证请求，展示登录状态 |
+
+Controller 异常处理和 Spring Security 过滤器错误处理共用 [错误响应约定](api.md#错误响应)。MySQL 是用户账号和密码哈希的权威来源，Redis 是账号当前登录会话的权威来源。
+
+## 业务规则与状态
+
+| 规则 | 对外行为 |
+| --- | --- |
+| 一个账号只有一个当前会话 | 最后一次成功写入 Redis 的登录生效。密码错误的登录不影响当前会话。 |
+| 刷新保留当前会话 | 刷新沿用原会话 ID 和绝对截止时间。该会话内仍有效的旧 Access Token 可以继续使用。 |
+| 退出或撤销作用于指定会话 | 该会话在下一次鉴权时失效。已通过鉴权的在途请求可以完成。 |
+
+## 端到端流程
+
+### 登录与受保护请求
+
+1. Vue 获取 CSRF Cookie，提交账号密码。登录按账号和请求来源限流，凭证校验失败使用统一提示。
+2. 后端按规范化用户名查询 MySQL，由 Spring Security 使用 Argon2id 校验密码。认证通过后生成新会话，由 Redis 原子替换当前会话。
+3. Redis 写入确认后，后端返回 Access Token 和 Refresh Cookie。Vue 将 Access Token 留在内存中。
+4. 调用受保护接口时，Spring Security 先验证 JWT，再查 Redis 当前会话。身份验证通过后交给 MVC。当前用户接口按该身份的用户 ID 查询 MySQL。
+
+### 页面恢复与刷新
+
+1. Vue 重新打开页面时先初始化 CSRF，再通过浏览器携带的 Refresh Cookie 尝试恢复登录。Access Token 到期时也走同一个刷新入口。
+2. 服务端校验凭证所属会话仍然有效，在 Redis 中原子轮换 Refresh Token。刷新保留原登录期限。
+3. 轮换成功后返回新的 Access Token 和 Refresh Cookie。到达原登录期限后，用户需重新登录。
+
+### 退出
+
+1. Vue 提交页面正在操作的 `sessionId`，由浏览器携带 Refresh Cookie。Access Token 到期后仍可使用属于该会话的可识别 Refresh Token 退出。
+2. 后端确认退出目标、Cookie 和 Redis 当前会话一致，再原子删除会话。
+3. 删除确认后返回退出成功并清除 Refresh Cookie。Vue 清理与退出目标对应的内存状态。
+
+## 失败与并发
+
+- Redis 不可用时，受保护请求及依赖 Redis 的认证操作返回暂不可用。登录或退出发生结果不确定的故障时，服务端不确认成功。
+- Vue 对跨标签页的登录、刷新和退出使用同一把锁。刷新响应丢失且结果不确定时，引导重新登录，避免自动用旧凭证再次刷新。
+- **换设备后的旧请求。** 旧设备的 JWT 在下一次鉴权时被拒绝。旧设备的刷新、退出只可能作用于旧会话，保留新设备会话。前端只清理与失败请求对应的本地状态。
+- **重复刷新。** 同一 Refresh Token 最多成功换发一次。第二次提交若命中当前会话的已消费记录，撤销该会话，第一次换发的凭证也随之失效。
+- **刷新与退出竞争。** 刷新先提交时，退出仍可用该会话中已消费但可识别的凭证完成撤销。若旧标签页发起退出时浏览器 Cookie 已切到新会话，拒绝该请求并保留新会话和 Cookie，具体响应见 [退出接口](api.md#退出)。
+
+## 专业文档
+
+| 配套文档 | 定义内容 |
+| --- | --- |
+| [HTTP 接口](api.md) | 路由、请求与响应字段、Cookie、CSRF、错误码及前端处理 |
+| [MySQL 用户表](database.md) | `users` 字段、索引及查询路径 |
+| [凭证与 Redis 会话](session.md) | JWT Claims、Refresh Token 格式、Redis 字段、原子操作及状态转换 |

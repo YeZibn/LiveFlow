@@ -1,5 +1,5 @@
 import { createApp } from 'vue'
 import App from './App.vue'
 
-// 将开发检查页挂载到 index.html 中的 #app，页面挂载后开始检查服务。
+// 挂载应用。认证入口恢复登录，开发检查入口按需检查服务。
 createApp(App).mount('#app')
