@@ -2,6 +2,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
 import { authClient } from '../auth/authClient'
+import MyRoom from '../room/MyRoom.vue'
 import { avatarOptions, readProfile, saveProfile, type ProfileForm, type UserProfile } from './profileClient'
 
 const props = defineProps<{
@@ -175,6 +176,7 @@ async function submitProfile() {
       <p class="ui-feedback ui-feedback--error" role="alert">{{ error }}</p>
       <button class="ui-button" type="button" :disabled="loading || authBusy" @click="loadProfile">重试读取</button>
     </template>
+    <MyRoom :with-access="withAccess" :auth-busy="authBusy" />
   </section>
 </template>
 

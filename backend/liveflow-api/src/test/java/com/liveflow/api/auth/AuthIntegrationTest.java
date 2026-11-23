@@ -2,6 +2,7 @@ package com.liveflow.api.auth;
 
 import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.profile.service.UserProfileService;
+import com.liveflow.core.room.mapper.RoomMapper;
 import com.liveflow.infrastructure.auth.AuthSessionRepository;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -53,6 +54,8 @@ class AuthIntegrationTest {
     private static final String REGISTRATION_SOURCE = "liveflow:auth:registration:source:127.0.0.1";
     private static final String REGISTRATION_PASSWORD = "Abcdefg1!_";
     private static final String PROFILE_PATH = "/api/v1/users/me/profile";
+    private static final String ROOM_CREATE_PATH = "/api/v1/rooms";
+    private static final String ROOM_READ_PATH = "/api/v1/users/me/room";
     private static final byte[] KEY = new SecureRandom().generateSeed(32);
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
@@ -70,6 +73,7 @@ class AuthIntegrationTest {
     @Autowired JsonMapper json;
     @MockitoSpyBean AuthSessionRepository sessions;
     @MockitoSpyBean UserProfileService profiles;
+    @MockitoSpyBean RoomMapper rooms;
     @LocalServerPort int port;
 
     String username;
@@ -91,6 +95,7 @@ class AuthIntegrationTest {
     @AfterEach
     void removeAccount() {
         redis.delete("liveflow:auth:session:{" + userId + "}");
+        jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", userId);
         jdbc.update("DELETE FROM users WHERE id = ?", userId);
         for (String name : registeredNames) {
             for (Long id : jdbc.queryForList("SELECT id FROM users WHERE username = ?", Long.class, name)) {
@@ -416,6 +421,123 @@ class AuthIntegrationTest {
         String bearer = access(browser.login());
         doThrow(new DataAccessResourceFailureException("test")).when(profiles).read(userId);
         failure(browser.sendPath("GET", PROFILE_PATH, null, bearer, false), 503, "PROFILE_SERVICE_UNAVAILABLE");
+    }
+
+    @Test
+    void roomValidatesInputAndPersistsNormalizedTitle() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        assertThat(roomResponse(browser.sendPath("GET", ROOM_READ_PATH, null, bearer, false), 200)
+                .get("room").isNull()).isTrue();
+        for (String body : List.of("{}", "null", "[]", "{", "{\"title\":null}", "{\"title\":42}",
+                "{\"title\":\"room\",\"ownerUserId\":42}", "{\"title\":\"a\",\"title\":\"b\"}",
+                "{\"title\":\"a\"}{}", roomBody("　 "), roomBody("\n房间"), roomBody("房间\u0080"),
+                roomBody("房\u2028间"), roomBody("🎥".repeat(41)))) {
+            failure(browser.sendPath("POST", ROOM_CREATE_PATH, body, bearer, true), 400, "INVALID_REQUEST");
+        }
+        assertThat(roomCount(userId)).isZero();
+        String title = "🎥".repeat(40);
+        JsonNode created = roomResponse(browser.sendPath("POST", ROOM_CREATE_PATH,
+                roomBody("　" + title + " "), bearer, true), 201);
+        assertThat(created.get("title").asString()).isEqualTo(title);
+        assertThat(created.get("roomId").isString()).isTrue();
+        assertThat(created.get("roomId").asString()).matches("[1-9][0-9]*");
+        assertThat(created.get("createdAt").asString()).matches(".+\\.\\d{3}Z");
+        assertThat(roomResponse(browser.sendPath("GET", ROOM_READ_PATH, null, bearer, false), 200).get("room"))
+                .isEqualTo(created);
+        assertThat(roomCount(userId)).isOne();
+    }
+
+    @Test
+    void roomRequiresCurrentSessionAndCsrf() throws Exception {
+        var browser = new Browser();
+        String oldBearer = access(browser.login());
+        failure(browser.sendPath("GET", ROOM_READ_PATH, null, null, false), 401, "AUTH_REQUIRED");
+        failure(browser.sendPath("POST", ROOM_CREATE_PATH, roomBody("间"), null, true), 401, "AUTH_REQUIRED");
+        failure(browser.sendPath("POST", ROOM_CREATE_PATH, roomBody("间"), oldBearer, false), 403, "AUTH_CSRF_INVALID");
+        var current = new Browser();
+        String currentBearer = access(current.login());
+        failure(browser.sendPath("POST", ROOM_CREATE_PATH, roomBody("间"), oldBearer, true),
+                401, "AUTH_SESSION_REPLACED");
+        assertThat(roomCount(userId)).isZero();
+        assertThat(roomResponse(current.sendPath("POST", ROOM_CREATE_PATH, roomBody("间"), currentBearer, true), 201)
+                .get("title").asString()).isEqualTo("间");
+    }
+
+    @Test
+    void roomConcurrentCreatesKeepOneWinnerAndAllowSameTitleForOtherAccount() throws Exception {
+        var first = new Browser();
+        String bearer = access(first.login());
+        var second = new Browser();
+        second.csrf();
+        String otherName = username + "_room";
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?",
+                otherName, userId);
+        long otherId = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, otherName);
+        try {
+            var start = new CyclicBarrier(2);
+            JsonNode winner;
+            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                var attempts = executor.<HttpResponse<String>>invokeAll(List.of(
+                        () -> {
+                            start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                            return first.sendPath("POST", ROOM_CREATE_PATH, roomBody("第一个名称"), bearer, true);
+                        },
+                        () -> {
+                            start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                            return second.sendPath("POST", ROOM_CREATE_PATH, roomBody("第二个名称"), bearer, true);
+                        }));
+                var left = attempts.get(0).get();
+                var right = attempts.get(1).get();
+                assertThat(List.of(left.statusCode(), right.statusCode())).containsExactlyInAnyOrder(201, 409);
+                boolean leftWon = left.statusCode() == 201;
+                winner = roomResponse(leftWon ? left : right, 201);
+                assertThat(winner.get("title").asString()).isEqualTo(leftWon ? "第一个名称" : "第二个名称");
+                failure(leftWon ? right : left, 409, "ROOM_ALREADY_EXISTS");
+            }
+            assertThat(roomCount(userId)).isOne();
+            var other = new Browser();
+            String otherBearer = access(other.login(otherName));
+            assertThat(roomResponse(other.sendPath("GET", ROOM_READ_PATH, null, otherBearer, false), 200)
+                    .get("room").isNull()).isTrue();
+            JsonNode sameTitle = roomResponse(other.sendPath("POST", ROOM_CREATE_PATH,
+                    roomBody(winner.get("title").asString()), otherBearer, true), 201);
+            assertThat(sameTitle.get("roomId")).isNotEqualTo(winner.get("roomId"));
+            assertThat(roomResponse(first.sendPath("GET", ROOM_READ_PATH, null, bearer, false), 200).get("room"))
+                    .isEqualTo(winner);
+            assertThat(roomResponse(other.sendPath("GET", ROOM_READ_PATH, null, otherBearer, false), 200).get("room"))
+                    .isEqualTo(sameTitle);
+        } finally {
+            redis.delete("liveflow:auth:session:{" + otherId + "}");
+            jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", otherId);
+            jdbc.update("DELETE FROM users WHERE id = ?", otherId);
+        }
+    }
+
+    @Test
+    void roomStorageFailureMapsTo503AndFailedReadBackRollsBackInsert() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        doThrow(new DataAccessResourceFailureException("test")).when(rooms).find(userId);
+        failure(browser.sendPath("GET", ROOM_READ_PATH, null, bearer, false), 503, "ROOM_SERVICE_UNAVAILABLE");
+        failure(browser.sendPath("POST", ROOM_CREATE_PATH, roomBody("房间"), bearer, true),
+                503, "ROOM_SERVICE_UNAVAILABLE");
+        assertThat(roomCount(userId)).isZero();
+    }
+
+    private String roomBody(String title) {
+        return json.writeValueAsString(Map.of("title", title));
+    }
+
+    private int roomCount(long ownerId) {
+        return jdbc.queryForObject("SELECT COUNT(*) FROM rooms WHERE owner_user_id = ?", Integer.class, ownerId);
+    }
+
+    private JsonNode roomResponse(HttpResponse<String> response, int status) {
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(status);
+        assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
+        return json.readTree(response.body());
     }
 
     private String profileBody(String nickname, String avatarKey, String bio) {
