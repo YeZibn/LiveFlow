@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import ProfileView from '../profile/ProfileView.vue'
 import { useAuth } from './useAuth'
 
 const username = ref('')
 const password = ref('')
-const { user, loggedIn, restoring, busy, error, restoreFailed, restore, login, logout } = useAuth()
+const { loggedIn, restoring, busy, error, restoreFailed, sessionId, restore, login, logout, withAccess } = useAuth()
 const showDev = import.meta.env.DEV
 
 /** 提交输入并立即清除组件中的明文密码。 */
@@ -23,21 +24,12 @@ async function submit() {
     </header>
 
     <main class="auth-main">
-      <section class="panel" aria-labelledby="auth-title" :aria-busy="busy || restoring">
+      <ProfileView v-if="!restoring && loggedIn" :key="sessionId" :with-access="withAccess"
+        :auth-busy="busy" :auth-error="error" @logout="logout" />
+      <section v-else class="panel" aria-labelledby="auth-title" :aria-busy="busy || restoring">
         <template v-if="restoring">
           <h1 id="auth-title">正在恢复登录</h1>
           <p role="status">正在检查当前会话…</p>
-        </template>
-        <template v-else-if="loggedIn && user">
-          <h1 id="auth-title">你好，{{ user.username }}</h1>
-          <dl class="account"><dt>用户 ID</dt><dd>{{ user.userId }}</dd></dl>
-          <p v-if="error" class="error" role="alert">{{ error }}</p>
-          <div class="actions">
-            <button type="button" class="secondary" :disabled="busy" @click="restore">刷新登录状态</button>
-            <button type="button" class="primary" :disabled="busy" @click="logout">
-              {{ busy ? '正在退出…' : '退出登录' }}
-            </button>
-          </div>
         </template>
         <template v-else>
           <h1 id="auth-title">登录 LiveFlow</h1>
@@ -107,7 +99,7 @@ async function submit() {
 h1 { margin: 0 0 1.6rem; font-size: 1.85rem; line-height: 1.25; overflow-wrap: anywhere; }
 form, .field { display: grid; gap: 0.6rem; }
 form { gap: 1.2rem; }
-label, dt { font-size: 0.9rem; font-weight: 650; }
+label { font-size: 0.9rem; font-weight: 650; }
 input { box-sizing: border-box; width: 100%; padding: 0.68rem 0.75rem; border: 1px solid #b7c6d9; border-radius: 0.45rem; color: inherit; font: inherit; }
 button { min-height: 2.65rem; padding: 0.55rem 0.85rem; font: inherit; font-weight: 650; border-radius: 0.45rem; cursor: pointer; }
 .primary { background: #245cbd; border: 1px solid #245cbd; color: #fff; }
@@ -115,7 +107,4 @@ button { min-height: 2.65rem; padding: 0.55rem 0.85rem; font: inherit; font-weig
 button:disabled { opacity: 0.65; cursor: wait; }
 :focus-visible { outline: 2px solid #2464d1; outline-offset: 3px; }
 .error { margin: 0; padding: 0.65rem; border-radius: 0.4rem; background: #fff1ef; color: #97281f; }
-.account { display: flex; gap: 1rem; margin: 0 0 1.6rem; }
-.account dd { margin: 0; overflow-wrap: anywhere; }
-.actions { display: flex; flex-wrap: wrap; gap: 0.65rem; margin-top: 1.2rem; }
 </style>

@@ -1,0 +1,215 @@
+<script setup lang="ts">
+import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { ApiRequestError } from '../api/requestJson'
+import { authClient } from '../auth/authClient'
+import { avatarOptions, readProfile, saveProfile, type ProfileForm, type UserProfile } from './profileClient'
+
+const props = defineProps<{
+  withAccess: <T>(call: (access: string) => Promise<T>) => Promise<T>
+  authBusy: boolean
+  authError: string
+}>()
+const emit = defineEmits<{ logout: [] }>()
+
+const profile = ref<UserProfile>()
+const draft = ref<ProfileForm>()
+const loading = ref(false)
+const saving = ref(false)
+const error = ref('')
+const fieldErrors = ref<Record<string, string>>({})
+const uncertain = ref(false)
+const confirmed = ref(false)
+let active = true
+
+onMounted(() => void loadProfile())
+onBeforeUnmount(() => { active = false })
+
+/**
+ * 读取当前会话的资料。确认超时的保存结果时保留编辑草稿。
+ * @returns 成功、失败或会话结束后的处理结果
+ */
+async function loadProfile() {
+  loading.value = true
+  error.value = ''
+  try {
+    const current = await props.withAccess(readProfile)
+    // 同会话校验由认证层完成。这里只为仍挂载的主页更新状态。
+    if (active) {
+      profile.value = current
+      confirmed.value = uncertain.value && Boolean(draft.value)
+      uncertain.value = false
+    }
+  } catch (cause) {
+    if (active) {
+      error.value = cause instanceof ApiRequestError ? cause.message : '读取资料失败，请重试。'
+    }
+  } finally {
+    loading.value = false
+  }
+}
+
+/** 从最近读取的资料生成独立草稿，取消编辑时可直接丢弃。 */
+function startEditing() {
+  if (!profile.value) return
+  const { nickname, avatarKey, bio } = profile.value
+  draft.value = { nickname, avatarKey, bio }
+}
+
+/** 清除草稿和编辑反馈，并保留最近一次确认的服务端资料。 */
+function closeEditor() {
+  draft.value = undefined
+  error.value = ''
+  fieldErrors.value = {}
+  uncertain.value = false
+  confirmed.value = false
+}
+
+/**
+ * 保存当前草稿，使用同一个输入快照完成可能发生的令牌续期重发。
+ * @returns 成功更新展示或保留草稿和失败提示后完成
+ */
+async function submitProfile() {
+  if (!draft.value || saving.value || loading.value || props.authBusy) return
+  const submitted = { ...draft.value }
+  saving.value = true
+  error.value = ''
+  fieldErrors.value = {}
+  uncertain.value = false
+  confirmed.value = false
+  try {
+    const saved = await props.withAccess(access => saveProfile(access, submitted))
+    if (active) {
+      profile.value = saved
+      closeEditor()
+    }
+  } catch (cause) {
+    if (!active) return
+    if (cause instanceof ApiRequestError) {
+      fieldErrors.value = cause.fieldErrors ?? {}
+      uncertain.value = cause.status === 0 || cause.code === 'PROFILE_SERVICE_UNAVAILABLE' || cause.code === 'HTTP_ERROR'
+      error.value = uncertain.value ? '无法确认资料是否已保存，可以先读取当前资料。' : cause.message
+      if (cause.code === 'AUTH_CSRF_INVALID') {
+        // 只重新获取 CSRF。保存由用户再次提交，保留此次失败的表单。
+        await authClient.csrf().catch(() => undefined)
+      }
+    } else {
+      error.value = '保存资料失败，请重试。'
+    }
+  } finally {
+    saving.value = false
+  }
+}
+</script>
+
+<template>
+  <section class="profile-panel" aria-labelledby="profile-title">
+    <header class="profile-header">
+      <h1 id="profile-title">个人主页</h1>
+      <button type="button" :disabled="authBusy" @click="emit('logout')">
+        {{ authBusy ? '正在退出…' : '退出登录' }}
+      </button>
+    </header>
+
+    <p v-if="authError" class="error" role="alert">{{ authError }}</p>
+    <p v-if="loading && !profile" role="status">正在读取资料…</p>
+    <template v-if="profile">
+      <div class="identity">
+        <span class="avatar" :data-avatar="profile.avatarKey" aria-hidden="true">{{ [...profile.displayName][0] }}</span>
+        <div>
+          <h2>{{ profile.displayName }}</h2>
+          <p class="username">用户名 {{ profile.username }}</p>
+        </div>
+      </div>
+
+      <template v-if="!draft">
+        <dl>
+          <div><dt>用户 ID</dt><dd>{{ profile.userId }}</dd></div>
+          <div><dt>个人简介</dt><dd class="bio">{{ profile.bio || '尚未填写简介' }}</dd></div>
+        </dl>
+        <button type="button" class="primary" :disabled="authBusy" @click="startEditing">编辑资料</button>
+      </template>
+
+      <form v-else @submit.prevent="submitProfile">
+        <fieldset class="edit-fields" :disabled="saving || loading || authBusy">
+          <div class="field">
+            <label for="nickname">昵称</label>
+            <input id="nickname" v-model="draft.nickname" placeholder="留空使用登录用户名"
+              :aria-invalid="Boolean(fieldErrors.nickname)" :aria-describedby="fieldErrors.nickname ? 'nickname-error' : undefined" />
+            <p v-if="fieldErrors.nickname" id="nickname-error" class="field-error">{{ fieldErrors.nickname }}</p>
+          </div>
+          <fieldset class="field avatars" :aria-describedby="fieldErrors.avatarKey ? 'avatar-error' : undefined">
+            <legend>头像</legend>
+            <div class="avatar-options">
+              <label v-for="option in avatarOptions" :key="option.key" class="avatar-option">
+                <input v-model="draft.avatarKey" type="radio" name="profile-avatar" :value="option.key" />
+                <span class="avatar swatch" :data-avatar="option.key" aria-hidden="true"></span>
+                {{ option.label }}
+              </label>
+            </div>
+            <p v-if="fieldErrors.avatarKey" id="avatar-error" class="field-error">{{ fieldErrors.avatarKey }}</p>
+          </fieldset>
+          <div class="field">
+            <label for="bio">个人简介</label>
+            <textarea id="bio" v-model="draft.bio" rows="4" placeholder="最多 160 个字符"
+              :aria-invalid="Boolean(fieldErrors.bio)" :aria-describedby="fieldErrors.bio ? 'bio-error' : undefined" />
+            <p v-if="fieldErrors.bio" id="bio-error" class="field-error">{{ fieldErrors.bio }}</p>
+          </div>
+        </fieldset>
+        <p v-if="error" class="error" role="alert">{{ error }}</p>
+        <div v-if="confirmed" class="confirmed" role="status">
+          <strong>已重新读取当前资料</strong>
+          <p>{{ profile.displayName }} · {{ avatarOptions.find(option => option.key === profile?.avatarKey)?.label }}头像</p>
+          <p class="bio">{{ profile.bio || '尚未填写简介' }}</p>
+        </div>
+        <div class="actions">
+          <button type="submit" class="primary" :disabled="saving || loading || authBusy">
+            {{ saving ? '正在保存…' : '保存资料' }}
+          </button>
+          <button type="button" :disabled="saving || loading || authBusy" @click="closeEditor">取消</button>
+          <button v-if="uncertain" type="button" :disabled="loading || saving || authBusy" @click="loadProfile">
+            {{ loading ? '正在读取…' : '重新读取资料' }}
+          </button>
+        </div>
+      </form>
+    </template>
+    <template v-else-if="error">
+      <p class="error" role="alert">{{ error }}</p>
+      <button type="button" :disabled="loading || authBusy" @click="loadProfile">重试读取</button>
+    </template>
+  </section>
+</template>
+
+<style scoped>
+.profile-panel { box-sizing: border-box; width: min(100%, 41rem); padding: clamp(1.4rem, 5vw, 2.4rem); background: white; border: 1px solid #dfe6ef; border-radius: 1rem; }
+.profile-header, .identity { display: flex; align-items: center; gap: 1rem; }
+.profile-header { justify-content: space-between; margin-bottom: 1.5rem; }
+h1, h2, p, dd { margin: 0; }
+h1 { font-size: 1.5rem; }
+h2, dd { overflow-wrap: anywhere; }
+.identity { padding-block: 0.6rem; }
+.username { color: #536781; margin-top: 0.25rem; }
+.avatar { display: grid; flex-shrink: 0; place-items: center; width: 3.5rem; height: 3.5rem; border-radius: 50%; background: #e6ebf2; color: #2b4262; font-size: 1.3rem; font-weight: 700; }
+.avatar[data-avatar="blue"] { background: #dbeaff; color: #184c9c; }
+.avatar[data-avatar="green"] { background: #d9f3e6; color: #145741; }
+.avatar[data-avatar="orange"] { background: #ffe7cb; color: #824714; }
+dl, form, .edit-fields, .field { display: grid; gap: 0.9rem; }
+dl { padding-block: 1rem; border-block: 1px solid #e4ebf4; }
+dt { font-weight: 650; margin-bottom: 0.25rem; }
+.bio { white-space: pre-wrap; overflow-wrap: anywhere; }
+form { margin-top: 1.2rem; }
+fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
+label, legend { font-weight: 650; }
+input:not([type="radio"]), textarea { box-sizing: border-box; width: 100%; padding: 0.65rem; font: inherit; color: inherit; border: 1px solid #b7c6d9; border-radius: 0.45rem; }
+textarea { resize: vertical; }
+.avatar-options, .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; }
+.avatar-option { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem; font-size: 0.9rem; border: 1px solid #dfe6ef; border-radius: 0.45rem; }
+.swatch { width: 1.15rem; height: 1.15rem; }
+button { min-height: 2.65rem; padding: 0.55rem 0.85rem; color: #264876; font: inherit; font-weight: 650; background: #fff; border: 1px solid #b7c6d9; border-radius: 0.45rem; cursor: pointer; }
+.primary { background: #245cbd; border-color: #245cbd; color: #fff; }
+button:disabled { opacity: 0.65; cursor: wait; }
+:focus-visible { outline: 2px solid #2464d1; outline-offset: 3px; }
+.error, .field-error { color: #97281f; }
+.error, .confirmed { padding: 0.65rem; border-radius: 0.4rem; background: #fff1ef; }
+.confirmed { background: #f0f6ff; }
+.profile-panel > .error { margin-bottom: 0.8rem; }
+</style>

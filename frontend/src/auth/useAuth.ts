@@ -1,5 +1,6 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { AuthRequestError, authClient, type CurrentUser, type TokenResponse } from './authClient'
+import { ApiRequestError } from '../api/requestJson'
+import { authClient, type CurrentUser, type TokenResponse } from './authClient'
 
 const lockName = 'liveflow:auth:write'
 // 跨标签页共享的是会话标识或重登状态，凭证只留在内存或 HttpOnly Cookie 中。
@@ -14,27 +15,27 @@ const terminalErrors = new Set([
  * 在同源标签页间串行处理认证写操作。
  * @param action 持锁后才开始的操作，包含响应处理
  * @returns 操作结果
- * @throws AuthRequestError 浏览器缺少安全互斥能力
+ * @throws ApiRequestError 浏览器缺少安全互斥能力
  */
 async function withSessionLock<T>(action: () => Promise<T>): Promise<T> {
   if (!navigator.locks) {
-    return Promise.reject(new AuthRequestError(0, 'AUTH_LOCK_UNAVAILABLE',
+    return Promise.reject(new ApiRequestError(0, 'AUTH_LOCK_UNAVAILABLE',
       '当前浏览器环境无法安全协调登录，请通过 HTTPS 或本地回环地址打开受支持的浏览器。'))
   }
   return navigator.locks.request(lockName, action)
 }
 
 function sessionChanged() {
-  return new AuthRequestError(409, 'AUTH_SESSION_CHANGED', '登录会话已变化，请重新读取登录状态。')
+  return new ApiRequestError(409, 'AUTH_SESSION_CHANGED', '登录会话已变化，请重新读取登录状态。')
 }
 
 function refreshUncertain() {
-  return new AuthRequestError(0, 'AUTH_REFRESH_UNCERTAIN', '无法确认登录续期结果，请重新登录。')
+  return new ApiRequestError(0, 'AUTH_REFRESH_UNCERTAIN', '无法确认登录续期结果，请重新登录。')
 }
 
 /**
  * 维护当前标签页的内存凭证和登录状态。
- * @returns 认证界面状态及初始化、登录和退出入口
+ * @returns 认证界面状态、会话标识以及登录、退出和受保护请求入口
  */
 export function useAuth() {
   const token = ref<TokenResponse>()
@@ -44,6 +45,7 @@ export function useAuth() {
   const error = ref('')
   const restoreFailed = ref(false)
   const loggedIn = computed(() => Boolean(token.value && user.value))
+  const sessionId = computed(() => token.value?.sessionId)
   // 清理或替换本地会话时递增。已在途请求据此判断响应是否仍属于当前状态。
   let generation = 0
   let pendingRefresh: { sessionId: string; promise: Promise<TokenResponse> } | undefined
@@ -84,12 +86,12 @@ export function useAuth() {
     try {
       next = await authClient.refresh()
     } catch (cause) {
-      if (cause instanceof AuthRequestError && (cause.status === 0 || cause.status === 503)) {
+      if (cause instanceof ApiRequestError && (cause.status === 0 || cause.status === 503)) {
         // 服务端可能已经消费旧 Cookie。通知其他标签页停止自动续期，等待重新登录。
         localStorage.setItem(sessionMarker, reloginMarker)
         throw refreshUncertain()
       }
-      if (cause instanceof AuthRequestError && terminalErrors.has(cause.code)) {
+      if (cause instanceof ApiRequestError && terminalErrors.has(cause.code)) {
         localStorage.removeItem(sessionMarker)
       }
       throw cause
@@ -139,12 +141,12 @@ export function useAuth() {
    * 发起一次受保护调用，仅在服务端拒绝过期 JWT 时续期并重发一次。
    * @param call 使用当前 Access Token 发请求的入口
    * @returns 属于同一会话的调用结果
-   * @throws AuthRequestError 会话已变更、续期失败或受保护请求失败
+   * @throws ApiRequestError 会话已变更、续期失败或受保护请求失败
    */
   async function withAccess<T>(call: (access: string) => Promise<T>): Promise<T> {
     const previous = token.value
     if (!previous) {
-      throw new AuthRequestError(401, 'AUTH_REQUIRED', '请先登录。')
+      throw new ApiRequestError(401, 'AUTH_REQUIRED', '请先登录。')
     }
     const version = generation
     try {
@@ -152,7 +154,7 @@ export function useAuth() {
       try {
         result = await call(previous.accessToken)
       } catch (cause) {
-        if (!(cause instanceof AuthRequestError) || cause.code !== 'AUTH_ACCESS_EXPIRED') {
+        if (!(cause instanceof ApiRequestError) || cause.code !== 'AUTH_ACCESS_EXPIRED') {
           throw cause
         }
         const next = await refreshAccess(previous)
@@ -168,10 +170,11 @@ export function useAuth() {
       }
       return result
     } catch (cause) {
-      if (version === generation && cause instanceof AuthRequestError
+      if (version === generation && cause instanceof ApiRequestError
           && (terminalErrors.has(cause.code) || cause.code === 'AUTH_REFRESH_UNCERTAIN'
             || cause.code === 'AUTH_SESSION_CHANGED')) {
         clearSession(previous.sessionId)
+        error.value = messageFor(cause)
       }
       throw cause
     }
@@ -194,11 +197,11 @@ export function useAuth() {
       }
       user.value = await withAccess(authClient.me)
     } catch (cause) {
-      if (cause instanceof AuthRequestError && cause.code === 'AUTH_REQUIRED') {
+      if (cause instanceof ApiRequestError && cause.code === 'AUTH_REQUIRED') {
         return
       }
       error.value = messageFor(cause)
-      restoreFailed.value = cause instanceof AuthRequestError
+      restoreFailed.value = cause instanceof ApiRequestError
         && cause.code !== 'AUTH_REFRESH_UNCERTAIN' && (cause.status === 0 || cause.status === 503)
     } finally {
       restoring.value = false
@@ -256,11 +259,11 @@ export function useAuth() {
         await authClient.csrf()
       })
     } catch (cause) {
-      if (cause instanceof AuthRequestError && (terminalErrors.has(cause.code)
+      if (cause instanceof ApiRequestError && (terminalErrors.has(cause.code)
           || cause.code === 'AUTH_SESSION_CHANGED')) {
         clearSession(target)
       }
-      if (cause instanceof AuthRequestError && cause.code === 'AUTH_CSRF_INVALID') {
+      if (cause instanceof ApiRequestError && cause.code === 'AUTH_CSRF_INVALID') {
         try {
           await authClient.csrf()
         } catch {
@@ -279,9 +282,9 @@ export function useAuth() {
   })
   onUnmounted(() => window.removeEventListener('storage', handleMarkerChange))
 
-  return { user, loggedIn, restoring, busy, error, restoreFailed, restore, login, logout }
+  return { user, loggedIn, restoring, busy, error, restoreFailed, sessionId, restore, login, logout, withAccess }
 }
 
 function messageFor(cause: unknown): string {
-  return cause instanceof AuthRequestError ? cause.message : '认证操作暂不可用，请稍后再试。'
+  return cause instanceof ApiRequestError ? cause.message : '认证操作暂不可用，请稍后再试。'
 }

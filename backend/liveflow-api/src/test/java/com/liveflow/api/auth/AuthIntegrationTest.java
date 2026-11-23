@@ -1,6 +1,7 @@
 package com.liveflow.api.auth;
 
 import com.liveflow.core.auth.AuthFailure;
+import com.liveflow.core.profile.service.UserProfileService;
 import com.liveflow.infrastructure.auth.AuthSessionRepository;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -13,6 +14,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import javax.crypto.spec.SecretKeySpec;
@@ -23,6 +25,7 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.security.crypto.argon2.Argon2PasswordEncoder;
@@ -45,6 +48,7 @@ import static org.mockito.Mockito.doThrow;
 @EnabledIfEnvironmentVariable(named = "LIVEFLOW_AUTH_INTEGRATION", matches = "true")
 class AuthIntegrationTest {
 
+    private static final String PROFILE_PATH = "/api/v1/users/me/profile";
     private static final byte[] KEY = new SecureRandom().generateSeed(32);
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
@@ -58,6 +62,7 @@ class AuthIntegrationTest {
     @Autowired StringRedisTemplate redis;
     @Autowired JsonMapper json;
     @MockitoSpyBean AuthSessionRepository sessions;
+    @MockitoSpyBean UserProfileService profiles;
     @LocalServerPort int port;
 
     String username;
@@ -179,6 +184,124 @@ class AuthIntegrationTest {
         assertThat(browser.send("GET", "me", null, access, false).statusCode()).isEqualTo(200);
     }
 
+    @Test
+    void profileDefaultsSaveAndReset() throws Exception {
+        var browser = new Browser();
+        failure(browser.sendPath("GET", PROFILE_PATH, null, null, false), 401, "AUTH_REQUIRED");
+        String bearer = access(browser.login());
+
+        var defaults = profile(browser.sendPath("GET", PROFILE_PATH, null, bearer, false));
+        assertThat(defaults.get("userId").asString()).isEqualTo(Long.toString(userId));
+        assertThat(defaults.get("username").asString()).isEqualTo(username);
+        assertThat(defaults.get("displayName").asString()).isEqualTo(username);
+        assertThat(defaults.get("avatarKey").asString()).isEqualTo("default");
+        assertThat(profileCount(userId)).isZero();
+
+        String nickname = "叶".repeat(23) + "🌊";
+        var saved = profile(browser.sendPath("PUT", PROFILE_PATH, profileBody(" " + nickname + " ", "blue",
+                "  第一行\r\n第二行  "), bearer, true));
+        assertThat(saved.get("displayName").asString()).isEqualTo(nickname);
+        assertThat(saved.get("bio").asString()).isEqualTo("第一行\n第二行");
+        assertThat(profile(browser.sendPath("GET", PROFILE_PATH, null, bearer, false))).isEqualTo(saved);
+
+        var created = jdbc.queryForObject("SELECT created_at FROM user_profiles WHERE user_id = ?", String.class, userId);
+        var reset = profile(browser.sendPath("PUT", PROFILE_PATH, profileBody("", "default", ""), bearer, true));
+        assertThat(reset).isEqualTo(defaults);
+        assertThat(profileCount(userId)).isOne();
+        assertThat(jdbc.queryForObject("SELECT created_at FROM user_profiles WHERE user_id = ?", String.class, userId))
+                .isEqualTo(created);
+    }
+
+    @Test
+    void invalidProfileBodyCsrfAndReplacedSessionCannotWrite() throws Exception {
+        var oldBrowser = new Browser();
+        String oldBearer = access(oldBrowser.login());
+        String valid = profileBody("有效昵称", "blue", "");
+        failure(oldBrowser.sendPath("PUT", PROFILE_PATH, valid, oldBearer, false), 403, "AUTH_CSRF_INVALID");
+        for (String body : List.of("{", "null", "[]", "{}", """
+                {"nickname":null,"avatarKey":"default","bio":""}
+                """, """
+                {"nickname":"改别人","avatarKey":"default","bio":"","userId":"1"}
+                """, """
+                {"nickname":123,"avatarKey":"default","bio":""}
+                """, profileBody("一", "unknown", "字".repeat(161)))) {
+            failure(oldBrowser.sendPath("PUT", PROFILE_PATH, body, oldBearer, true), 400, "INVALID_REQUEST");
+        }
+        assertThat(profileCount(userId)).isZero();
+
+        var currentBrowser = new Browser();
+        String currentBearer = access(currentBrowser.login());
+        var saved = profile(currentBrowser.sendPath("PUT", PROFILE_PATH, valid, currentBearer, true));
+        failure(oldBrowser.sendPath("PUT", PROFILE_PATH, profileBody("旧会话", "green", ""), oldBearer, true),
+                401, "AUTH_SESSION_REPLACED");
+        assertThat(profile(currentBrowser.sendPath("GET", PROFILE_PATH, null, currentBearer, false))).isEqualTo(saved);
+    }
+
+    @Test
+    void concurrentFirstProfileSavesStayCompleteAndIsolated() throws Exception {
+        var firstBrowser = new Browser();
+        String bearer = access(firstBrowser.login());
+        var secondBrowser = new Browser();
+        secondBrowser.csrf();
+        String otherName = username + "_other";
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?",
+                otherName, userId);
+        long otherId = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, otherName);
+        try {
+            var otherBrowser = new Browser();
+            String otherBearer = access(otherBrowser.login(otherName));
+            var otherSaved = profile(otherBrowser.sendPath("PUT", PROFILE_PATH, profileBody("另一账号", "orange", ""),
+                    otherBearer, true));
+            var start = new CyclicBarrier(2);
+            try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                var writes = executor.<HttpResponse<String>>invokeAll(List.of(
+                        () -> {
+                            start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                            return firstBrowser.sendPath("PUT", PROFILE_PATH, profileBody("第一份", "blue", "甲"),
+                                    bearer, true);
+                        },
+                        () -> {
+                            start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                            return secondBrowser.sendPath("PUT", PROFILE_PATH, profileBody("第二份", "green", "乙"),
+                                    bearer, true);
+                        }));
+                var first = profile(writes.get(0).get());
+                var second = profile(writes.get(1).get());
+                assertThat(first.get("nickname").asString()).isEqualTo("第一份");
+                assertThat(second.get("nickname").asString()).isEqualTo("第二份");
+                assertThat(profile(firstBrowser.sendPath("GET", PROFILE_PATH, null, bearer, false))).isIn(first, second);
+                assertThat(profileCount(userId)).isOne();
+            }
+            assertThat(profile(otherBrowser.sendPath("GET", PROFILE_PATH, null, otherBearer, false))).isEqualTo(otherSaved);
+        } finally {
+            redis.delete("liveflow:auth:session:{" + otherId + "}");
+            jdbc.update("DELETE FROM users WHERE id = ?", otherId);
+        }
+    }
+
+    @Test
+    void unavailableProfileStorageMapsTo503() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        doThrow(new DataAccessResourceFailureException("test")).when(profiles).read(userId);
+        failure(browser.sendPath("GET", PROFILE_PATH, null, bearer, false), 503, "PROFILE_SERVICE_UNAVAILABLE");
+    }
+
+    private String profileBody(String nickname, String avatarKey, String bio) {
+        return json.writeValueAsString(Map.of("nickname", nickname, "avatarKey", avatarKey, "bio", bio));
+    }
+
+    private int profileCount(long id) {
+        return jdbc.queryForObject("SELECT COUNT(*) FROM user_profiles WHERE user_id = ?", Integer.class, id);
+    }
+
+    private JsonNode profile(HttpResponse<String> response) {
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+        assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
+        return json.readTree(response.body());
+    }
+
     private String credentials(String supplied) {
         return json.writeValueAsString(Map.of("username", username.toUpperCase(java.util.Locale.ROOT), "password", supplied));
     }
@@ -210,8 +333,13 @@ class AuthIntegrationTest {
         final Map<String, String> cookies = new HashMap<>();
 
         JsonNode login() throws Exception {
+            return login(username);
+        }
+
+        JsonNode login(String name) throws Exception {
             csrf();
-            var response = send("POST", "login", credentials(password), null, true);
+            String body = json.writeValueAsString(Map.of("username", name, "password", password));
+            var response = send("POST", "login", body, null, true);
             assertThat(response.statusCode()).isEqualTo(200);
             csrf();
             return json.readTree(response.body());
@@ -224,7 +352,12 @@ class AuthIntegrationTest {
 
         HttpResponse<String> send(String method, String path, String body, String bearer, boolean csrf)
                 throws Exception {
-            var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/api/v1/auth/" + path));
+            return sendPath(method, "/api/v1/auth/" + path, body, bearer, csrf);
+        }
+
+        HttpResponse<String> sendPath(String method, String path, String body, String bearer, boolean csrf)
+                throws Exception {
+            var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path));
             if (!cookies.isEmpty()) {
                 request.header("Cookie", String.join("; ", cookies.entrySet().stream()
                         .map(entry -> entry.getKey() + "=" + entry.getValue()).toList()));

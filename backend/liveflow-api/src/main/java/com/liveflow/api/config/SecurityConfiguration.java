@@ -10,12 +10,14 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.config.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
+import org.springframework.security.web.csrf.CsrfFilter;
 
 /**
  * 定义 LiveFlow 的 HTTP 请求授权规则。
@@ -50,7 +52,15 @@ class SecurityConfiguration {
         return http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(AbstractHttpConfigurer::disable)
                 .logout(AbstractHttpConfigurer::disable)
-                .csrf(csrf -> csrf.spa().csrfTokenRepository(csrfTokens))
+                .csrf(csrf -> csrf.spa().csrfTokenRepository(csrfTokens)
+                        .withObjectPostProcessor(new ObjectPostProcessor<CsrfFilter>() {
+                            @Override
+                            public <F extends CsrfFilter> F postProcess(F filter) {
+                                // Resource Server 默认豁免 Bearer 请求。本站的浏览器写接口仍需校验 CSRF。
+                                filter.setRequireCsrfProtectionMatcher(CsrfFilter.DEFAULT_CSRF_MATCHER);
+                                return filter;
+                            }
+                        }))
                 .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(errors).accessDeniedHandler(errors))
                 .oauth2ResourceServer(resource -> resource.authenticationEntryPoint(errors)
                         .jwt(jwt -> jwt.decoder(decoder).jwtAuthenticationConverter(token -> {
@@ -69,6 +79,8 @@ class SecurityConfiguration {
                             .requestMatchers(HttpMethod.POST, "/api/v1/auth/login", "/api/v1/auth/refresh",
                                     "/api/v1/auth/logout").permitAll()
                             .requestMatchers(HttpMethod.GET, "/api/v1/auth/me").authenticated()
+                            .requestMatchers(HttpMethod.GET, "/api/v1/users/me/profile").authenticated()
+                            .requestMatchers(HttpMethod.PUT, "/api/v1/users/me/profile").authenticated()
                             .anyRequest().denyAll();
                 }).build();
     }

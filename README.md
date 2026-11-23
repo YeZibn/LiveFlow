@@ -30,6 +30,7 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 | `liveflow-api` | MVC 控制器、HTTP 安全、WebSocket 接入和应用配置，依赖另外两个模块并打包可执行 JAR |
 
 - [登录认证 V1](docs/design/auth/design.md) 涵盖 Spring MVC 分层、HTTP 接口、MySQL 用户索引、Redis 单会话和凭证轮换。WebSocket Ticket 归入后续实时连接阶段。
+- [个人主页 V1](docs/design/profile/design.md) 涵盖登录后的个人主页、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
 
 ## 本地启动
 
