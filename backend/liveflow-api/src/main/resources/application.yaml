@@ -39,3 +39,7 @@ liveflow:
     # 使用部署环境注入的 Base64 随机密钥，解码后至少 32 字节。
     signing-key: ${LIVEFLOW_JWT_SIGNING_KEY:}
     secure-cookie: true
+    registration-limit:
+      # 对字段校验通过的注册请求按来源 IP 计数。
+      max-attempts: ${LIVEFLOW_REGISTRATION_MAX_ATTEMPTS:10}
+      window-seconds: ${LIVEFLOW_REGISTRATION_WINDOW_SECONDS:600}

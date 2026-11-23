@@ -19,7 +19,7 @@ public record AuthHttpError(String code, String message) {
                     AUTH_SESSION_INACTIVE, AUTH_SESSION_REPLACED, AUTH_REFRESH_INVALID, AUTH_REFRESH_REUSED ->
                     HttpStatus.UNAUTHORIZED;
             case AUTH_CSRF_INVALID -> HttpStatus.FORBIDDEN;
-            case AUTH_SESSION_CHANGED -> HttpStatus.CONFLICT;
+            case AUTH_SESSION_CHANGED, AUTH_USERNAME_ALREADY_EXISTS -> HttpStatus.CONFLICT;
             case AUTH_RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
             case AUTH_SERVICE_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE;
         };

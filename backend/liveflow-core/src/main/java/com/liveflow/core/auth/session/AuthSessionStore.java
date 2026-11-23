@@ -4,7 +4,7 @@ import com.liveflow.core.auth.AuthFailure;
 import java.time.Instant;
 import java.util.UUID;
 
-/** 管理每个账号唯一的当前认证会话，以及登录尝试的限流额度。 */
+/** 管理每个账号唯一的当前认证会话，以及注册和登录的限流额度。 */
 public interface AuthSessionStore {
 
     /**
@@ -48,9 +48,16 @@ public interface AuthSessionStore {
 
     /**
      * 为登录请求保留一次限流额度。
-     * @param username 已规范化的账号
+     * @param username 已校验并保留大小写的账号
      * @param source 可信传输连接给出的来源地址
      * @throws AuthFailure 当前窗口超额或会话存储不可用
      */
     void checkLoginLimit(String username, String source);
+
+    /**
+     * 为通过字段校验的注册请求预留一次来源额度。
+     * @param source 可信传输连接给出的来源地址
+     * @throws AuthFailure 来源窗口超额或限流存储不可用
+     */
+    void checkRegistrationLimit(String source);
 }

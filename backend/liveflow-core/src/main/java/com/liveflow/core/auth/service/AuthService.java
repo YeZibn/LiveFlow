@@ -7,17 +7,23 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.Locale;
 import java.util.UUID;
+import java.util.regex.Pattern;
+import org.springframework.dao.DataAccessException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.security.crypto.argon2.Argon2PasswordEncoder;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.stereotype.Service;
 
 import static com.liveflow.core.auth.AuthFailure.Code.*;
 
-/** 统一编排密码认证、凭证签发及登录会话变更。 */
+/** 统一编排账号注册、密码认证、凭证签发及登录会话变更。 */
 @Service
 public class AuthService {
+
+    private static final Pattern USERNAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9_]{2,31}");
+    private static final Pattern REGISTRATION_PASSWORD =
+            Pattern.compile("(?=.*[A-Z])(?=.*[a-z])(?=.*[0-9])(?=.*[^A-Za-z0-9])[!-~]{10,25}");
 
     private final UserMapper users;
     private final AuthSessionStore sessions;
@@ -39,6 +45,38 @@ public class AuthService {
     }
 
     /**
+     * 创建账号。写入成功后返回账号摘要，登录入口随后建立会话。
+     * @param username 用户提供的原样账号名
+     * @param password 用户新设置的原始密码
+     * @param source 可信连接的来源地址
+     * @return 已写入的账号 ID 和原样账号名
+     * @throws AuthFailure 输入无效、账号重复、限流或无法确认写入
+     * @throws DataAccessException 账号存储不可用
+     */
+    public UserMapper.Account register(String username, String password, String source) {
+        if (!validUsername(username) || password == null || password.length() < 10 || password.length() > 25
+                || !REGISTRATION_PASSWORD.matcher(password).matches()) {
+            throw new AuthFailure(INVALID_REQUEST);
+        }
+        // 先预留来源额度，超限请求无需计算 Argon2id。
+        sessions.checkRegistrationLimit(source);
+        var account = new UserMapper.NewAccount(username, passwords.encode(password));
+        try {
+            // 直接插入以唯一索引裁决并发注册，避免先查后写产生竞态。
+            if (users.insert(account) != 1 || account.id() == null) {
+                throw new AuthFailure(AUTH_SERVICE_UNAVAILABLE);
+            }
+        } catch (DuplicateKeyException ex) {
+            String reason = ex.getMostSpecificCause().getMessage();
+            if (reason != null && (reason.endsWith(".uk_users_username'") || reason.endsWith("'uk_users_username'"))) {
+                throw new AuthFailure(AUTH_USERNAME_ALREADY_EXISTS);
+            }
+            throw ex;
+        }
+        return new UserMapper.Account(account.id(), username);
+    }
+
+    /**
      * 校验密码并将新会话登记为账号唯一的当前会话。
      * @param username 用户提交的 ASCII 用户名
      * @param password 用户提交的原始密码
@@ -47,15 +85,13 @@ public class AuthService {
      * @throws AuthFailure 输入无效、密码错误、限流或无法确认会话
      */
     public Credentials login(String username, String password, String source) {
-        String canonical = username == null ? "" : username.toLowerCase(Locale.ROOT);
-        if (username == null || !StandardCharsets.US_ASCII.newEncoder().canEncode(username)
-                || !canonical.matches("[a-z0-9][a-z0-9_]{2,31}") || password == null || password.isEmpty()
+        if (!validUsername(username) || password == null || password.isEmpty()
                 || password.getBytes(StandardCharsets.UTF_8).length > 256) {
             throw new AuthFailure(INVALID_REQUEST);
         }
-        // 先按规范化账号和连接来源限流，超额请求在查库及 Argon2 校验前返回。
-        sessions.checkLoginLimit(canonical, source);
-        var account = users.findForLogin(canonical);
+        // 限流键与数据库使用相同拼写，大小写不同的账号分别计数。
+        sessions.checkLoginLimit(username, source);
+        var account = users.findForLogin(username);
         boolean matches = passwords.matches(password, account == null ? absentAccountHash : account.passwordHash());
         if (account == null || !matches) {
             throw new AuthFailure(AUTH_INVALID_CREDENTIALS);
@@ -116,6 +152,10 @@ public class AuthService {
             throw new AuthFailure(AUTH_SESSION_INACTIVE);
         }
         return account;
+    }
+
+    private static boolean validUsername(String username) {
+        return username != null && USERNAME.matcher(username).matches();
     }
 
     /** 服务内部的凭证交付结果。Controller 负责将刷新凭证写入 HttpOnly Cookie。 */

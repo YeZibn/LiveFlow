@@ -1,7 +1,7 @@
 /** 同源 API 的公开失败，status 为 0 表示传输结果无法确认。 */
 export class ApiRequestError extends Error {
   constructor(readonly status: number, readonly code: string, message: string,
-    readonly fieldErrors?: Record<string, string>) {
+    readonly fieldErrors?: Record<string, string>, readonly retryAfterSeconds?: number) {
     super(message)
   }
 }
@@ -48,8 +48,10 @@ export async function requestJson<T>(path: string, options: {
     }
     const body = await response.json().catch(() => undefined)
     if (!response.ok) {
+      const retryAfter = response.headers.get('Retry-After')
+      const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined
       throw new ApiRequestError(response.status, body?.code ?? 'HTTP_ERROR',
-        body?.message ?? '服务暂不可用，请稍后再试。', body?.fieldErrors)
+        body?.message ?? '服务暂不可用，请稍后再试。', body?.fieldErrors, seconds)
     }
     if (body == null) {
       throw new ApiRequestError(0, 'RESPONSE_INVALID', '服务响应无法确认。')

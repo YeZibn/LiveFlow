@@ -9,9 +9,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.security.SecureRandom;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CyclicBarrier;
@@ -48,6 +50,8 @@ import static org.mockito.Mockito.doThrow;
 @EnabledIfEnvironmentVariable(named = "LIVEFLOW_AUTH_INTEGRATION", matches = "true")
 class AuthIntegrationTest {
 
+    private static final String REGISTRATION_SOURCE = "liveflow:auth:registration:source:127.0.0.1";
+    private static final String REGISTRATION_PASSWORD = "Abcdefg1!_";
     private static final String PROFILE_PATH = "/api/v1/users/me/profile";
     private static final byte[] KEY = new SecureRandom().generateSeed(32);
     private static final HttpClient HTTP = HttpClient.newHttpClient();
@@ -56,6 +60,9 @@ class AuthIntegrationTest {
     static void settings(DynamicPropertyRegistry registry) {
         registry.add("liveflow.auth.signing-key", () -> Base64.getEncoder().encodeToString(KEY));
         registry.add("liveflow.auth.secure-cookie", () -> false);
+        registry.add("spring.data.redis.database", () -> 15);
+        registry.add("liveflow.auth.registration-limit.max-attempts", () -> 10);
+        registry.add("liveflow.auth.registration-limit.window-seconds", () -> 600);
     }
 
     @Autowired JdbcTemplate jdbc;
@@ -68,6 +75,7 @@ class AuthIntegrationTest {
     String username;
     String password;
     long userId;
+    final List<String> registeredNames = new ArrayList<>();
 
     @BeforeEach
     void createAccount() {
@@ -77,12 +85,134 @@ class AuthIntegrationTest {
         jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
                 + " VALUES (?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))", username, hash);
         userId = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, username);
+        redis.delete(REGISTRATION_SOURCE);
     }
 
     @AfterEach
     void removeAccount() {
         redis.delete("liveflow:auth:session:{" + userId + "}");
         jdbc.update("DELETE FROM users WHERE id = ?", userId);
+        for (String name : registeredNames) {
+            for (Long id : jdbc.queryForList("SELECT id FROM users WHERE username = ?", Long.class, name)) {
+                redis.delete("liveflow:auth:session:{" + id + "}");
+                jdbc.update("DELETE FROM users WHERE id = ?", id);
+            }
+        }
+        redis.delete(REGISTRATION_SOURCE);
+    }
+
+    @Test
+    void registerValidPasswordsAndLoginWithExactUsername() throws Exception {
+        String mixed = registrationName("New_");
+        String lower = mixed.toLowerCase(Locale.ROOT);
+        registeredNames.add(lower);
+        String longestPassword = "Aa1!" + "x".repeat(21);
+        var upper = new Browser();
+        upper.csrf();
+        var first = registered(upper.send("POST", "register", credentials(mixed, REGISTRATION_PASSWORD), null, true));
+        assertThat(first.get("username").asString()).isEqualTo(mixed);
+        String hash = jdbc.queryForObject("SELECT password_hash FROM users WHERE username = ?", String.class, mixed);
+        assertThat(hash).startsWith("$argon2id$");
+
+        var lowerBrowser = new Browser();
+        lowerBrowser.csrf();
+        var second = registered(lowerBrowser.send("POST", "register", credentials(lower, longestPassword), null, true));
+        assertThat(second.get("userId")).isNotEqualTo(first.get("userId"));
+        failure(upper.send("POST", "login", credentials(lower, REGISTRATION_PASSWORD), null, true),
+                401, "AUTH_INVALID_CREDENTIALS");
+        String firstAccess = access(upper.login(mixed, REGISTRATION_PASSWORD));
+        String secondAccess = access(lowerBrowser.login(lower, longestPassword));
+        assertThat(json.readTree(upper.send("GET", "me", null, firstAccess, false).body())).isEqualTo(first);
+        assertThat(json.readTree(lowerBrowser.send("GET", "me", null, secondAccess, false).body())).isEqualTo(second);
+    }
+
+    @Test
+    void invalidRegistrationAndMissingCsrfCannotCreateAccount() throws Exception {
+        var browser = new Browser();
+        String name = registrationName("Invalid_");
+        String valid = credentials(name, REGISTRATION_PASSWORD);
+        failure(browser.send("POST", "register", valid, null, false), 403, "AUTH_CSRF_INVALID");
+        browser.csrf();
+        for (String invalid : List.of("Abcdef1!_", "Aa1!" + "x".repeat(22), "abcdefg1!_", "ABCDEFG1!_",
+                "Abcdefgh!_", "Abcdefg123", "Abcdefg1! ", "Abcdefg1!中")) {
+            failure(browser.send("POST", "register", credentials(name, invalid), null, true), 400, "INVALID_REQUEST");
+        }
+        for (String body : List.of("{}", "null", "[]", "{",
+                json.writeValueAsString(Map.of("username", name, "password", 12345)),
+                json.writeValueAsString(Map.of("username", name, "password", REGISTRATION_PASSWORD,
+                        "confirmation", REGISTRATION_PASSWORD)))) {
+            failure(browser.send("POST", "register", body, null, true), 400, "INVALID_REQUEST");
+        }
+        failure(browser.send("POST", "register", credentials(" " + name, REGISTRATION_PASSWORD), null, true),
+                400, "INVALID_REQUEST");
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE username = ?", Integer.class, name)).isZero();
+        assertThat(redis.hasKey(REGISTRATION_SOURCE)).isFalse();
+    }
+
+    @Test
+    void concurrentDuplicateRegistrationCreatesOneAccount() throws Exception {
+        String name = registrationName("Race_");
+        String body = credentials(name, REGISTRATION_PASSWORD);
+        var first = new Browser();
+        var second = new Browser();
+        first.csrf();
+        second.csrf();
+        var start = new CyclicBarrier(2);
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var attempts = executor.<HttpResponse<String>>invokeAll(List.of(
+                    () -> {
+                        start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                        return first.send("POST", "register", body, null, true);
+                    },
+                    () -> {
+                        start.await(5, java.util.concurrent.TimeUnit.SECONDS);
+                        return second.send("POST", "register", body, null, true);
+                    }));
+            var results = List.of(attempts.get(0).get(), attempts.get(1).get());
+            assertThat(results.stream().map(HttpResponse::statusCode)).containsExactlyInAnyOrder(201, 409);
+            failure(results.stream().filter(response -> response.statusCode() == 409).findFirst().orElseThrow(),
+                    409, "AUTH_USERNAME_ALREADY_EXISTS");
+        }
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE username = ?", Integer.class, name)).isOne();
+    }
+
+    @Test
+    void registrationRateLimitReturnsRetryAfterAndDoesNotLimitLogin() throws Exception {
+        var browser = new Browser();
+        browser.csrf();
+        String body = credentials(username, REGISTRATION_PASSWORD);
+        for (int attempt = 0; attempt < 10; attempt++) {
+            failure(browser.send("POST", "register", body, null, true), 409, "AUTH_USERNAME_ALREADY_EXISTS");
+        }
+        var denied = browser.send("POST", "register", body, null, true);
+        failure(denied, 429, "AUTH_RATE_LIMITED");
+        assertThat(Long.parseLong(denied.headers().firstValue("Retry-After").orElseThrow())).isBetween(1L, 600L);
+        assertThat(access(browser.login())).isNotEmpty();
+    }
+
+    @Test
+    void unavailableRegistrationLimiterCannotCreateAccount() throws Exception {
+        var browser = new Browser();
+        browser.csrf();
+        String name = registrationName("Unavailable_");
+        doThrow(new AuthFailure(AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE)).when(sessions)
+                .checkRegistrationLimit("127.0.0.1");
+        failure(browser.send("POST", "register", credentials(name, REGISTRATION_PASSWORD), null, true),
+                503, "AUTH_SERVICE_UNAVAILABLE");
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE username = ?", Integer.class, name)).isZero();
+    }
+
+    private String registrationName(String prefix) {
+        String name = prefix + username;
+        registeredNames.add(name);
+        return name;
+    }
+
+    private JsonNode registered(HttpResponse<String> response) {
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(201);
+        assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
+        assertThat(response.headers().allValues("Set-Cookie")).noneMatch(cookie -> cookie.startsWith("lf_refresh="));
+        return json.readTree(response.body());
     }
 
     @Test
@@ -303,7 +433,11 @@ class AuthIntegrationTest {
     }
 
     private String credentials(String supplied) {
-        return json.writeValueAsString(Map.of("username", username.toUpperCase(java.util.Locale.ROOT), "password", supplied));
+        return credentials(username, supplied);
+    }
+
+    private String credentials(String name, String supplied) {
+        return json.writeValueAsString(Map.of("username", name, "password", supplied));
     }
 
     private String logoutBody(String sessionId) {
@@ -337,8 +471,12 @@ class AuthIntegrationTest {
         }
 
         JsonNode login(String name) throws Exception {
+            return login(name, password);
+        }
+
+        JsonNode login(String name, String suppliedPassword) throws Exception {
             csrf();
-            String body = json.writeValueAsString(Map.of("username", name, "password", password));
+            String body = credentials(name, suppliedPassword);
             var response = send("POST", "login", body, null, true);
             assertThat(response.statusCode()).isEqualTo(200);
             csrf();

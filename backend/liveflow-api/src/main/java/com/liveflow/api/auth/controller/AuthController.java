@@ -1,5 +1,6 @@
 package com.liveflow.api.auth.controller;
 
+import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.auth.service.AuthService;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -7,8 +8,11 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -21,6 +25,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import tools.jackson.databind.JsonNode;
 
 /** 认证 HTTP 入口。JSON 只交付短期访问凭证，刷新凭证通过 Cookie 交付。 */
 @RestController
@@ -54,6 +59,26 @@ public class AuthController {
         // 即使响应没有正文，也要取出延迟令牌，首次请求才会生成 CSRF Cookie。
         csrf.getToken();
         return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    }
+
+    /**
+     * 创建账号并返回公开摘要。
+     * @param body 含账号名和一份密码的 JSON 请求体
+     * @param request 用于读取可信来源地址
+     * @return 账号提交成功后的 201 响应
+     * @throws AuthFailure 请求非法、账号重复或注册限流
+     * @throws DataAccessException 账号存储不可用
+     */
+    @PostMapping(path = "/register", consumes = MediaType.APPLICATION_JSON_VALUE)
+    public ResponseEntity<CurrentUserResponse> register(@RequestBody JsonNode body, HttpServletRequest request) {
+        // 只接受两个明确的字符串字段，避免隐式类型转换或接收确认密码。
+        if (!body.isObject() || body.size() != 2 || !body.path("username").isString()
+                || !body.path("password").isString()) {
+            throw new AuthFailure(AuthFailure.Code.INVALID_REQUEST);
+        }
+        var account = auth.register(body.get("username").asString(), body.get("password").asString(), request.getRemoteAddr());
+        return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore())
+                .body(new CurrentUserResponse(Long.toString(account.id()), account.username()));
     }
 
     /**

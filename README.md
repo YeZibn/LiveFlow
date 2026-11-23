@@ -29,7 +29,7 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 | `liveflow-infrastructure` | Redis 会话存储及 Lua 脚本、Kafka 健康检查，依赖 `core` |
 | `liveflow-api` | MVC 控制器、HTTP 安全、WebSocket 接入和应用配置，依赖另外两个模块并打包可执行 JAR |
 
-- [登录认证 V1](docs/design/auth/design.md) 涵盖 Spring MVC 分层、HTTP 接口、MySQL 用户索引、Redis 单会话和凭证轮换。WebSocket Ticket 归入后续实时连接阶段。
+- [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。WebSocket Ticket 归入后续实时连接阶段。
 - [个人主页 V1](docs/design/profile/design.md) 涵盖登录后的个人主页、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
 
 ## 本地启动
@@ -84,35 +84,13 @@ curl --fail http://127.0.0.1:18080/actuator/health
 
 ## 认证联调
 
-本阶段从已有账号登录。用户表由后端启动时的 Flyway 迁移创建。在本地或测试库中准备 ASCII 小写用户名和 Argon2id 哈希。可用 `backend` 中的 Maven Wrapper 生成运行依赖清单，再启动 JShell 读取测试密码并生成哈希。
-
-```bash
-./mvnw -pl liveflow-core dependency:build-classpath -Dmdep.outputFile=target/auth-classpath
-jshell --execution local --class-path "$(cat liveflow-core/target/auth-classpath)"
-```
-
-在 JShell 输入以下语句，复制输出的哈希。密码通过终端读取，避免写入命令历史。
-
-```java
-var password = System.console().readPassword("测试密码：");
-var encoder = new org.springframework.security.crypto.argon2.Argon2PasswordEncoder(16, 32, 1, 19456, 2);
-System.out.println(encoder.encode(java.nio.CharBuffer.wrap(password)));
-java.util.Arrays.fill(password, '\0');
-/exit
-```
-
-在本地 MySQL 客户端执行以下 SQL，将哈希占位符替换为实际生成的值。然后用此用户名和测试密码在 Vue 页面登录。
-
-```sql
-INSERT INTO users (username, password_hash, created_at, updated_at)
-VALUES ('local_viewer', '<Argon2id 哈希>', UTC_TIMESTAMP(3), UTC_TIMESTAMP(3));
-```
+启动前后端后，打开 Vue 登录页，点击「注册」，输入账号和两次一致的密码。注册成功后页面预填账号名，使用刚设置的密码登录。账号严格区分大小写。新密码为 10–25 个可见 ASCII 字符，并同时包含大写字母、小写字母、数字和符号。使用旧测试数据的环境可按重建流程切换。 [注册接口](docs/design/auth/api.md#注册) · [测试数据重建](docs/design/auth/database.md#开发与测试数据重建)
 
 同一账号的新登录会替换原会话。可以用两个独立浏览器会话观察替换行为，用同一个浏览器的两个标签页观察刷新与退出协调。生产环境以 HTTPS 部署并注入独立的 Base64 随机签名密钥。回环 HTTP 覆盖只适用于 `local` profile。
 
-登录限流采用 60 秒固定窗口，每个规范化账号 10 次，每个连接来源 60 次。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
+登录限流采用 60 秒固定窗口，每个原样账号 10 次，每个连接来源 60 次。注册独立计数，默认每个来源 600 秒内 10 次。可用 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` 和 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` 配置注册额度。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
 
-在本地 Compose 依赖健康时，可从仓库根目录运行认证集成测试。测试会创建并清理专用账号，连接配置沿用后端的本地默认值或当前终端覆盖值。
+在本地 Compose 依赖健康时，可从仓库根目录运行认证集成测试。测试会创建并清理专用账号，连接配置沿用后端的本地默认值或当前终端覆盖值，Redis 使用测试数据库 15。
 
 ```bash
 (cd backend && LIVEFLOW_AUTH_INTEGRATION=true ./mvnw clean verify)

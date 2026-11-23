@@ -42,7 +42,7 @@
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
 | `userId` | string | 账号 ID 的十进制字符串，沿用当前用户接口格式 |
-| `username` | string | 账号表中的登录用户名 |
+| `username` | string | 账号表中原样保存的登录用户名，保留大小写。规则见 [认证请求字段](../auth/api.md#请求字段)。 |
 | `nickname` | string | 用户设置的昵称，未设置时为空字符串 |
 | `displayName` | string | 使用非空昵称，空昵称时回退到用户名 |
 | `avatarKey` | string | 预设头像标识 |

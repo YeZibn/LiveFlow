@@ -3,6 +3,7 @@ package com.liveflow.api.auth.controller;
 import com.liveflow.api.auth.AuthHttpError;
 import com.liveflow.core.auth.AuthFailure;
 import org.springframework.dao.DataAccessException;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -16,7 +17,11 @@ class AuthErrorAdvice {
 
     @ExceptionHandler(AuthFailure.class)
     ResponseEntity<AuthHttpError> handleFailure(AuthFailure failure) {
-        return respond(failure.code());
+        var response = ResponseEntity.status(AuthHttpError.status(failure.code()));
+        if (failure.retryAfterSeconds() > 0) {
+            response.header(HttpHeaders.RETRY_AFTER, Long.toString(failure.retryAfterSeconds()));
+        }
+        return response.body(AuthHttpError.from(failure.code()));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)

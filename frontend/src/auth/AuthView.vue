@@ -1,18 +1,43 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import ProfileView from '../profile/ProfileView.vue'
+import RegisterForm from './RegisterForm.vue'
 import { useAuth } from './useAuth'
 
 const username = ref('')
 const password = ref('')
+const registering = ref(false)
+const notice = ref('')
 const { loggedIn, restoring, busy, error, restoreFailed, sessionId, restore, login, logout, withAccess } = useAuth()
 const showDev = import.meta.env.DEV
 
 /** 提交输入并立即清除组件中的明文密码。 */
 async function submit() {
+  notice.value = ''
   const result = login(username.value, password.value)
   password.value = ''
   await result
+}
+
+/**
+ * 切换认证表单并清理上一份表单的密码和错误。
+ * @param next 是否打开注册表单
+ */
+function showRegistration(next: boolean) {
+  password.value = ''
+  error.value = ''
+  notice.value = ''
+  registering.value = next
+}
+
+/**
+ * 注册完成后保留服务端返回的准确账号拼写。
+ * @param registeredUsername 新建账号的原样用户名
+ */
+function completeRegistration(registeredUsername: string) {
+  showRegistration(false)
+  username.value = registeredUsername
+  notice.value = '注册成功，请登录。'
 }
 </script>
 
@@ -31,13 +56,16 @@ async function submit() {
           <h1 id="auth-title">正在恢复登录</h1>
           <p role="status">正在检查当前会话…</p>
         </template>
+        <RegisterForm v-else-if="registering" @registered="completeRegistration" @back="showRegistration(false)" />
         <template v-else>
           <h1 id="auth-title">登录 LiveFlow</h1>
+          <p v-if="notice" class="notice" role="status">{{ notice }}</p>
           <form @submit.prevent="submit">
             <div class="field">
               <label for="username">用户名</label>
               <input id="username" v-model="username" autocomplete="username" required
-                minlength="3" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_]{2,31}" :disabled="busy" />
+                autocapitalize="none" spellcheck="false" minlength="3" maxlength="32"
+                pattern="[A-Za-z0-9][A-Za-z0-9_]{2,31}" :disabled="busy" />
             </div>
             <div class="field">
               <label for="password">密码</label>
@@ -46,6 +74,7 @@ async function submit() {
             </div>
             <p v-if="error" class="error" role="alert">{{ error }}</p>
             <button class="primary" :disabled="busy" type="submit">{{ busy ? '正在登录…' : '登录' }}</button>
+            <button class="secondary" :disabled="busy" type="button" @click="showRegistration(true)">注册</button>
             <button v-if="restoreFailed" class="secondary" type="button" :disabled="busy" @click="restore">
               重试恢复登录
             </button>
@@ -107,4 +136,5 @@ button { min-height: 2.65rem; padding: 0.55rem 0.85rem; font: inherit; font-weig
 button:disabled { opacity: 0.65; cursor: wait; }
 :focus-visible { outline: 2px solid #2464d1; outline-offset: 3px; }
 .error { margin: 0; padding: 0.65rem; border-radius: 0.4rem; background: #fff1ef; color: #97281f; }
+.notice { margin: 0 0 1rem; color: #245546; }
 </style>
