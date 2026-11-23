@@ -11,6 +11,7 @@ import org.springframework.dao.DataAccessException;
 /** 按账号归属读取和创建房间。 */
 @Mapper
 public interface RoomMapper {
+    // 列表和详情共用显示名规则。CHAR_LENGTH 检查真实空字符串，避免依赖排序规则的相等比较。
     String OWNER_NAME = """
             CASE WHEN p.nickname IS NULL OR CHAR_LENGTH(p.nickname) = 0
                  THEN u.username ELSE p.nickname END AS ownerName

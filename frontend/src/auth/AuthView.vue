@@ -15,7 +15,10 @@ const registering = ref(false)
 const notice = ref('')
 const { loggedIn, restoring, busy, error, restoreFailed, sessionId, restore, login, logout, withAccess } = useAuth()
 
-/** 提交输入并立即清除组件中的明文密码。 */
+/**
+ * 交给认证状态发起登录，并立即清空表单中的明文密码。
+ * @returns 登录请求完成且认证界面状态已更新
+ */
 async function submit() {
   notice.value = ''
   const result = login(username.value, password.value)

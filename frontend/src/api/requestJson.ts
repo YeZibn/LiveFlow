@@ -1,5 +1,13 @@
 /** 同源 API 的公开失败，status 为 0 表示传输结果无法确认。 */
 export class ApiRequestError extends Error {
+  /**
+   * 构造供界面按状态码、业务错误码和字段提示处理的错误。
+   * @param status HTTP 状态，0 表示无可确认的 HTTP 结果
+   * @param code 服务端错误码或客户端映射的错误码
+   * @param message 可直接展示的简短说明
+   * @param fieldErrors 可选的表单字段错误
+   * @param retryAfterSeconds 限流时建议等待的整数秒数
+   */
   constructor(readonly status: number, readonly code: string, message: string,
     readonly fieldErrors?: Record<string, string>, readonly retryAfterSeconds?: number) {
     super(message)
@@ -48,6 +56,7 @@ export async function requestJson<T>(path: string, options: {
     }
     const body = await response.json().catch(() => undefined)
     if (!response.ok) {
+      // HTTP 错误即使没有 JSON 正文，也保留状态码供调用方区分过期、限流和结果不明。
       const retryAfter = response.headers.get('Retry-After')
       const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined
       throw new ApiRequestError(response.status, body?.code ?? 'HTTP_ERROR',

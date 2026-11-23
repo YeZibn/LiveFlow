@@ -28,6 +28,11 @@ export interface MessageSubmission {
   content: string
 }
 
+/**
+ * 构造同源房间接口的公共前缀。
+ * @param roomId 房间的对外 UUID
+ * @returns 包含已编码房间段的 API 路径
+ */
 function roomUrl(roomId: string) {
   return `/api/v1/rooms/${encodeURIComponent(roomId)}`
 }
@@ -104,10 +109,20 @@ export function decodeRoomFrame(data: unknown): RoomFrame | undefined {
   return undefined
 }
 
+/**
+ * 验证下行标识为规范的小写 UUID v4。
+ * @param value 待验证的协议字段
+ * @returns 字段可按对外房间或消息标识使用时为 true
+ */
 function isUuid(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 }
 
+/**
+ * 验证消息时间为带毫秒的 UTC 字符串，并确认浏览器能解析。
+ * @param value 从回执或广播读到的原始时间字段
+ * @returns 时间满足客户端解析要求时为 true
+ */
 function isSentAt(value: unknown): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
     && Number.isFinite(Date.parse(value))

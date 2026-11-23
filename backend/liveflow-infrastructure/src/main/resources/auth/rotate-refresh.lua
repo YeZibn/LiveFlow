@@ -1,4 +1,6 @@
 -- 先确认原会话，再根据摘要决定轮换或撤销，避免影响新会话。
+-- KEYS[1] 是账号的当前会话键。ARGV 依次为目标会话 ID、提交摘要和新摘要。
+-- 返回原会话绝对到期毫秒表示轮换成功，0 表示无效，-1 表示发现重放并删除会话。
 local key = KEYS[1]
 if redis.call('HGET', key, 'sessionId') ~= ARGV[1] then return 0 end
 local used = 'used:' .. ARGV[2]

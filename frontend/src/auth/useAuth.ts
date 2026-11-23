@@ -25,10 +25,18 @@ async function withSessionLock<T>(action: () => Promise<T>): Promise<T> {
   return navigator.locks.request(lockName, action)
 }
 
+/**
+ * 构造会话切换错误，供等待中的旧请求退出。
+ * @returns 不暴露凭证内容的认证错误
+ */
 function sessionChanged() {
   return new ApiRequestError(409, 'AUTH_SESSION_CHANGED', '登录会话已变化，请重新读取登录状态。')
 }
 
+/**
+ * 将未获确认的刷新表示为需要手动登录的错误。
+ * @returns 用于停止自动刷新的认证错误
+ */
 function refreshUncertain() {
   return new ApiRequestError(0, 'AUTH_REFRESH_UNCERTAIN', '无法确认登录续期结果，请重新登录。')
 }
@@ -50,6 +58,10 @@ export function useAuth() {
   let generation = 0
   let pendingRefresh: { sessionId: string; promise: Promise<TokenResponse> } | undefined
 
+  /**
+   * 清除本页凭证和账号摘要，同时使在途调用过期。
+   * @param expected 只允许清除的会话 ID，省略时清除当前本地状态
+   */
   function clearSession(expected?: string) {
     if (expected !== undefined && token.value?.sessionId !== expected) {
       return
@@ -59,6 +71,10 @@ export function useAuth() {
     user.value = undefined
   }
 
+  /**
+   * 响应其他同源标签页的登录、退出或续期不确定事件。
+   * @param event 浏览器发送的存储变更事件
+   */
   function handleMarkerChange(event: StorageEvent) {
     if (event.key !== sessionMarker) {
       return
@@ -71,6 +87,12 @@ export function useAuth() {
     }
   }
 
+  /**
+   * 在调用方持有跨页写锁时轮换浏览器 Cookie 对应的会话。
+   * @param expected 要续期的原会话，页面首次恢复时可省略
+   * @returns 新 Access Token 与服务端确认的会话信息
+   * @throws ApiRequestError 会话切换、Cookie 无效或刷新结果无法确认
+   */
   async function exchange(expected?: string): Promise<TokenResponse> {
     // 拿到锁后再读共享标记，防止排队期间发生的登录或退出改变操作目标。
     const marker = localStorage.getItem(sessionMarker)
@@ -103,6 +125,12 @@ export function useAuth() {
     return next
   }
 
+  /**
+   * 在本页合并原会话的续期请求。收到较晚的过期响应时优先复用已经更新的 Token。
+   * @param previous 触发续期的原请求使用的凭证
+   * @returns 原会话的新凭证
+   * @throws ApiRequestError 续期失败或操作期间会话已变更
+   */
   function refreshAccess(previous: TokenResponse): Promise<TokenResponse> {
     const current = token.value
     if (current?.sessionId !== previous.sessionId) {
@@ -118,6 +146,7 @@ export function useAuth() {
 
     const version = generation
     const promise = withSessionLock(async () => {
+      // 等待跨页锁时本页可能已退出，失效操作连 Refresh Cookie 都不应触碰。
       if (version !== generation) {
         throw sessionChanged()
       }
@@ -129,6 +158,7 @@ export function useAuth() {
       token.value = next
       return next
     }).finally(() => {
+      // 较早的续期结束时不能清除另一个会话已经登记的请求。
       if (pendingRefresh?.promise === promise) {
         pendingRefresh = undefined
       }
@@ -154,6 +184,7 @@ export function useAuth() {
       try {
         result = await call(previous.accessToken)
       } catch (cause) {
+        // 仅凭服务端明确的过期错误重发一次。超时等不确定结果交给调用方处理。
         if (!(cause instanceof ApiRequestError) || cause.code !== 'AUTH_ACCESS_EXPIRED') {
           throw cause
         }
@@ -195,6 +226,7 @@ export function useAuth() {
           token.value = await exchange()
         })
       }
+      // 同会话的账号摘要载入后，页面才进入已登录视图。
       user.value = await withAccess(authClient.me)
     } catch (cause) {
       if (cause instanceof ApiRequestError && cause.code === 'AUTH_REQUIRED') {
@@ -285,6 +317,11 @@ export function useAuth() {
   return { user, loggedIn, restoring, busy, error, restoreFailed, sessionId, restore, login, logout, withAccess }
 }
 
+/**
+ * 给认证界面选择可直接展示的错误说明。
+ * @param cause 捕获的 API 错误或其他异常
+ * @returns 已映射的 API 提示或通用说明
+ */
 function messageFor(cause: unknown): string {
   return cause instanceof ApiRequestError ? cause.message : '认证操作暂不可用，请稍后再试。'
 }

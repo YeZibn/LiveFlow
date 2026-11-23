@@ -94,6 +94,12 @@ public class RoomController {
                 .body(new DirectoryResponse(items, page.nextCursor()));
     }
 
+    /**
+     * 读取目录页大小，格式校验由此处处理，取值范围由房间服务验证。
+     * @param rawLimit 原始查询值，缺省时为 null
+     * @return 用户提交的整数，缺省时为 12
+     * @throws InvalidRoomRequestException 空值、非十进制整数或整型溢出
+     */
     private static int parseLimit(String rawLimit) {
         if (rawLimit == null) {
             return 12;
@@ -151,23 +157,47 @@ public class RoomController {
         return ResponseEntity.status(HttpStatus.CREATED).cacheControl(CacheControl.noStore()).body(RoomResponse.from(room));
     }
 
-    /** 本人房间查询结果，房间未创建时仍发送 room 字段。 */
+    /**
+     * 本人房间查询结果。
+     * @param room 已创建的房间，未创建时响应显式包含 null
+     */
     public record CurrentRoomResponse(@JsonInclude(JsonInclude.Include.ALWAYS) RoomResponse room) {}
 
-    /** 对外房间信息，ID 和时间均按接口约定序列化。 */
+    /**
+     * 创建和本人查询共用的房间对象。
+     * @param roomId 对外使用的小写 UUID v4
+     * @param title 保存后的房间标题
+     * @param createdAt 三位小数秒的 UTC 创建时间
+     */
     public record RoomResponse(String roomId, String title, String createdAt) {
         private static RoomResponse from(Room room) {
             return new RoomResponse(room.roomId(), room.title(), UTC_MILLIS.format(room.createdAt()));
         }
     }
 
-    /** 直播间详情的公开字段。 */
+    /**
+     * 直播间详情的公开字段。
+     * @param roomId 房间的对外 UUID
+     * @param title 保存后的房间标题
+     * @param ownerName 房主昵称，未设置时为原拼写账号名
+     */
     public record RoomDetailsResponse(String roomId, String title, String ownerName) {}
 
-    /** 统一目录的一条公开房间信息。 */
+    /**
+     * 统一目录的一条公开房间信息。
+     * @param roomId 房间的对外 UUID
+     * @param title 保存后的房间标题
+     * @param ownerName 房主当前显示名
+     * @param createdAt 三位小数秒的 UTC 创建时间，用于展示与排序
+     * @param isMine 由认证账号与房主账号比较得到的标记
+     */
     public record DirectoryItem(String roomId, String title, String ownerName, String createdAt, boolean isMine) {}
 
-    /** 目录分页结果，终页发送显式的 null 游标。 */
+    /**
+     * 目录分页结果。
+     * @param items 按创建时间及房间 UUID 倒序排列的本页房间
+     * @param nextCursor 继续相同查询的不透明游标，终页显式返回 null
+     */
     public record DirectoryResponse(List<DirectoryItem> items,
             @JsonInclude(JsonInclude.Include.ALWAYS) String nextCursor) {}
 

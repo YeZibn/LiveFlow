@@ -13,6 +13,7 @@ const props = defineProps<{
 const emit = defineEmits<{ logout: [] }>()
 
 const profile = ref<UserProfile>()
+// 草稿独立于最近一次读取的资料，取消和读取确认结果时各自维护。
 const draft = ref<ProfileForm>()
 const loading = ref(false)
 const saving = ref(false)
@@ -37,6 +38,7 @@ async function loadProfile() {
     // 同会话校验由认证层完成。这里只为仍挂载的主页更新状态。
     if (active) {
       profile.value = current
+      // 结果不明确时重新读取数据库值，但保留用户的编辑草稿供比较。
       confirmed.value = uncertain.value && Boolean(draft.value)
       uncertain.value = false
     }

@@ -87,6 +87,8 @@ public class AuthController {
      * @param request 用于读取可信来源地址与清除旧 CSRF 状态
      * @param response 用于清除旧 CSRF Cookie
      * @return Access Token 正文及 Refresh Cookie
+     * @throws AuthFailure 输入无效、凭证错误、登录限流或会话无法确认
+     * @throws DataAccessException 账号存储不可用
      */
     @PostMapping("/login")
     public ResponseEntity<TokenResponse> login(@RequestBody LoginRequest input,
@@ -101,6 +103,7 @@ public class AuthController {
      * 轮换刷新凭证，保留原登录会话。
      * @param cookie 浏览器附带的当前刷新凭证
      * @return Access Token 正文及新的 Refresh Cookie
+     * @throws AuthFailure Cookie 缺失、无效、被重放或会话存储不可用
      */
     @PostMapping("/refresh")
     public ResponseEntity<TokenResponse> refresh(@CookieValue(name = COOKIE, required = false) String cookie) {
@@ -114,6 +117,7 @@ public class AuthController {
      * @param request 当前请求
      * @param response 用于清除旧 CSRF Cookie
      * @return 写入过期 Refresh Cookie 的 204 响应
+     * @throws AuthFailure 目标不匹配、Cookie 无效或撤销无法确认
      */
     @PostMapping("/logout")
     public ResponseEntity<Void> logout(@RequestBody LogoutRequest input,
@@ -129,6 +133,8 @@ public class AuthController {
      * 从安全上下文确定调用者并读取账号摘要。
      * @param jwt 签名、时效和 Redis 会话均验证通过的 JWT
      * @return 用户 ID 的字符串表示和用户名
+     * @throws AuthFailure 认证身份对应的账号已不存在
+     * @throws DataAccessException 账号存储不可用
      */
     @GetMapping("/me")
     public CurrentUserResponse me(@AuthenticationPrincipal Jwt jwt) {
@@ -136,6 +142,11 @@ public class AuthController {
         return new CurrentUserResponse(Long.toString(account.id()), account.username());
     }
 
+    /**
+     * 为登录和刷新构造统一响应，并将两种凭证写入各自的交付渠道。
+     * @param credentials 业务层已确认的凭证和会话期限
+     * @return 带 no-store、Access Token 正文和刷新 Cookie 的响应
+     */
     private ResponseEntity<TokenResponse> tokenResponse(AuthService.Credentials credentials) {
         Jwt jwt = credentials.access();
         long expiresIn = Duration.between(jwt.getIssuedAt(), jwt.getExpiresAt()).toSeconds();
@@ -147,11 +158,22 @@ public class AuthController {
                 .header(HttpHeaders.SET_COOKIE, refreshCookie(credentials.refreshToken(), remaining)).body(body);
     }
 
+    /**
+     * 序列化认证接口使用的刷新 Cookie。
+     * @param value 原始刷新凭证，清除 Cookie 时传入空串
+     * @param maxAgeSeconds Cookie 剩余秒数，传入 0 时清除
+     * @return 可直接写入 Set-Cookie 的值
+     */
     private String refreshCookie(String value, long maxAgeSeconds) {
         return ResponseCookie.from(COOKIE, value).httpOnly(true).secure(secureCookie)
                 .sameSite("Lax").path("/api/v1/auth").maxAge(maxAgeSeconds).build().toString();
     }
 
+    /**
+     * 密码登录请求。
+     * @param username 保留大小写的原始账号名
+     * @param password 用户提交的密码，不显示在请求对象的字符串表示中
+     */
     public record LoginRequest(String username, String password) {
         @Override
         public String toString() {
@@ -159,8 +181,20 @@ public class AuthController {
         }
     }
 
+    /**
+     * 定向退出请求。
+     * @param sessionId 页面点击退出时持有的会话 ID
+     */
     public record LogoutRequest(UUID sessionId) {}
 
+    /**
+     * 登录和刷新共用的 Access Token 响应。
+     * @param accessToken 短期 JWT，由客户端保留在内存
+     * @param tokenType Authorization 请求头使用的 Bearer 类型
+     * @param expiresIn JWT 从签发到到期的有效秒数
+     * @param sessionId 浏览器可用来识别会话变更的非秘密标识
+     * @param sessionExpiresAt 整次登录的绝对截止时间，刷新后保持原值
+     */
     public record TokenResponse(String accessToken, String tokenType, long expiresIn,
             UUID sessionId, Instant sessionExpiresAt) {
         @Override
@@ -169,5 +203,10 @@ public class AuthController {
         }
     }
 
+    /**
+     * 注册成功或当前账号查询返回的账号摘要。
+     * @param userId 十进制字符串形式的账号 ID
+     * @param username 保留原拼写的账号名
+     */
     public record CurrentUserResponse(String userId, String username) {}
 }

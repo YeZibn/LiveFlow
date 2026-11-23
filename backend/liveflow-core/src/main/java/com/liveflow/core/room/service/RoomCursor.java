@@ -64,6 +64,12 @@ record RoomCursor(LocalDateTime createdAt, String roomId) {
         return Base64.getUrlEncoder().withoutPadding().encodeToString(data.getBytes(StandardCharsets.US_ASCII));
     }
 
+    /**
+     * 按 UTF-8 编码计算规范化关键词的摘要，用于检查游标是否属于同一搜索。
+     * @param keyword 规范化关键词，浏览全部时为空字符串
+     * @return 小写十六进制 SHA-256 摘要
+     * @throws IllegalStateException 当前运行时无法提供 SHA-256
+     */
     private static String fingerprint(String keyword) {
         try {
             var digest = MessageDigest.getInstance("SHA-256");

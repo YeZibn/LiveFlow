@@ -150,7 +150,13 @@ public class RoomMessageService {
         }
     }
 
-    /** 在持有受理锁时判断是否已有结果，非空结果沿用原回执。 */
+    /**
+     * 在持有受理锁时判重。原回执命中后无需读取资料、扣减额度或再次入队。
+     * @param key 会话、房间与客户端消息标识组成的去重键
+     * @param content 已规范化的提交正文
+     * @return 已受理的原回执，未找到记录时为 null
+     * @throws RoomMessageFailure 同一标识已绑定不同的规范化正文
+     */
     private Receipt replay(RequestKey key, String content) {
         Accepted prior = accepted.get(key);
         if (prior == null) {
@@ -175,6 +181,10 @@ public class RoomMessageService {
         }
     }
 
+    /**
+     * 在受理锁内清理过期回执。记录按受理顺序插入，遇到首条未过期记录即可停止。
+     * @param now 本次裁决的单调时钟读数，单位为纳秒
+     */
     private void expireReceipts(long now) {
         var entries = accepted.values().iterator();
         while (entries.hasNext() && now - entries.next().acceptedAt() >= replayTtl) {
@@ -182,12 +192,23 @@ public class RoomMessageService {
         }
     }
 
+    /**
+     * 在受理锁内从队列头移除滚动窗口之外的发送时间。
+     * @param recent 按受理顺序保存的账号发送时间
+     * @param now 本次裁决的单调时钟读数，单位为纳秒
+     */
     private void expireAttempts(ArrayDeque<Long> recent, long now) {
         while (!recent.isEmpty() && now - recent.getFirst() >= window) {
             recent.removeFirst();
         }
     }
 
+    /**
+     * 按单行文本规则校验原文，再清理首尾 Unicode 空白。
+     * @param raw 从 HTTP 请求收到的原始弹幕
+     * @return 保留内部空白且长度为 1–100 个码点的正文
+     * @throws RoomMessageFailure 原始字符或规范化后的长度无效
+     */
     private static String normalize(String raw) {
         // 检查原文后再去除首尾空白，防止首尾换行被规范化掩盖。
         if (raw == null || raw.codePoints().anyMatch(point -> Character.isISOControl(point)
@@ -206,6 +227,10 @@ public class RoomMessageService {
     private record RequestKey(UUID sessionId, String roomId, String clientMessageId) {}
     private record Accepted(String content, Receipt receipt, long acceptedAt) {}
 
-    /** HTTP 受理结果，重试命中时复用原标识和时间。 */
+    /**
+     * HTTP 受理结果，重试命中时复用原标识和时间。
+     * @param messageId 服务端生成的消息 UUID
+     * @param sentAt 服务端确认本次受理的 UTC 时间
+     */
     public record Receipt(String messageId, Instant sentAt) {}
 }

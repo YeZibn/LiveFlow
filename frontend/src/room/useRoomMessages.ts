@@ -29,6 +29,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   let retryCount = 0
   let generation = 0
   let active = true
+  // 保留发送结果不明的原请求。用户重试相同输入时沿用客户端消息标识。
   let uncertain: MessageSubmission | undefined
 
   const canSend = computed(() => state.value === 'ready' && !submitting.value && content.value.trim().length > 0)
@@ -43,10 +44,20 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     socket?.close()
   })
 
+  /**
+   * 确认异步回调仍属于当前尝试，防止关掉旧连接后覆盖新连接状态。
+   * @param attempt 发起回调时记录的连接代次
+   * @param connection 可选的具体连接，用于检查 WebSocket 事件
+   * @returns 页面仍在且连接尝试未被替换时为 true
+   */
   function isCurrent(attempt: number, connection?: WebSocket) {
     return active && attempt === generation && (!connection || socket === connection)
   }
 
+  /**
+   * 按设定的延迟顺序安排下一次重连，耗尽次数后交给手动重连。
+   * @param attempt 刚结束或失败的连接代次
+   */
   function scheduleReconnect(attempt: number) {
     if (!isCurrent(attempt)) return
     const delay = RECONNECT_DELAYS[retryCount]
@@ -78,6 +89,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
       if (!isCurrent(attempt)) return
       const connection = openRoomSocket()
       socket = connection
+      // 收到应用层 ready 才表示入房成功。超时关闭当前连接，由关闭回调统一处理重连。
       readyTimer = window.setTimeout(() => {
         if (isCurrent(attempt, connection)) connection.close()
       }, 8000)
@@ -100,6 +112,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
           return
         }
         if (frame.type === 'ready') {
+          // 只有成功加入对应房间才重置自动重连次数并启用发送。
           window.clearTimeout(readyTimer)
           retryCount = 0
           state.value = 'ready'
@@ -164,6 +177,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
       await withAccess(access => sendRoomMessage(access, roomId, submission))
       if (!active) return
       uncertain = undefined
+      // 只清除与这次回执对应的输入，已变更的草稿保留。
       if (content.value === raw) content.value = ''
       feedback.value = '弹幕已提交'
     } catch (cause) {

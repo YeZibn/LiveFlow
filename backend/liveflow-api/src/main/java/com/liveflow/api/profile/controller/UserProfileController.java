@@ -61,9 +61,16 @@ public class UserProfileController {
     @PutMapping(consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<ProfileResponse> save(@AuthenticationPrincipal Jwt jwt, @RequestBody JsonNode body) {
         UpdateProfileRequest input = parse(body);
+        // 资料归属只从安全上下文取得，提交的三个字段仅用于更新资料内容。
         return response(profiles.save(Long.parseLong(jwt.getSubject()), input.nickname(), input.avatarKey(), input.bio()));
     }
 
+    /**
+     * 解析完整资料表单，拒绝未知字段并收集缺失或类型错误的已知字段。
+     * @param body HTTP 请求中的 JSON 节点
+     * @return 包含昵称、头像标识和简介的原始表单
+     * @throws InvalidProfileException 请求结构或字段类型无效
+     */
     private static UpdateProfileRequest parse(JsonNode body) {
         // 在此入口检查字段与 JSON 类型，避免其他接口受全局反序列化规则影响。
         if (!body.isObject() || !EDITABLE_FIELDS.containsAll(body.propertyNames())) {
@@ -82,6 +89,11 @@ public class UserProfileController {
                 body.get("bio").asString());
     }
 
+    /**
+     * 生成本人资料的统一读取或保存响应，内部账号 ID 以字符串形式传输。
+     * @param profile 已组装的本人资料或默认资料
+     * @return 不可缓存的 JSON 响应
+     */
     private static ResponseEntity<ProfileResponse> response(Profile profile) {
         var body = new ProfileResponse(Long.toString(profile.userId()), profile.username(), profile.nickname(),
                 profile.displayName(), profile.avatarKey(), profile.bio());

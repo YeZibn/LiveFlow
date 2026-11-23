@@ -16,6 +16,7 @@ const formatter = new Intl.DateTimeFormat('zh-CN', {
 })
 const stateName = { connecting: '连接中', ready: '已连接', reconnecting: '正在重连', offline: '连接已断开' }
 
+// 先从更新前的 DOM 取可见位置，等 Vue 渲染后再应用跟随或阅读锚点。
 watch(messages, async updated => {
   const node = log.value
   if (!node) return
@@ -38,7 +39,11 @@ watch(messages, async updated => {
   }
 })
 
-/** @param node 当前独立滚动的消息列表 */
+/**
+ * 判断阅读位置是否在列表底部附近，容许行高和像素取整带来的少量偏差。
+ * @param node 当前独立滚动的消息列表
+ * @returns 距底部不超过 24 像素时为 true
+ */
 function isNearBottom(node: HTMLElement) {
   return node.scrollHeight - node.clientHeight - node.scrollTop <= 24
 }
@@ -54,7 +59,10 @@ function jumpToLatest() {
   hasNewMessages.value = false
 }
 
-/** @param event 回车键事件，用于区分候选词确认和发送 */
+/**
+ * 普通回车会发送当前弹幕，输入法组字期间保留回车确认候选词的行为。
+ * @param event 弹幕输入框的键盘事件
+ */
 function handleEnter(event: KeyboardEvent) {
   if (event.isComposing || event.keyCode === 229) return
   event.preventDefault()

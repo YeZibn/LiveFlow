@@ -26,6 +26,10 @@ public class RedisRoomTicketStore implements RoomTicketStore {
         this.json = json;
     }
 
+    /**
+     * {@inheritDoc}
+     * 在一次 SET 中加入 NX 和失效时间，避免无期限票据或覆盖同摘要的现有绑定。
+     */
     @Override
     public boolean put(String digest, Binding binding, Duration lifetime) {
         Boolean stored = redis.opsForValue().setIfAbsent(PREFIX + digest, json.writeValueAsString(binding), lifetime);
@@ -35,6 +39,10 @@ public class RedisRoomTicketStore implements RoomTicketStore {
         return stored;
     }
 
+    /**
+     * {@inheritDoc}
+     * GETDEL 让并发兑换只有一个能读到内容。解析或后续鉴权失败仍保留已消费结果。
+     */
     @Override
     public Optional<Binding> consume(String digest) {
         String stored = redis.opsForValue().getAndDelete(PREFIX + digest);

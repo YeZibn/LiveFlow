@@ -39,7 +39,10 @@ class RoomSocketConfiguration implements WebSocketConfigurer {
                 .toList();
     }
 
-    /** @param registry Spring WebSocket 路由和来源校验注册表 */
+    /**
+     * 注册房间接收路径，握手时检查浏览器来源，登录会话由升级后的首帧票据确认。
+     * @param registry Spring WebSocket 路由和来源校验注册表
+     */
     @Override
     public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
         var route = registry.addHandler(handler, "/ws/rooms").addInterceptors(new HandshakeInterceptor() {
@@ -62,6 +65,7 @@ class RoomSocketConfiguration implements WebSocketConfigurer {
                 // 来源校验无需保留握手后的状态。
             }
         });
+        // 显式配置时同时交给 Spring 校验。空列表保留框架默认的同源约束。
         if (!allowedOrigins.isEmpty()) {
             route.setAllowedOrigins(allowedOrigins.toArray(String[]::new));
         }

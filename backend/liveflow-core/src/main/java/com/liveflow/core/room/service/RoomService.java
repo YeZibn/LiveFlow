@@ -135,6 +135,16 @@ public class RoomService {
         }
     }
 
+    /**
+     * 在独立事务中写入并回读房间。重试调用会生成新的 UUID。
+     * @param ownerUserId 已认证的房主账号 ID
+     * @param title 已校验并规范化的房间名称
+     * @return 事务提交后的房间
+     * @throws RoomAlreadyExistsException 房主唯一约束拒绝写入
+     * @throws AuthFailure 房主账号已不存在
+     * @throws DataAccessException 写入、读取或 UUID 唯一约束失败
+     * @throws TransactionException 事务无法完成
+     */
     private Room insertRoom(long ownerUserId, String title) {
         String roomId = UUID.randomUUID().toString();
         return transaction.execute(status -> {
@@ -154,11 +164,23 @@ public class RoomService {
         });
     }
 
+    /**
+     * 判断 MySQL 的重复键异常是否来自指定索引。
+     * @param failure MyBatis 转换后的重复键异常
+     * @param key 匹配底层错误末尾索引名的表达式
+     * @return 底层异常明确报告该索引时为 true
+     */
     private static boolean matchesConstraint(DuplicateKeyException failure, Pattern key) {
         String detail = failure.getMostSpecificCause().getMessage();
         return detail != null && key.matcher(detail).find();
     }
 
+    /**
+     * 先验证原始单行输入，再清理首尾空白并按码点检查长度。
+     * @param title 创建请求的原始标题
+     * @return 保留内部空白和大小写的标题
+     * @throws InvalidTitleException 原始字符或规范化后的长度不符合约定
+     */
     private static String normalizeTitle(String title) {
         // 先校验原始字符，避免首尾换行被去除后绕过单行校验。
         if (title == null || !isSingleLine(title)) {
@@ -172,12 +194,22 @@ public class RoomService {
         return normalized;
     }
 
+    /**
+     * 验证标题与关键词共用的字符规则，拒绝控制字符、行段分隔符和未配对代理项。
+     * @param value 已确认非 null 的原始字符串
+     * @return 原始字符串可作为单行文本时为 true
+     */
     private static boolean isSingleLine(String value) {
         return value.codePoints().noneMatch(point -> Character.isISOControl(point)
                 || point == 0x2028 || point == 0x2029
                 || (point >= Character.MIN_SURROGATE && point <= Character.MAX_SURROGATE));
     }
 
+    /**
+     * 按 Unicode 空白规则清理输入两端。
+     * @param value 已完成字符校验的非 null 输入
+     * @return 保留内部空白的字符串
+     */
     private static String trim(String value) {
         return EDGE_WHITESPACE.matcher(value).replaceAll("");
     }

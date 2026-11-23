@@ -19,6 +19,7 @@ import org.springframework.stereotype.Service;
 
 import static com.liveflow.core.room.message.RoomMessageFailure.Code.*;
 
+/** 将已认证的 HTTP 会话交接给一次性的房间 WebSocket 首帧。 */
 @Service
 public class RoomTicketService {
 
@@ -30,10 +31,12 @@ public class RoomTicketService {
     private final Duration lifetime;
 
     /**
+     * 构造带固定期限的房间票据服务。
      * @param tickets 短期票据存储
      * @param rooms 现有房间查询服务
      * @param sessions 当前会话存储
      * @param ttlSeconds 票据有效秒数
+     * @throws IllegalArgumentException 票据有效期不是正数
      */
     public RoomTicketService(RoomTicketStore tickets, RoomService rooms, AuthSessionStore sessions,
             @Value("${liveflow.room-messages.ticket-ttl-seconds:30}") int ttlSeconds) {
@@ -57,6 +60,7 @@ public class RoomTicketService {
      */
     public Issued issue(long userId, UUID sessionId, String roomId) {
         requireRoom(roomId);
+        // NX 未写入时重新生成一次票据，保留同摘要下已有的连接绑定。
         for (int attempt = 0; attempt < 2; attempt++) {
             byte[] bytes = new byte[32];
             random.nextBytes(bytes);
@@ -87,6 +91,12 @@ public class RoomTicketService {
         return binding;
     }
 
+    /**
+     * 在票据签发和兑换时共用房间检查。
+     * @param roomId 需要验证的对外房间 UUID
+     * @throws RoomMessageFailure UUID 格式无效或房间不存在
+     * @throws DataAccessException 房间查询失败
+     */
     private void requireRoom(String roomId) {
         if (!RoomUuid.isCanonical(roomId)) {
             throw new RoomMessageFailure(INVALID_REQUEST);
@@ -96,6 +106,12 @@ public class RoomTicketService {
         }
     }
 
+    /**
+     * 为原始票据计算 Redis 键使用的摘要。
+     * @param ticket 签发或通过格式校验的 ASCII 票据
+     * @return 小写十六进制 SHA-256 摘要
+     * @throws IllegalStateException 当前运行时无法提供 SHA-256
+     */
     private static String digest(String ticket) {
         try {
             return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
@@ -105,6 +121,10 @@ public class RoomTicketService {
         }
     }
 
-    /** 签发接口使用的短期票据与有效期。 */
+    /**
+     * 签发接口使用的短期票据与有效期。
+     * @param ticket 仅交付签发请求方的原始票据
+     * @param expiresIn 票据有效期，单位为秒
+     */
     public record Issued(String ticket, long expiresIn) {}
 }

@@ -12,6 +12,13 @@ public interface RoomMessageBroadcast {
      */
     void enqueue(Message message);
 
-    /** 本机分发使用的数据，房间 UUID 用于路由。 */
+    /**
+     * 本机分发事件。同一事件为该房间的接收者提供一致的显示字段。
+     * @param roomId 仅用于路由到对应的房间
+     * @param messageId 与 HTTP 回执共用的消息 UUID
+     * @param senderName 受理该条消息时读取的发送者显示名
+     * @param content 已规范化的纯文本正文
+     * @param sentAt 服务端受理时间
+     */
     record Message(String roomId, String messageId, String senderName, String content, Instant sentAt) {}
 }

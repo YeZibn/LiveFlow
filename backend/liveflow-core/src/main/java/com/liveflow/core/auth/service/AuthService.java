@@ -34,7 +34,8 @@ public class AuthService {
     private final String absentAccountHash = passwords.encode(UUID.randomUUID().toString());
 
     /**
-     * @param users 用于读取账号及密码哈希的查询入口
+     * 创建认证编排服务并绑定账号存储、会话存储和 JWT 签发器。
+     * @param users 用于创建账号及读取账号和密码哈希的入口
      * @param sessions 当前登录会话的权威仓储
      * @param tokens 用于签发短期访问凭证的组件
      */
@@ -68,6 +69,7 @@ public class AuthService {
             }
         } catch (DuplicateKeyException ex) {
             String reason = ex.getMostSpecificCause().getMessage();
+            // 只有账号名唯一索引冲突等价于重名，其他重复键错误由通用异常映射处理。
             if (reason != null && (reason.endsWith(".uk_users_username'") || reason.endsWith("'uk_users_username'"))) {
                 throw new AuthFailure(AUTH_USERNAME_ALREADY_EXISTS);
             }
@@ -83,6 +85,8 @@ public class AuthService {
      * @param source 可信连接的来源地址
      * @return 已提交会话的客户端凭证和有效期
      * @throws AuthFailure 输入无效、密码错误、限流或无法确认会话
+     * @throws DataAccessException 账号存储不可用
+     * @throws org.springframework.security.oauth2.jwt.JwtEncodingException 无法签发 Access Token
      */
     public Credentials login(String username, String password, String source) {
         if (!validUsername(username) || password == null || password.isEmpty()
@@ -112,12 +116,14 @@ public class AuthService {
      * @param cookie 浏览器现有 Refresh Cookie 值
      * @return 新凭证及原有会话信息
      * @throws AuthFailure 凭证不可用、已重放或依赖不可用
+     * @throws org.springframework.security.oauth2.jwt.JwtEncodingException 轮换后无法签发 Access Token
      */
     public Credentials refresh(String cookie) {
         var current = RefreshToken.parse(cookie);
         var next = RefreshToken.issue(current.userId(), current.sessionId());
         // 在 Redis 一次性消费旧摘要，并取回原会话的截止时间。
         Instant expiresAt = sessions.rotate(current.userId(), current.sessionId(), current.digest(), next.digest());
+        // 到这里旧凭证已被消耗。若响应结果不明确，客户端应重新登录。
         Jwt jwt = tokens.issue(next.userId(), next.sessionId(), expiresAt);
         return new Credentials(jwt, next.sessionId(), expiresAt, next.value());
     }
@@ -141,10 +147,11 @@ public class AuthService {
     }
 
     /**
-     * 查询已认证用户的公开数据。
+     * 查询当前调用者自己的账号摘要。
      * @param userId 从通过鉴权的 JWT 取得的用户 ID
      * @return 当前用户公开信息
      * @throws AuthFailure 账号已不存在
+     * @throws DataAccessException 账号存储不可用
      */
     public UserMapper.Account currentUser(long userId) {
         var account = users.findById(userId);
@@ -154,11 +161,22 @@ public class AuthService {
         return account;
     }
 
+    /**
+     * 校验账号名的字符集和长度，沿用提交时的大小写。
+     * @param username 用户提交的原样账号名
+     * @return 满足注册和登录共用的账号格式时为 true
+     */
     private static boolean validUsername(String username) {
         return username != null && USERNAME.matcher(username).matches();
     }
 
-    /** 服务内部的凭证交付结果。Controller 负责将刷新凭证写入 HttpOnly Cookie。 */
+    /**
+     * 服务内部的凭证交付结果。Controller 将刷新凭证写入 HttpOnly Cookie。
+     * @param access 已签发的 Access Token
+     * @param sessionId 服务端登记的登录会话 ID
+     * @param expiresAt Redis 会话的绝对截止时间
+     * @param refreshToken 待写入 Cookie 的原始刷新凭证
+     */
     public record Credentials(Jwt access, UUID sessionId, Instant expiresAt, String refreshToken) {
         @Override
         public String toString() {

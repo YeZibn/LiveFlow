@@ -9,6 +9,7 @@ const props = defineProps<{
   authBusy: boolean
 }>()
 
+// undefined 表示尚未读到结果，null 表示服务端确认该账号还没有房间。
 const room = ref<Room | null>()
 const loading = ref(true)
 const submitting = ref(false)
@@ -73,6 +74,7 @@ function closeForm() {
  */
 async function submit() {
   if (submitting.value || loading.value || props.authBusy || readError.value || room.value !== null) return
+  // 如果 Access Token 在写入前被明确拒绝，续期后的重发仍使用同一标题快照。
   const submittedTitle = title.value
   submitting.value = true
   createError.value = ''

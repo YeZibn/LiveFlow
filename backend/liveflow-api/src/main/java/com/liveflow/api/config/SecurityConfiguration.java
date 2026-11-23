@@ -26,6 +26,10 @@ import org.springframework.security.web.csrf.CsrfFilter;
 @Configuration(proxyBeanMethods = false)
 class SecurityConfiguration {
 
+    /**
+     * 为同源 SPA 提供可读取的 CSRF Cookie，以便写请求将值回传到请求头。
+     * @return 与认证控制器和安全过滤链共用的 Cookie 仓储
+     */
     @Bean
     CookieCsrfTokenRepository csrfTokens() {
         return CookieCsrfTokenRepository.withHttpOnlyFalse();
@@ -49,6 +53,7 @@ class SecurityConfiguration {
     SecurityFilterChain securityFilterChain(HttpSecurity http, Environment environment,
             CookieCsrfTokenRepository csrfTokens, AccessTokenService decoder,
             AuthSessionStore sessions, AuthSecurityErrors errors) throws Exception {
+        // 当前登录由 JWT 与 Redis 会话决定，Servlet 会话无需保存认证状态或待恢复请求。
         return http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(AbstractHttpConfigurer::disable)
                 .logout(AbstractHttpConfigurer::disable)

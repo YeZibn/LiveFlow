@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import AuthView from './auth/AuthView.vue'
 import DevelopmentCheck from './DevelopmentCheck.vue'
 
+// 路由以浏览器地址为准。登录或恢复会话只切换视图，保留直达链接的查询参数。
 const location = ref(new URL(window.location.href))
 const listReturn = ref('/')
 const showDevelopmentCheck = computed(() => location.value.pathname === '/dev')
@@ -31,6 +32,7 @@ onUnmounted(() => window.removeEventListener('popstate', readLocation))
 function navigate(url: URL) {
   if (url.href === location.value.href) return
   const fromDirectory = location.value.pathname === '/' && url.pathname.startsWith('/rooms/')
+  // 目录来源只写入当前历史记录，复制房间链接时无需携带搜索条件。
   window.history.pushState(fromDirectory ? { roomList: directoryHref.value } : null, '', url)
   readLocation()
   window.scrollTo(0, 0)

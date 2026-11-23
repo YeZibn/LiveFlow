@@ -38,7 +38,11 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectReader;
 import tools.jackson.databind.json.JsonMapper;
 
-/** 管理本机房间接收连接。房间入队与每条连接的网络写入分离。 */
+/**
+ * 管理本机房间的 WebSocket 连接，从首帧兑换票据到最后释放连接名额。
+ * 房间成员关系和队列入队受 {@code monitor} 保护。每条连接独占一个写线程，
+ * Redis 复查和阻塞网络写入均在房间锁外执行。
+ */
 @Component
 public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomMessageBroadcast {
 
@@ -62,10 +66,12 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
     private final Object monitor = new Object();
     private final Map<String, Connection> connections = new HashMap<>();
     private final Map<String, Set<Connection>> rooms = new HashMap<>();
+    // 待鉴权名额涵盖 PENDING 与 AUTHENTICATING。总连接名额一直保留到写线程退出。
     private int pending;
     private boolean stopped;
 
     /**
+     * 初始化连接限制和严格的首帧解析器。
      * @param tickets 连接票据兑换服务
      * @param sessions 当前会话复查服务
      * @param json 应用 JSON 映射器
@@ -75,6 +81,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
      * @param authSeconds 首帧及鉴权允许的秒数
      * @param recheckSeconds 当前会话复查间隔
      * @param writeMillis Tomcat 单次阻塞写入的毫秒上限
+     * @throws IllegalArgumentException 任一容量或时间参数小于 1
      */
     public RoomSocketHandler(RoomTicketService tickets, AuthSessionStore sessions, JsonMapper json,
             @Value("${liveflow.room-messages.connection-limit:512}") int connectionLimit,
@@ -149,6 +156,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
                 close(connection, CloseStatus.POLICY_VIOLATION, null);
                 return;
             }
+            // 在锁内认领首帧，避免另一帧在兑换票据期间也进入鉴权。
             connection.state = State.AUTHENTICATING;
         }
 
@@ -161,6 +169,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
             var binding = tickets.redeem(input.get("ticket").asString());
             var ready = text(new ReadyFrame("ready", binding.roomId()));
             synchronized (monitor) {
+                // Redis 往返期间连接可能超时或断开。只有仍处于鉴权状态的连接才能入房。
                 if (connection.state != State.AUTHENTICATING) {
                     return;
                 }
@@ -187,13 +196,21 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
-    /** @param socket 发送不受支持的二进制帧的连接 */
+    /**
+     * 关闭发送二进制应用帧的连接。房间的应用首帧使用文本 JSON。
+     * @param socket 发送该帧的连接
+     * @param frame 收到的二进制帧，其内容无需解析
+     */
     @Override
     protected void handleBinaryMessage(WebSocketSession socket, BinaryMessage frame) {
         disconnect(socket, CloseStatus.BAD_DATA);
     }
 
-    /** @param socket 返回协议级心跳的连接 */
+    /**
+     * 记录就绪连接的协议级心跳响应。
+     * @param socket 返回 Pong 的连接
+     * @param frame 协议级 Pong 帧，其载荷无需读取
+     */
     @Override
     protected void handlePongMessage(WebSocketSession socket, PongMessage frame) {
         synchronized (monitor) {
@@ -204,13 +221,21 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
-    /** @param socket 传输失败的连接 */
+    /**
+     * 传输失败时撤销连接的接收资格，并通知写线程收尾。
+     * @param socket 传输失败的连接
+     * @param failure 容器报告的异常，统一映射为服务端关闭状态
+     */
     @Override
     public void handleTransportError(WebSocketSession socket, Throwable failure) {
         disconnect(socket, CloseStatus.SERVER_ERROR);
     }
 
-    /** @param socket 已经关闭的连接 */
+    /**
+     * 容器关闭回调也走同一个连接清理流程。
+     * @param socket 已关闭的连接
+     * @param status 容器报告的关闭状态
+     */
     @Override
     public void afterConnectionClosed(WebSocketSession socket, CloseStatus status) {
         disconnect(socket, status);
@@ -265,6 +290,11 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
+    /**
+     * 在持有房间锁时推进就绪连接的心跳和登录会话复查。
+     * @param connection 当前就绪的连接
+     * @param now 本轮调度的单调时钟读数，单位为纳秒
+     */
     private void maintainReady(Connection connection, long now) {
         if (connection.awaitingPong && now - connection.lastPing >= HEARTBEAT_TIMEOUT) {
             close(connection, CloseStatus.SESSION_NOT_RELIABLE, null);
@@ -277,6 +307,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
                 return;
             }
         }
+        // checking 将每条连接的并发复查限制为一个，慢查询不会累积新的 Redis 调用。
         if (!connection.checking && now - connection.lastCheck >= recheckInterval) {
             connection.checking = true;
             Binding binding = connection.binding;
@@ -284,6 +315,11 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
+    /**
+     * 在房间锁外复查绑定的登录会话。无法确认时关闭接收连接。
+     * @param connection 正在接受复查的连接
+     * @param binding 首帧鉴权时确认的账号、会话与房间
+     */
     private void recheck(Connection connection, Binding binding) {
         try {
             sessions.requireCurrent(binding.userId(), binding.sessionId());
@@ -299,6 +335,12 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
+    /**
+     * 在持有房间锁时尝试立即入队。容量耗尽时将该连接移出房间。
+     * @param connection 目标接收连接
+     * @param frame 要入队的广播或协议级心跳帧
+     * @return 帧已入队时为 true，连接因队列满而被关闭时为 false
+     */
     private boolean offer(Connection connection, WebSocketMessage<?> frame) {
         if (connection.outgoing.offer(new Output(frame, null))) {
             return true;
@@ -308,12 +350,24 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         return false;
     }
 
+    /**
+     * 按登录失效或认证依赖故障选择关闭状态。
+     * @param connection 鉴权或复查失败的连接
+     * @param cause 包含对外认证错误码的领域异常
+     */
     private void failAuth(Connection connection, AuthFailure cause) {
         CloseStatus status = cause.code() == AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE
                 ? CloseStatus.SERVER_ERROR : CloseStatus.POLICY_VIOLATION;
         fail(connection, cause.code().name(), cause.getMessage(), status);
     }
 
+    /**
+     * 排入错误帧和关闭指令，由此连接的写线程按序发送。
+     * @param connection 要关闭的连接
+     * @param code 客户端可识别的错误码
+     * @param message 可展示的错误说明
+     * @param status WebSocket 关闭状态
+     */
     private void fail(Connection connection, String code, String message, CloseStatus status) {
         TextMessage frame = text(new ErrorFrame("error", code, message));
         synchronized (monitor) {
@@ -321,6 +375,11 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
+    /**
+     * 定位尚在管理中的连接并请求关闭。重复回调可以安全到达。
+     * @param socket 容器传入的连接
+     * @param status 本次关闭原因
+     */
     private void disconnect(WebSocketSession socket, CloseStatus status) {
         synchronized (monitor) {
             var connection = connections.get(socket.getId());
@@ -330,6 +389,12 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
+    /**
+     * 在持有房间锁时撤销连接的接收资格。实际写入和关闭由写线程完成。
+     * @param connection 待关闭的连接
+     * @param status 在写线程退出时交给容器的关闭状态
+     * @param lastFrame 关闭前可选的错误帧，允许为 null
+     */
     private void close(Connection connection, CloseStatus status, TextMessage lastFrame) {
         if (connection.state == State.CLOSED) {
             return;
@@ -345,10 +410,15 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
             pending--;
         }
         connection.state = State.CLOSED;
+        // 关闭指令不应排在过时的广播后面。清空队列也为终止指令腾出空间。
         connection.outgoing.clear();
         connection.outgoing.add(new Output(lastFrame, status));
     }
 
+    /**
+     * 作为此连接唯一的写入者按队列顺序发帧，退出时释放总连接名额。
+     * @param connection 当前写线程独占的网络连接
+     */
     private void writeLoop(Connection connection) {
         CloseStatus status = CloseStatus.SERVER_ERROR;
         try {
@@ -378,6 +448,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
                 LOG.debug("房间连接关闭失败，连接 ID {}", connection.socket.getId());
             } finally {
                 synchronized (monitor) {
+                    // 只移除当前线程管理的实例，避免旧写线程清除同名的新记录。
                     connections.remove(connection.socket.getId(), connection);
                     connection.outgoing.clear();
                 }
@@ -385,6 +456,12 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
         }
     }
 
+    /**
+     * 将出站协议对象编码为文本帧。
+     * @param body 应用层发送内容
+     * @return 供连接队列复用的 JSON 文本帧
+     * @throws JacksonException 无法序列化出站对象
+     */
     private TextMessage text(Object body) {
         return new TextMessage(json.writeValueAsString(body));
     }

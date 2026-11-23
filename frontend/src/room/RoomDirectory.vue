@@ -8,6 +8,7 @@ const props = defineProps<{
   withAccess: <T>(call: (access: string) => Promise<T>) => Promise<T>
 }>()
 const emit = defineEmits<{ search: [keyword: string] }>()
+// 草稿和已提交关键词各自维护。仅 URL 中已提交的关键词决定列表查询。
 const draft = ref('')
 const inputError = ref('')
 const rooms = ref<DirectoryItem[]>([])
@@ -38,6 +39,7 @@ function submitSearch() {
   inputError.value = ''
   draft.value = query
   emit('search', query)
+  // 地址改变时由观察器加载首页。同词再次提交时主动刷新首页。
   if (query === props.keyword) void loadFirstPage()
 }
 
@@ -82,11 +84,13 @@ async function loadPage(cursor?: string) {
   } catch (cause) {
     if (current !== generation) return
     if (cursor && cause instanceof ApiRequestError && cause.code === 'INVALID_REQUEST') {
+      // 游标可能已失效，用相同关键词从无游标的首页恢复。
       await loadFirstPage()
       return
     }
     failure.value = cause instanceof ApiRequestError ? cause.message : '无法读取直播间，请重试。'
   } finally {
+    // 被替换的请求不能关闭新一次查询的加载状态。
     if (current === generation) loading.value = false
   }
 }

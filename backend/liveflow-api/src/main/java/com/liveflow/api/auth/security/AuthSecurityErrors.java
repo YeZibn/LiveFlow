@@ -76,6 +76,12 @@ public class AuthSecurityErrors implements AuthenticationEntryPoint, AccessDenie
         }
     }
 
+    /**
+     * 在进入 MVC 之前写出与控制器一致的认证错误正文。
+     * @param response 供安全过滤链直接写入的 HTTP 响应
+     * @param code 已识别的公开认证错误码
+     * @throws IOException 无法写入响应流
+     */
     private void write(HttpServletResponse response, AuthFailure.Code code) throws IOException {
         response.setStatus(AuthHttpError.status(code).value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);

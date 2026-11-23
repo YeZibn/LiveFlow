@@ -126,10 +126,19 @@ public class RoomMessageController {
                 .body(AuthHttpError.from(failure.code()));
     }
 
+    /**
+     * 从已验证的身份提取会话标识，供票据绑定及弹幕判重使用。
+     * @param jwt 通过安全过滤链的 Access Token
+     * @return 登录会话 UUID
+     */
     private static UUID sessionId(Jwt jwt) {
         return UUID.fromString(jwt.getClaimAsString("sid"));
     }
 
-    /** HTTP 提交回执。 */
+    /**
+     * HTTP 提交回执。客户端等待 WebSocket 广播后再追加弹幕。
+     * @param messageId 已受理消息的服务端 UUID，重复提交沿用原值
+     * @param sentAt 服务端受理时间，以带三位小数秒的 UTC 字符串传输
+     */
     public record MessageReceipt(String messageId, String sentAt) {}
 }

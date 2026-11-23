@@ -26,6 +26,11 @@ public interface RoomTicketStore {
      */
     Optional<Binding> consume(String digest);
 
-    /** 由服务端从已认证请求生成的房间连接身份。 */
+    /**
+     * 由服务端从已认证请求生成的连接身份。
+     * @param userId 用于复查会话的认证账号 ID
+     * @param sessionId 票据申请时的当前登录会话 ID
+     * @param roomId 票据授权接收的房间 UUID
+     */
     record Binding(long userId, UUID sessionId, String roomId) {}
 }

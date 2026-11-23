@@ -79,6 +79,14 @@ public class UserProfileService {
         });
     }
 
+    /**
+     * 汇总资料字段的校验问题。昵称字符检查使用原文，长度检查使用规范化后的值。
+     * @param originalName 用户提交的原始昵称
+     * @param nickname 去除两端空白后的昵称，允许为空
+     * @param avatarKey 需要精确匹配的预设头像标识
+     * @param bio 统一换行并清理两端空白后的简介
+     * @throws InvalidProfileException 任一字段不满足资料规则
+     */
     private static void validate(String originalName, String nickname, String avatarKey, String bio) {
         Map<String, String> errors = new LinkedHashMap<>();
         int nicknameLength = nickname.codePointCount(0, nickname.length());
@@ -102,7 +110,15 @@ public class UserProfileService {
         return point >= Character.MIN_SURROGATE && point <= Character.MAX_SURROGATE;
     }
 
-    /** 个人主页展示所需的本人资料。 */
+    /**
+     * 个人主页使用的本人资料，包含由昵称和账号名计算的显示名。
+     * @param userId 内部数值账号 ID
+     * @param username 保留原拼写的登录账号名
+     * @param nickname 用户设置的昵称，未设置时为空字符串
+     * @param displayName 使用昵称，空昵称时回退至账号名
+     * @param avatarKey 预设头像标识
+     * @param bio 规范化后的纯文本简介
+     */
     public record Profile(long userId, String username, String nickname, String displayName, String avatarKey,
             String bio) {}
 

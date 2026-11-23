@@ -31,7 +31,11 @@ public class AccessTokenService implements JwtDecoder {
     private final NimbusJwtDecoder decoder;
     private final NimbusJwtEncoder encoder;
 
-    /** @param signingKey 由部署注入的 Base64 签名密钥，至少 32 字节 */
+    /**
+     * 用相同的 HS256 密钥初始化签发器和解码器，并安装项目的声明校验。
+     * @param signingKey 由部署注入的 Base64 密钥，解码后至少 32 字节
+     * @throws IllegalArgumentException 密钥编码无效或长度不足
+     */
     public AccessTokenService(@Value("${liveflow.auth.signing-key}") String signingKey) {
         byte[] key = Base64.getDecoder().decode(signingKey);
         if (key.length < 32) {
@@ -49,6 +53,8 @@ public class AccessTokenService implements JwtDecoder {
      * @param sessionId 当前会话 ID
      * @param sessionExpiresAt 会话的绝对截止时间
      * @return 签发后的 JWT，包含有效期和签发时刻
+     * @throws AuthFailure 会话剩余有效期不足以签发有效凭证
+     * @throws org.springframework.security.oauth2.jwt.JwtEncodingException JWT 签发失败
      */
     public Jwt issue(long userId, UUID sessionId, Instant sessionExpiresAt) {
         Instant now = Instant.now().truncatedTo(ChronoUnit.SECONDS);
@@ -76,6 +82,11 @@ public class AccessTokenService implements JwtDecoder {
         return decoder.decode(token);
     }
 
+    /**
+     * 检查 JWT 身份声明和时效。签名已由解码器校验，Redis 会话校验随后执行。
+     * @param jwt 已解码并通过签名确认的 JWT
+     * @return 校验成功，或区分声明无效和单纯到期的结果
+     */
     private static OAuth2TokenValidatorResult validateClaims(Jwt jwt) {
         // 先校验身份声明和时效范围，只有其余声明有效的过期凭证才触发前端续期。
         try {
