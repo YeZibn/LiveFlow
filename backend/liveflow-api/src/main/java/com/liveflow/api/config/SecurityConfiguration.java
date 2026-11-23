@@ -83,7 +83,10 @@ class SecurityConfiguration {
                             .requestMatchers(HttpMethod.PUT, "/api/v1/users/me/profile").authenticated()
                             .requestMatchers(HttpMethod.GET, "/api/v1/users/me/room").authenticated()
                             .requestMatchers(HttpMethod.GET, "/api/v1/rooms/{roomId}").authenticated()
-                            .requestMatchers(HttpMethod.POST, "/api/v1/rooms").authenticated()
+                            .requestMatchers(HttpMethod.POST, "/api/v1/rooms", "/api/v1/rooms/{roomId}/ws-ticket",
+                                    "/api/v1/rooms/{roomId}/messages").authenticated()
+                            // HTTP 升级后先等待一次性票据，验票前连接不属于任何房间。
+                            .requestMatchers(HttpMethod.GET, "/ws/rooms").permitAll()
                             .anyRequest().denyAll();
                 }).build();
     }

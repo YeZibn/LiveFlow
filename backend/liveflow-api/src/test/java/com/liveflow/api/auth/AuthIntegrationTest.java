@@ -8,18 +8,26 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.WebSocket;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import javax.crypto.spec.SecretKeySpec;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -44,6 +52,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -69,6 +78,8 @@ class AuthIntegrationTest {
         registry.add("spring.data.redis.database", () -> 15);
         registry.add("liveflow.auth.registration-limit.max-attempts", () -> 10);
         registry.add("liveflow.auth.registration-limit.window-seconds", () -> 600);
+        registry.add("liveflow.room-messages.auth-seconds", () -> 2);
+        registry.add("liveflow.room-messages.recheck-seconds", () -> 1);
     }
 
     @Autowired JdbcTemplate jdbc;
@@ -582,6 +593,220 @@ class AuthIntegrationTest {
             assertThat(roomCount(userId)).isOne();
         } finally {
             jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", otherId);
+        }
+    }
+
+    @Test
+    void roomMessagesRejectUnauthorizedAndInvalidHttpRequests() throws Exception {
+        var browser = new Browser();
+        browser.csrf();
+        String missing = UUID.randomUUID().toString();
+        failure(browser.sendPath("POST", messagePath(missing, "ws-ticket"), null, null, true), 401, "AUTH_REQUIRED");
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        failure(browser.sendPath("POST", messagePath(room, "ws-ticket"), null, bearer, false), 403, "AUTH_CSRF_INVALID");
+        failure(browser.sendPath("POST", messagePath(missing, "ws-ticket"), null, bearer, true), 404, "ROOM_NOT_FOUND");
+        failure(browser.sendPath("POST", messagePath("73", "ws-ticket"), null, bearer, true), 400, "INVALID_REQUEST");
+        String valid = messageBody(UUID.randomUUID().toString(), "你好");
+        failure(browser.sendPath("POST", messagePath(room, "messages"), valid, bearer, false), 403, "AUTH_CSRF_INVALID");
+        failure(browser.sendPath("POST", messagePath(missing, "messages"), valid, bearer, true), 404, "ROOM_NOT_FOUND");
+        for (String invalid : List.of("{}", "{", "{\"clientMessageId\":\"bad\",\"content\":\"a\"}",
+                messageBody(UUID.randomUUID().toString(), "\n你好"), messageBody(UUID.randomUUID().toString(), "🎥".repeat(101)))) {
+            failure(browser.sendPath("POST", messagePath(room, "messages"), invalid, bearer, true), 400, "INVALID_REQUEST");
+        }
+    }
+
+    @Test
+    void roomTicketIsSingleUseAndExpiredAndWrongOriginConnectionsCannotJoin() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        assertThrows(java.util.concurrent.ExecutionException.class, () ->
+                HTTP.newWebSocketBuilder().header("Origin", "https://example.invalid")
+                        .buildAsync(URI.create("ws://127.0.0.1:" + port + "/ws/rooms"), new SocketClient())
+                        .get(3, TimeUnit.SECONDS));
+        try (var idle = connectRoom()) {
+            assertThat(idle.closeCode.get(5, TimeUnit.SECONDS)).isEqualTo(1008);
+        }
+        try (var malformed = connectRoom()) {
+            malformed.socket.sendText("{\"type\":\"send\"}", true).join();
+            assertThat(malformed.next().get("code").asString()).isEqualTo("INVALID_REQUEST");
+        }
+
+        String expired = ticket(browser, bearer, room);
+        String digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(expired.getBytes(StandardCharsets.US_ASCII)));
+        String key = "liveflow:rooms:ws-ticket:" + digest;
+        assertThat(redis.getExpire(key)).isBetween(1L, 30L);
+        redis.expire(key, Duration.ZERO);
+        try (var socket = connectRoom()) {
+            socket.authenticate(expired);
+            assertThat(socket.next().get("code").asString()).isEqualTo("TICKET_INVALID");
+        }
+
+        String shared = ticket(browser, bearer, room);
+        try (var first = connectRoom(); var second = connectRoom()) {
+            var a = first.authenticate(shared);
+            var b = second.authenticate(shared);
+            CompletableFuture.allOf(a, b).get(3, TimeUnit.SECONDS);
+            assertThat(List.of(first.next().get("type").asString(), second.next().get("type").asString()))
+                    .containsExactlyInAnyOrder("ready", "error");
+        }
+    }
+
+    @Test
+    void concurrentRoomMessageRetriesBroadcastOnceAndStayInTheRoom() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        String otherName = registrationName("Msg_");
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?", otherName, userId);
+        long otherId = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, otherName);
+        var viewer = new Browser();
+        String viewerBearer = access(viewer.login(otherName));
+        String otherRoom = createRoomFor(viewer, viewerBearer);
+        try (var sender = readyRoom(browser, bearer, room);
+                var receiver = readyRoom(viewer, viewerBearer, room);
+                var isolated = readyRoom(viewer, viewerBearer, otherRoom);
+                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var secondTab = new Browser();
+            secondTab.csrf();
+            String id = UUID.randomUUID().toString();
+            String path = messagePath(room, "messages");
+            var start = new CyclicBarrier(2);
+            var submissions = executor.<HttpResponse<String>>invokeAll(List.of(
+                    () -> {
+                        start.await(3, TimeUnit.SECONDS);
+                        return browser.sendPath("POST", path, messageBody(id, "　你好 "), bearer, true);
+                    },
+                    () -> {
+                        start.await(3, TimeUnit.SECONDS);
+                        return secondTab.sendPath("POST", path, messageBody(id, "你好"), bearer, true);
+                    }));
+            JsonNode receipt = roomResponse(submissions.getFirst().get(), 200);
+            assertThat(roomResponse(submissions.getLast().get(), 200)).isEqualTo(receipt);
+            JsonNode event = sender.next();
+            assertThat(event.get("type").asString()).isEqualTo("message");
+            assertThat(event.get("messageId")).isEqualTo(receipt.get("messageId"));
+            assertThat(event.get("sentAt")).isEqualTo(receipt.get("sentAt"));
+            assertThat(event.get("content").asString()).isEqualTo("你好");
+            assertThat(receiver.next()).isEqualTo(event);
+            failure(browser.sendPath("POST", path, messageBody(id, "已修改"), bearer, true), 409, "MESSAGE_ID_CONFLICT");
+            assertThat(sender.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
+            assertThat(receiver.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
+            assertThat(isolated.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
+
+            for (int i = 0; i < 4; i++) {
+                roomResponse(secondTab.sendPath("POST", path, messageBody(UUID.randomUUID().toString(), "下一条"),
+                        bearer, true), 200);
+            }
+            var limited = browser.sendPath("POST", messagePath(otherRoom, "messages"),
+                    messageBody(UUID.randomUUID().toString(), "不同房间"), bearer, true);
+            failure(limited, 429, "MESSAGE_RATE_LIMITED");
+            assertThat(limited.headers().firstValue("Retry-After")).hasValueSatisfying(
+                    value -> assertThat(Integer.parseInt(value)).isBetween(1, 10));
+            assertThat(isolated.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
+        } finally {
+            jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", otherId);
+        }
+    }
+
+    @Test
+    void roomSocketClosesOnSessionReplacementAndFailedRecheck() throws Exception {
+        var browser = new Browser();
+        JsonNode login = browser.login();
+        String bearer = access(login);
+        String room = createRoomFor(browser, bearer);
+        try (var old = readyRoom(browser, bearer, room)) {
+            var next = new Browser();
+            JsonNode replacement = next.login();
+            String current = access(replacement);
+            failure(browser.sendPath("POST", messagePath(room, "messages"),
+                    messageBody(UUID.randomUUID().toString(), "旧会话"), bearer, true), 401, "AUTH_SESSION_REPLACED");
+            assertThat(old.next().get("code").asString()).isEqualTo("AUTH_SESSION_REPLACED");
+            assertThat(old.closeCode.get(4, TimeUnit.SECONDS)).isEqualTo(1008);
+            try (var unavailable = readyRoom(next, current, room)) {
+                UUID sessionId = UUID.fromString(replacement.get("sessionId").asString());
+                doThrow(new AuthFailure(AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE))
+                        .when(sessions).requireCurrent(userId, sessionId);
+                assertThat(unavailable.next().get("code").asString()).isEqualTo("AUTH_SERVICE_UNAVAILABLE");
+                assertThat(unavailable.closeCode.get(4, TimeUnit.SECONDS)).isEqualTo(1011);
+            }
+        }
+    }
+
+    private static String messagePath(String roomId, String action) {
+        return ROOM_CREATE_PATH + "/" + roomId + "/" + action;
+    }
+
+    private String messageBody(String id, String content) {
+        return json.writeValueAsString(Map.of("clientMessageId", id, "content", content));
+    }
+
+    private String createRoomFor(Browser browser, String bearer) throws Exception {
+        return roomResponse(browser.sendPath("POST", ROOM_CREATE_PATH, roomBody("测试房间"), bearer, true), 201)
+                .get("roomId").asString();
+    }
+
+    private String ticket(Browser browser, String bearer, String roomId) throws Exception {
+        return roomResponse(browser.sendPath("POST", messagePath(roomId, "ws-ticket"), null, bearer, true), 200)
+                .get("ticket").asString();
+    }
+
+    private SocketClient readyRoom(Browser browser, String bearer, String roomId) throws Exception {
+        String issued = ticket(browser, bearer, roomId);
+        SocketClient socket = connectRoom();
+        socket.authenticate(issued).get(3, TimeUnit.SECONDS);
+        var ready = socket.next();
+        assertThat(ready.get("type").asString()).isEqualTo("ready");
+        assertThat(ready.get("roomId").asString()).isEqualTo(roomId);
+        return socket;
+    }
+
+    private SocketClient connectRoom() throws Exception {
+        var client = new SocketClient();
+        client.socket = HTTP.newWebSocketBuilder().header("Origin", "http://127.0.0.1:" + port)
+                .buildAsync(URI.create("ws://127.0.0.1:" + port + "/ws/rooms"), client).get(3, TimeUnit.SECONDS);
+        return client;
+    }
+
+    private final class SocketClient implements WebSocket.Listener, AutoCloseable {
+        final LinkedBlockingQueue<JsonNode> frames = new LinkedBlockingQueue<>();
+        final CompletableFuture<Integer> closeCode = new CompletableFuture<>();
+        final StringBuilder fragments = new StringBuilder();
+        WebSocket socket;
+
+        CompletableFuture<WebSocket> authenticate(String ticket) {
+            return socket.sendText(json.writeValueAsString(Map.of("type", "auth", "ticket", ticket)), true);
+        }
+
+        JsonNode next() throws InterruptedException {
+            var frame = frames.poll(4, TimeUnit.SECONDS);
+            assertThat(frame).as("服务端 WebSocket 帧").isNotNull();
+            return frame;
+        }
+
+        @Override
+        public java.util.concurrent.CompletionStage<?> onText(WebSocket source, CharSequence data, boolean last) {
+            fragments.append(data);
+            if (last) {
+                frames.add(json.readTree(fragments.toString()));
+                fragments.setLength(0);
+            }
+            source.request(1);
+            return null;
+        }
+
+        @Override
+        public java.util.concurrent.CompletionStage<?> onClose(WebSocket source, int statusCode, String reason) {
+            closeCode.complete(statusCode);
+            return null;
+        }
+
+        @Override
+        public void close() {
+            socket.abort();
         }
     }
 

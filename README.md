@@ -17,7 +17,7 @@ LiveFlow 是基于 Java 的直播弹幕系统。第一阶段用一个 Spring Boo
 
 Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应的 MyBatis-Plus Boot 4 starter。 [Spring Boot 3.5 发布说明](https://spring.io/blog/2026/06/25/spring-boot-3-5-16-available-now/) · [MyBatis-Plus 安装说明](https://baomidou.com/en/getting-started/install/)
 
-跨实例阶段的计划链路为 `WebSocket 接入 → Kafka`。广播消费组把事件发到 Redis Pub/Sub，各实例将消息推给本机房间连接。持久化消费组把事件批量写入 MySQL，供历史查询。HTTP 认证依赖 MySQL、Redis 和 Flyway。Prometheus、Grafana 和 Nginx 随压测和部署阶段接入。
+弹幕首版采用 HTTP 提交、WebSocket 接收和单实例内存广播。跨实例阶段计划将已接受的弹幕事件写入 Kafka，再由广播消费组发到 Redis Pub/Sub，各实例将消息推给本机房间连接。持久化消费组计划批量写入 MySQL，供历史查询。HTTP 认证依赖 MySQL、Redis 和 Flyway。Prometheus、Grafana 和 Nginx 随压测和部署阶段接入。
 
 ## 模块设计
 
@@ -29,9 +29,10 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 | `liveflow-infrastructure` | Redis 会话存储及 Lua 脚本、Kafka 健康检查，依赖 `core` |
 | `liveflow-api` | MVC 控制器、HTTP 安全、WebSocket 接入和应用配置，依赖另外两个模块并打包可执行 JAR |
 
-- [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。WebSocket Ticket 归入后续实时连接阶段。
+- [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。
 - [个人主页 V1](docs/design/profile/design.md) 涵盖登录后的个人主页、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
 - [直播间 V1](docs/design/room/design.md) 定义一人一房、UUID 链接进入、房间页面框架、HTTP 接口及数据库迁移。
+- [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、右侧列表及短期去重。
 
 ## 本地启动
 
@@ -66,6 +67,8 @@ npm run dev
 ```
 
 打开 [LiveFlow 登录页](http://127.0.0.1:5173/)。[开发环境检查页](http://127.0.0.1:5173/dev) 通过 Vite 代理访问 Actuator 和 WebSocket。正常时 Spring Boot、MySQL、Redis、Kafka、WebSocket 都会显示 `UP`。后端也可直接检查。
+
+房间弹幕的 WebSocket 在 `local` 模式下默认允许 `http://127.0.0.1:5173` 和 `http://localhost:5173`。更换前端端口或通过反向代理部署时，可设置 `LIVEFLOW_ROOM_MESSAGES_ALLOWED_ORIGIN`，多个地址用逗号分隔。每个值须与浏览器的 Origin 一致，使用非默认端口时需写出端口。
 
 ```bash
 curl --fail http://127.0.0.1:18080/actuator/health

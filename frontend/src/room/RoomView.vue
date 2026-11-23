@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
+import RoomMessages from './RoomMessages.vue'
 import { readRoomDetails, type RoomDetails } from './roomClient'
 
 const props = defineProps<{
@@ -93,10 +94,7 @@ async function copyLink() {
       <section class="video" aria-label="直播画面">
         <p>直播画面尚未接入</p>
       </section>
-      <section class="messages" aria-labelledby="messages-title">
-        <h2 id="messages-title">弹幕</h2>
-        <p>弹幕暂未开放</p>
-      </section>
+      <RoomMessages :room-id="room.roomId" :with-access="withAccess" />
     </div>
   </div>
 </template>
@@ -133,18 +131,9 @@ h1 { margin: 0.65rem 0 0; font-size: clamp(1.6rem, 4vw, 2.5rem); overflow-wrap: 
   color: #e1eae3;
   text-align: center;
 }
-.video p, .messages p { margin: 0; }
-.messages {
-  padding: 1rem;
-  border: 1px solid var(--line);
-  border-radius: 1.15rem;
-  background: var(--surface);
-}
-.messages h2 { margin: 0 0 0.85rem; font-size: 1rem; }
-.messages p { color: var(--muted); font-size: 0.875rem; }
+.video p { margin: 0; }
 
 @media (max-width: 760px) {
   .room-layout { grid-template-columns: minmax(0, 1fr); }
-  .messages { min-height: 8rem; }
 }
 </style>

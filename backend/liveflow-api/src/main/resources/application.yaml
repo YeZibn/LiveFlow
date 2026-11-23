@@ -35,6 +35,9 @@ management:
       show-details: never
 
 liveflow:
+  room-messages:
+    # 服务位于反向代理之后时，可显式配置浏览器地址。留空使用同源校验。
+    allowed-origin: ${LIVEFLOW_ROOM_MESSAGES_ALLOWED_ORIGIN:}
   auth:
     # 使用部署环境注入的 Base64 随机密钥，解码后至少 32 字节。
     signing-key: ${LIVEFLOW_JWT_SIGNING_KEY:}

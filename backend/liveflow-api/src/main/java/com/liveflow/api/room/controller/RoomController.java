@@ -2,13 +2,13 @@ package com.liveflow.api.room.controller;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.liveflow.core.auth.AuthFailure;
+import com.liveflow.core.room.RoomUuid;
 import com.liveflow.core.room.service.RoomService;
 import com.liveflow.core.room.service.RoomService.InvalidTitleException;
 import com.liveflow.core.room.service.RoomService.Room;
 import com.liveflow.core.room.service.RoomService.RoomAlreadyExistsException;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
-import java.util.regex.Pattern;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
@@ -33,8 +33,6 @@ import tools.jackson.databind.json.JsonMapper;
 public class RoomController {
 
     private static final DateTimeFormatter UTC_MILLIS = new DateTimeFormatterBuilder().appendInstant(3).toFormatter();
-    private static final Pattern ROOM_UUID = Pattern.compile(
-            "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}");
 
     private final RoomService rooms;
     private final ObjectReader requestReader;
@@ -74,7 +72,7 @@ public class RoomController {
      */
     @GetMapping("/api/v1/rooms/{roomId}")
     public ResponseEntity<RoomDetailsResponse> readDetails(@PathVariable("roomId") String roomId) {
-        if (!ROOM_UUID.matcher(roomId).matches()) {
+        if (!RoomUuid.isCanonical(roomId)) {
             throw new InvalidRoomRequestException();
         }
         // 安全过滤链先校验当前会话，详情仅暴露渲染房间页所需的字段。

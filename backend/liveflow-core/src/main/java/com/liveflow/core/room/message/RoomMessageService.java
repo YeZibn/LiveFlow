@@ -1,0 +1,172 @@
+package com.liveflow.core.room.message;
+
+import com.liveflow.core.room.RoomUuid;
+import com.liveflow.core.room.service.RoomService;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
+import java.util.regex.Pattern;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DataAccessException;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import static com.liveflow.core.room.message.RoomMessageFailure.Code.*;
+
+/** 在单实例内受理弹幕、限制账号发送频率并保存短期受理结果。 */
+@Service
+public class RoomMessageService {
+
+    private static final Pattern EDGE_WHITESPACE = Pattern.compile("(?U)\\A\\s+|\\s+\\z");
+    private final RoomService rooms;
+    private final RoomMessageBroadcast broadcast;
+    private final LongSupplier ticker;
+    private final Clock clock;
+    private final long window;
+    private final long replayTtl;
+    private final int maxPerWindow;
+    private final int capacity;
+    private final Object admission = new Object();
+    private final Map<Long, ArrayDeque<Long>> attempts = new HashMap<>();
+    private final Map<RequestKey, Accepted> accepted = new LinkedHashMap<>();
+
+    /**
+     * @param rooms 房间查询服务
+     * @param broadcast 本机房间广播
+     * @param windowSeconds 账号滚动窗口秒数
+     * @param maxPerWindow 窗口内允许的消息数
+     * @param replaySeconds 受理结果保留时间
+     * @param capacity 本实例可同时保留的受理记录上限
+     */
+    @Autowired
+    public RoomMessageService(RoomService rooms, RoomMessageBroadcast broadcast,
+            @Value("${liveflow.room-messages.window-seconds:10}") int windowSeconds,
+            @Value("${liveflow.room-messages.max-per-window:5}") int maxPerWindow,
+            @Value("${liveflow.room-messages.replay-seconds:60}") int replaySeconds,
+            @Value("${liveflow.room-messages.replay-capacity:4096}") int capacity) {
+        this(rooms, broadcast, System::nanoTime, Clock.systemUTC(), windowSeconds, maxPerWindow, replaySeconds, capacity);
+    }
+
+    RoomMessageService(RoomService rooms, RoomMessageBroadcast broadcast, LongSupplier ticker, Clock clock,
+            int windowSeconds, int maxPerWindow, int replaySeconds, int capacity) {
+        if (windowSeconds <= 0 || maxPerWindow <= 0 || replaySeconds < windowSeconds || capacity <= 0) {
+            throw new IllegalArgumentException("弹幕额度和受理容量必须为正，去重期限必须覆盖限流窗口");
+        }
+        this.rooms = rooms;
+        this.broadcast = broadcast;
+        this.ticker = ticker;
+        this.clock = clock;
+        this.window = TimeUnit.SECONDS.toNanos(windowSeconds);
+        this.replayTtl = TimeUnit.SECONDS.toNanos(replaySeconds);
+        this.maxPerWindow = maxPerWindow;
+        this.capacity = capacity;
+    }
+
+    /**
+     * 接受一次弹幕提交，或返回同一提交此前的结果。
+     * @param userId 已认证的账号 ID
+     * @param sessionId 已认证的登录会话 ID
+     * @param roomId 房间 UUID
+     * @param clientMessageId 客户端为本次提交生成的 UUID
+     * @param rawContent 输入的原始正文
+     * @return 服务端消息标识和受理时间
+     * @throws RoomMessageFailure 输入无效、房间不存在、正文冲突、超额或暂时无法受理
+     * @throws DataAccessException 房间查询失败
+     */
+    public Receipt send(long userId, UUID sessionId, String roomId, String clientMessageId, String rawContent) {
+        if (!RoomUuid.isCanonical(roomId) || !RoomUuid.isCanonical(clientMessageId)) {
+            throw new RoomMessageFailure(INVALID_REQUEST);
+        }
+        String content = normalize(rawContent);
+        if (rooms.readDetails(roomId).isEmpty()) {
+            throw new RoomMessageFailure(ROOM_NOT_FOUND);
+        }
+
+        var key = new RequestKey(sessionId, roomId, clientMessageId);
+        // 单实例的短临界区只访问内存。去重、额度和房间入队共享一次受理顺序。
+        synchronized (admission) {
+            long now = ticker.getAsLong();
+            expireReceipts(now);
+            Accepted prior = accepted.get(key);
+            if (prior != null) {
+                if (!prior.content().equals(content)) {
+                    throw new RoomMessageFailure(MESSAGE_ID_CONFLICT);
+                }
+                return prior.receipt();
+            }
+            var recent = attempts.get(userId);
+            if (recent != null) {
+                expireAttempts(recent, now);
+                if (recent.size() >= maxPerWindow) {
+                    long remaining = window - (now - recent.getFirst());
+                    long seconds = (remaining - 1) / TimeUnit.SECONDS.toNanos(1) + 1;
+                    throw new RoomMessageFailure(MESSAGE_RATE_LIMITED, seconds);
+                }
+            }
+            if (accepted.size() >= capacity) {
+                throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
+            }
+
+            var receipt = new Receipt(UUID.randomUUID().toString(), clock.instant());
+            // 广播只做有界入队。成功后才记录受理结果和额度，失败时两者均不提交。
+            broadcast.enqueue(new RoomMessageBroadcast.Message(roomId, receipt.messageId(), content, receipt.sentAt()));
+            accepted.put(key, new Accepted(content, receipt, now));
+            attempts.computeIfAbsent(userId, ignored -> new ArrayDeque<>()).addLast(now);
+            return receipt;
+        }
+    }
+
+    /** 定期回收无请求的账号状态以及已过期的去重记录。 */
+    @Scheduled(fixedDelay = 10000)
+    public void cleanUp() {
+        synchronized (admission) {
+            long now = ticker.getAsLong();
+            expireReceipts(now);
+            attempts.values().removeIf(times -> {
+                expireAttempts(times, now);
+                return times.isEmpty();
+            });
+        }
+    }
+
+    private void expireReceipts(long now) {
+        var entries = accepted.values().iterator();
+        while (entries.hasNext() && now - entries.next().acceptedAt() >= replayTtl) {
+            entries.remove();
+        }
+    }
+
+    private void expireAttempts(ArrayDeque<Long> recent, long now) {
+        while (!recent.isEmpty() && now - recent.getFirst() >= window) {
+            recent.removeFirst();
+        }
+    }
+
+    private static String normalize(String raw) {
+        // 检查原文后再去除首尾空白，防止首尾换行被规范化掩盖。
+        if (raw == null || raw.codePoints().anyMatch(point -> Character.isISOControl(point)
+                || point == 0x2028 || point == 0x2029
+                || (point >= Character.MIN_SURROGATE && point <= Character.MAX_SURROGATE))) {
+            throw new RoomMessageFailure(INVALID_REQUEST);
+        }
+        String content = EDGE_WHITESPACE.matcher(raw).replaceAll("");
+        int length = content.codePointCount(0, content.length());
+        if (length < 1 || length > 100) {
+            throw new RoomMessageFailure(INVALID_REQUEST);
+        }
+        return content;
+    }
+
+    private record RequestKey(UUID sessionId, String roomId, String clientMessageId) {}
+    private record Accepted(String content, Receipt receipt, long acceptedAt) {}
+
+    /** HTTP 受理结果，重试命中时复用原标识和时间。 */
+    public record Receipt(String messageId, Instant sentAt) {}
+}
