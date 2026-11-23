@@ -3,6 +3,7 @@ import { ApiRequestError, requestJson } from '../api/requestJson'
 export interface RoomMessage {
   type: 'message'
   messageId: string
+  senderName: string
   content: string
   sentAt: string
 }
@@ -95,8 +96,10 @@ export function decodeRoomFrame(data: unknown): RoomFrame | undefined {
   if (frame.type === 'error' && typeof frame.code === 'string' && typeof frame.message === 'string') {
     return { type: 'error', code: frame.code, message: frame.message }
   }
-  if (frame.type === 'message' && isUuid(frame.messageId) && typeof frame.content === 'string' && isSentAt(frame.sentAt)) {
-    return { type: 'message', messageId: frame.messageId, content: frame.content, sentAt: frame.sentAt }
+  if (frame.type === 'message' && isUuid(frame.messageId) && typeof frame.senderName === 'string'
+    && frame.senderName.length > 0 && typeof frame.content === 'string' && isSentAt(frame.sentAt)) {
+    return { type: 'message', messageId: frame.messageId, senderName: frame.senderName,
+      content: frame.content, sentAt: frame.sentAt }
   }
   return undefined
 }

@@ -1,12 +1,42 @@
 import { requestJson } from '../api/requestJson'
 
-export interface RoomDetails {
+interface RoomSummary {
   roomId: string
   title: string
 }
 
-export interface Room extends RoomDetails {
+export interface Room extends RoomSummary {
   createdAt: string
+}
+
+export interface RoomDetails extends RoomSummary {
+  ownerName: string
+}
+
+export interface DirectoryItem extends Room {
+  ownerName: string
+  isMine: boolean
+}
+
+interface DirectoryPage {
+  items: DirectoryItem[]
+  nextCursor: string | null
+}
+
+/**
+ * 读取统一直播间目录的一页。
+ * @param access 当前会话的 Access Token
+ * @param keyword 已提交的标题关键词，空字符串表示浏览
+ * @param cursor 当前关键词的翻页边界，省略时查首页
+ * @returns 当页房间及可选的下一页游标
+ * @throws ApiRequestError 参数、认证、读取或传输失败
+ */
+export function readRoomDirectory(access: string, keyword: string, cursor?: string): Promise<DirectoryPage> {
+  const params = new URLSearchParams()
+  if (keyword) params.set('q', keyword)
+  if (cursor) params.set('cursor', cursor)
+  const query = params.toString()
+  return requestJson<DirectoryPage>(query ? `/api/v1/rooms?${query}` : '/api/v1/rooms', { access })
 }
 
 /**
@@ -35,7 +65,7 @@ export function createRoom(access: string, title: string): Promise<Room> {
  * 获取房间页所需信息。
  * @param access 当前会话的 Access Token
  * @param roomId 已验证格式的房间 UUID
- * @returns 房间对外标识及标题
+ * @returns 房间对外标识、标题和房主显示名
  * @throws ApiRequestError 鉴权、房间缺失、读取或传输失败
  */
 export function readRoomDetails(access: string, roomId: string): Promise<RoomDetails> {

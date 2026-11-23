@@ -3,6 +3,7 @@ package com.liveflow.api.room.controller;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.liveflow.api.auth.AuthHttpError;
 import com.liveflow.core.auth.AuthFailure;
+import com.liveflow.core.room.service.RoomService.InvalidDirectoryQueryException;
 import com.liveflow.core.room.service.RoomService.InvalidTitleException;
 import com.liveflow.core.room.service.RoomService.RoomAlreadyExistsException;
 import java.util.Map;
@@ -19,8 +20,8 @@ import tools.jackson.core.JacksonException;
 @RestControllerAdvice(assignableTypes = RoomController.class)
 class RoomErrorAdvice {
 
-    @ExceptionHandler({RoomController.InvalidRoomRequestException.class, HttpMessageNotReadableException.class,
-            JacksonException.class})
+    @ExceptionHandler({RoomController.InvalidRoomRequestException.class, InvalidDirectoryQueryException.class,
+            HttpMessageNotReadableException.class, JacksonException.class})
     ResponseEntity<RoomError> invalidRequest() {
         return ResponseEntity.badRequest().body(new RoomError("INVALID_REQUEST", "请检查请求字段", Map.of()));
     }

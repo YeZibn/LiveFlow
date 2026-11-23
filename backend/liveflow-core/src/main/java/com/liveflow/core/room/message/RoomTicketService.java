@@ -91,7 +91,7 @@ public class RoomTicketService {
         if (!RoomUuid.isCanonical(roomId)) {
             throw new RoomMessageFailure(INVALID_REQUEST);
         }
-        if (rooms.readDetails(roomId).isEmpty()) {
+        if (!rooms.exists(roomId)) {
             throw new RoomMessageFailure(ROOM_NOT_FOUND);
         }
     }

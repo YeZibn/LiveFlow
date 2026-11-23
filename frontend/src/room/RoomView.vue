@@ -6,6 +6,7 @@ import { readRoomDetails, type RoomDetails } from './roomClient'
 
 const props = defineProps<{
   roomId: string
+  listReturn: string
   withAccess: <T>(call: (access: string) => Promise<T>) => Promise<T>
 }>()
 
@@ -74,17 +75,18 @@ async function copyLink() {
 
 <template>
   <div class="room-page">
-    <header class="room-header">
-      <div>
-        <a class="back-link" href="/">← 返回个人主页</a>
-        <h1>{{ room?.title ?? '直播间' }}</h1>
-      </div>
+    <header class="room-toolbar">
+      <a class="back-link" :href="listReturn">← 返回直播间列表</a>
       <div v-if="room" class="share">
         <button type="button" class="ui-button" @click="copyLink">复制链接</button>
         <p v-if="copyFeedback" class="copy-feedback" role="status">{{ copyFeedback }}</p>
       </div>
     </header>
 
+    <div class="room-heading">
+      <h1>{{ room?.title ?? '直播间' }}</h1>
+      <p v-if="room" class="owner">房主 <span>{{ room.ownerName }}</span></p>
+    </div>
     <p v-if="loading" class="ui-feedback" role="status">正在读取直播间…</p>
     <div v-else-if="error" class="room-error">
       <p class="ui-feedback ui-feedback--error" role="alert">{{ error }}</p>
@@ -101,39 +103,63 @@ async function copyLink() {
 
 <style scoped>
 .room-page {
-  width: min(100%, 90rem);
+  --text: #eaf1ed;
+  --muted: #a8b7ae;
+  --surface: #1b2320;
+  --line: #34413b;
+  --field-line: #506057;
+  --tint: #26382f;
+  --accent: #22684e;
+  --accent-hover: #2a7759;
+  --danger: #ffaca6;
+  --room-highlight: #a5dfba;
+  width: 100%;
+  min-height: calc(100svh - 4.75rem);
+  background: #111715;
+  color: var(--text);
+  padding: clamp(1rem, 3vw, 2.5rem) max(clamp(1rem, 3vw, 2.5rem), calc((100% - 88rem) / 2));
   margin-inline: auto;
-  padding: clamp(1rem, 3vw, 2.5rem);
 }
-.room-header {
+.room-toolbar {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   flex-wrap: wrap;
   gap: 1rem;
   margin-bottom: 1.25rem;
 }
-.room-header > div { min-width: 0; }
-.back-link { font-size: 0.875rem; text-decoration: none; }
+.room-heading { margin-bottom: 1rem; }
+.back-link { color: var(--room-highlight); font-size: 0.875rem; text-decoration: none; }
 .back-link:hover { text-decoration: underline; }
-h1 { margin: 0.65rem 0 0; font-size: clamp(1.6rem, 4vw, 2.5rem); overflow-wrap: anywhere; }
+.room-page :deep(:focus-visible) { outline-color: var(--room-highlight); }
+h1 { margin: 0; font-size: clamp(1.6rem, 4vw, 2.5rem); line-height: 1.2; overflow-wrap: anywhere; }
+.owner { margin: 0.45rem 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.owner span { margin-inline-start: 0.25rem; color: var(--text); }
 .share { display: flex; align-items: center; flex-wrap: wrap; gap: 0.75rem; }
 .copy-feedback { margin: 0; color: var(--muted); font-size: 0.875rem; }
 .room-error { display: grid; gap: 0.85rem; justify-items: start; }
-.room-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(15rem, 24%); gap: 1rem; }
+.room-page > .ui-feedback, .room-error .ui-feedback { color: var(--text); background: var(--tint); }
+.room-error .ui-feedback--error { color: var(--danger); }
+.room-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) clamp(320px, 28vw, 380px);
+  gap: 1rem;
+  align-items: start;
+}
 .video {
   display: grid;
   place-items: center;
   aspect-ratio: 16 / 9;
   padding: 1rem;
-  border-radius: 1.15rem;
-  background: #172922;
-  color: #e1eae3;
+  border: 1px solid var(--line);
+  border-radius: 0.85rem;
+  background: #0b100e;
+  color: var(--muted);
   text-align: center;
 }
 .video p { margin: 0; }
 
-@media (max-width: 760px) {
+@media (max-width: 50rem) {
   .room-layout { grid-template-columns: minmax(0, 1fr); }
 }
 </style>

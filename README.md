@@ -30,9 +30,9 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 | `liveflow-api` | MVC 控制器、HTTP 安全、WebSocket 接入和应用配置，依赖另外两个模块并打包可执行 JAR |
 
 - [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。
-- [个人主页 V1](docs/design/profile/design.md) 涵盖登录后的个人主页、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
-- [直播间 V1](docs/design/room/design.md) 定义一人一房、UUID 链接进入、房间页面框架、HTTP 接口及数据库迁移。
-- [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、右侧列表及短期去重。
+- [个人主页 V1](docs/design/profile/design.md) 涵盖个人主页入口、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
+- [直播间 V1](docs/design/room/design.md) 定义一人一房、统一列表与名称搜索、UUID 进入、观看页布局，以及对应的 HTTP 接口和数据库索引。
+- [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、短期去重，以及显示发送者和秒级本地时间的弹幕列表。
 
 ## 本地启动
 

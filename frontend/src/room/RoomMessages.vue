@@ -10,16 +10,49 @@ const props = defineProps<{
 const { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send } =
   useRoomMessages(props.roomId, props.withAccess)
 const log = ref<HTMLElement>()
-const formatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' })
+const hasNewMessages = ref(false)
+const formatter = new Intl.DateTimeFormat('zh-CN', {
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+})
 const stateName = { connecting: '连接中', ready: '已连接', reconnecting: '正在重连', offline: '连接已断开' }
 
-watch(messages, async () => {
+watch(messages, async updated => {
   const node = log.value
-  if (!node || node.scrollHeight - node.clientHeight - node.scrollTop > 36) return
-  // 用户停在底部附近时跟随，向上阅读时保留当前位置。
+  if (!node) return
+  const following = isNearBottom(node)
+  const top = node.getBoundingClientRect().top
+  // 记录仍保留的首个可见项，以便顶部裁剪后恢复它原来的屏幕位置。
+  const retained = new Set(updated.map(item => item.messageId))
+  const anchor = following ? undefined : Array.from(node.querySelectorAll<HTMLElement>('li[data-message-id]'))
+    .find(row => retained.has(row.dataset.messageId ?? '') && row.getBoundingClientRect().bottom > top)
+  const priorTop = anchor?.getBoundingClientRect().top
+  if (!following) hasNewMessages.value = true
   await nextTick()
-  if (log.value === node) node.scrollTop = node.scrollHeight
+  if (log.value !== node) return
+  if (following) {
+    jumpToLatest()
+  } else if (anchor && priorTop !== undefined) {
+    node.scrollTop += anchor.getBoundingClientRect().top - priorTop
+  } else {
+    node.scrollTop = 0
+  }
 })
+
+/** @param node 当前独立滚动的消息列表 */
+function isNearBottom(node: HTMLElement) {
+  return node.scrollHeight - node.clientHeight - node.scrollTop <= 24
+}
+
+/** 用户滚回底部后，清除新消息提示。 */
+function onScroll() {
+  if (log.value && isNearBottom(log.value)) hasNewMessages.value = false
+}
+
+/** 将列表恢复到跟随最新消息的位置。 */
+function jumpToLatest() {
+  if (log.value) log.value.scrollTop = log.value.scrollHeight
+  hasNewMessages.value = false
+}
 
 /** @param event 回车键事件，用于区分候选词确认和发送 */
 function handleEnter(event: KeyboardEvent) {
@@ -32,27 +65,33 @@ function handleEnter(event: KeyboardEvent) {
 <template>
   <section class="room-messages" aria-labelledby="room-messages-title">
     <header class="panel-heading">
-      <h2 id="room-messages-title">弹幕</h2>
-      <p class="connection" :data-state="state" role="status">
-        <span aria-hidden="true"></span>{{ stateName[state] }}
-      </p>
+      <div class="panel-title">
+        <h2 id="room-messages-title">弹幕</h2>
+        <p class="connection" :data-state="state" role="status">
+          <span aria-hidden="true"></span>{{ stateName[state] }}
+        </p>
+      </div>
+      <p v-if="connectionError" class="feedback" role="status">{{ connectionError }}</p>
+      <button v-if="state === 'offline' || state === 'reconnecting'" class="ui-button reconnect"
+        type="button" @click="reconnect">重连</button>
     </header>
 
-    <div ref="log" class="message-log" role="log" aria-label="直播间弹幕">
-      <p v-if="messages.length === 0" class="empty">
-        {{ state === 'ready' ? '还没有弹幕' : '连接后即可接收弹幕' }}
-      </p>
-      <ol v-else>
-        <li v-for="item in messages" :key="item.messageId">
-          <time :datetime="item.sentAt">{{ formatter.format(new Date(item.sentAt)) }}</time>
-          <span>{{ item.content }}</span>
-        </li>
-      </ol>
+    <div class="message-area">
+      <div ref="log" class="message-log" role="log" aria-label="直播间弹幕" tabindex="0" @scroll="onScroll">
+        <p v-if="messages.length === 0" class="empty">
+          {{ state === 'ready' ? '还没有弹幕' : '连接后即可接收弹幕' }}
+        </p>
+        <ol v-else>
+          <li v-for="item in messages" :key="item.messageId" :data-message-id="item.messageId">
+            <time :datetime="item.sentAt">{{ formatter.format(new Date(item.sentAt)) }}</time>
+            <span class="line"><strong>{{ item.senderName }}</strong>：{{ item.content }}</span>
+          </li>
+        </ol>
+      </div>
+      <button v-if="hasNewMessages" class="ui-button latest" type="button" @click="jumpToLatest">查看新消息</button>
     </div>
 
     <footer class="composer">
-      <p v-if="connectionError" class="feedback" role="status">{{ connectionError }}</p>
-      <button v-if="state === 'offline'" class="ui-button" type="button" @click="reconnect">重新连接</button>
       <form class="compose-form" :aria-busy="submitting" @submit.prevent="send">
         <input v-model="content" class="ui-input" aria-label="弹幕内容" placeholder="发送一条弹幕"
           :disabled="state !== 'ready' || submitting" autocomplete="off" @keydown.enter="handleEnter" />
@@ -70,43 +109,54 @@ function handleEnter(event: KeyboardEvent) {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   min-width: 0;
-  min-height: 19rem;
-  max-height: clamp(23rem, 50vw, 43rem);
+  height: clamp(24rem, 43vw, 43rem);
   overflow: hidden;
   background: var(--surface);
   border: 1px solid var(--line);
-  border-radius: 1.15rem;
+  border-radius: 0.85rem;
 }
 
 .panel-heading {
+  display: grid;
+  justify-items: start;
+  gap: 0.4rem;
+  padding: 0.9rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.panel-title {
+  width: 100%;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 0.6rem;
-  padding: 0.9rem 1rem;
-  border-bottom: 1px solid var(--line);
 }
 
 h2 { margin: 0; font-size: 1rem; }
 .connection { display: flex; align-items: center; gap: 0.4rem; margin: 0; color: var(--muted); font-size: 0.76rem; }
 .connection span { width: 0.45rem; height: 0.45rem; border-radius: 50%; background: currentColor; }
-.connection[data-state="ready"] { color: var(--accent); }
+.connection[data-state="ready"] { color: var(--room-highlight); }
+.reconnect { min-height: 1.95rem; font-size: 0.8rem; }
 
-.message-log { overflow-y: auto; overscroll-behavior: contain; padding: 0.7rem 1rem; }
+.message-area { position: relative; min-height: 0; }
+.message-log { height: 100%; overflow-y: auto; overflow-anchor: none; overscroll-behavior: contain; padding: 0.65rem 0.9rem; }
+.message-log:focus-visible { outline-offset: -3px; }
 .message-log ol { list-style: none; padding: 0; margin: 0; }
-.message-log li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.6rem; padding: 0.4rem 0; font-size: 0.88rem; }
-.message-log time { color: var(--muted); font-size: 0.75rem; padding-top: 0.1rem; }
-.message-log li span { overflow-wrap: anywhere; white-space: pre-wrap; }
+.message-log li { display: grid; grid-template-columns: 8ch minmax(0, 1fr); gap: 0.4rem; padding: 0.35rem 0; font-size: 0.875rem; line-height: 1.5; }
+.message-log time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.line { overflow-wrap: anywhere; white-space: pre-wrap; }
+.line strong { color: var(--room-highlight); }
+.latest { position: absolute; left: 50%; bottom: 0.6rem; translate: -50%; color: var(--room-highlight); }
 .empty { margin-block: 1.2rem; color: var(--muted); text-align: center; font-size: 0.85rem; }
 
 .composer { display: grid; gap: 0.5rem; padding: 0.8rem; border-top: 1px solid var(--line); }
 .compose-form { display: flex; align-items: center; gap: 0.45rem; }
 .compose-form .ui-input { flex: 1; min-width: 0; }
+.compose-form .ui-input:disabled { background: var(--tint); }
 .compose-form .ui-button { flex-shrink: 0; }
 .feedback { margin: 0; color: var(--muted); font-size: 0.78rem; }
 .feedback.failure { color: var(--danger); }
 
-@media (max-width: 760px) {
-  .room-messages { height: 21rem; }
+@media (max-width: 50rem) {
+  .room-messages { height: min(29rem, max(22rem, 60svh)); }
 }
 </style>

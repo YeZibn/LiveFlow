@@ -9,6 +9,9 @@ import com.liveflow.core.room.service.RoomService.Room;
 import com.liveflow.core.room.service.RoomService.RoomAlreadyExistsException;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
+import java.time.ZoneOffset;
+import java.util.List;
+import java.util.Set;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
@@ -17,10 +20,12 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.transaction.TransactionException;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.DeserializationFeature;
@@ -28,11 +33,12 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectReader;
 import tools.jackson.databind.json.JsonMapper;
 
-/** 处理房间创建、本人查询及已登录用户的房间详情请求。 */
+/** 处理房间创建、本人查询、统一目录和房间详情。 */
 @RestController
 public class RoomController {
 
     private static final DateTimeFormatter UTC_MILLIS = new DateTimeFormatterBuilder().appendInstant(3).toFormatter();
+    private static final Set<String> DIRECTORY_PARAMETERS = Set.of("q", "limit", "cursor");
 
     private final RoomService rooms;
     private final ObjectReader requestReader;
@@ -63,9 +69,49 @@ public class RoomController {
     }
 
     /**
+     * 浏览全部已创建房间或按名称搜索。
+     * @param jwt 安全过滤链已确认会话的 JWT
+     * @param parameters 原始查询参数，保留重复值用于严格校验
+     * @return 不可缓存的目录分页结果
+     * @throws InvalidRoomRequestException 查询参数重复、未知或页大小格式无效
+     * @throws RoomService.InvalidDirectoryQueryException 查询词、页大小或游标不符合契约
+     * @throws DataAccessException 房间读取失败
+     */
+    @GetMapping("/api/v1/rooms")
+    public ResponseEntity<DirectoryResponse> list(@AuthenticationPrincipal Jwt jwt,
+            @RequestParam MultiValueMap<String, String> parameters) {
+        if (parameters.entrySet().stream().anyMatch(entry ->
+                !DIRECTORY_PARAMETERS.contains(entry.getKey()) || entry.getValue().size() != 1)) {
+            throw new InvalidRoomRequestException();
+        }
+        // 本人标记始终依据可信账号。请求参数只允许提供搜索和分页条件。
+        var page = rooms.list(Long.parseLong(jwt.getSubject()), parameters.getFirst("q"),
+                parseLimit(parameters.getFirst("limit")), parameters.getFirst("cursor"));
+        var items = page.items().stream().map(room -> new DirectoryItem(room.roomId(), room.title(),
+                room.ownerName(), UTC_MILLIS.format(room.createdAt().toInstant(ZoneOffset.UTC)), room.isMine()))
+                .toList();
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(new DirectoryResponse(items, page.nextCursor()));
+    }
+
+    private static int parseLimit(String rawLimit) {
+        if (rawLimit == null) {
+            return 12;
+        }
+        if (!rawLimit.matches("[0-9]+")) {
+            throw new InvalidRoomRequestException();
+        }
+        try {
+            return Integer.parseInt(rawLimit);
+        } catch (NumberFormatException failure) {
+            throw new InvalidRoomRequestException();
+        }
+    }
+
+    /**
      * 查询任意已登录用户可访问的房间详情。
      * @param roomId 路径中的标准小写 UUID v4
-     * @return 不可缓存的房间标题和对外标识
+     * @return 不可缓存的房间标题、对外标识和房主显示名
      * @throws InvalidRoomRequestException 标识格式无效
      * @throws RoomNotFoundException UUID 对应的房间不存在
      * @throws DataAccessException 房间读取失败
@@ -78,7 +124,7 @@ public class RoomController {
         // 安全过滤链先校验当前会话，详情仅暴露渲染房间页所需的字段。
         var room = rooms.readDetails(roomId).orElseThrow(RoomNotFoundException::new);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
-                .body(new RoomDetailsResponse(room.roomId(), room.title()));
+                .body(new RoomDetailsResponse(room.roomId(), room.title(), room.ownerName()));
     }
 
     /**
@@ -116,7 +162,14 @@ public class RoomController {
     }
 
     /** 直播间详情的公开字段。 */
-    public record RoomDetailsResponse(String roomId, String title) {}
+    public record RoomDetailsResponse(String roomId, String title, String ownerName) {}
+
+    /** 统一目录的一条公开房间信息。 */
+    public record DirectoryItem(String roomId, String title, String ownerName, String createdAt, boolean isMine) {}
+
+    /** 目录分页结果，终页发送显式的 null 游标。 */
+    public record DirectoryResponse(List<DirectoryItem> items,
+            @JsonInclude(JsonInclude.Include.ALWAYS) String nextCursor) {}
 
     /** 房间请求的字段、类型或路径参数无效。 */
     static final class InvalidRoomRequestException extends RuntimeException {}

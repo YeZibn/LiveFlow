@@ -70,7 +70,8 @@ class RoomSocketHandlerTest {
             assertThat(slowReady.await(2, TimeUnit.SECONDS)).isTrue();
             assertThat(fastEvents.poll(2, TimeUnit.SECONDS)).isEqualTo("ready");
             for (String text : new String[] {"甲", "乙", "丙", "丁"}) {
-                handler.enqueue(new RoomMessageBroadcast.Message(roomId, UUID.randomUUID().toString(), text, Instant.now()));
+                handler.enqueue(new RoomMessageBroadcast.Message(roomId, UUID.randomUUID().toString(), "观众", text,
+                        Instant.now()));
                 assertThat(fastEvents.poll(2, TimeUnit.SECONDS)).isEqualTo(text);
                 if (text.equals("甲")) {
                     assertThat(slowWrite.await(2, TimeUnit.SECONDS)).isTrue();

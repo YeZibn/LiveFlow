@@ -223,7 +223,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
      */
     @Override
     public void enqueue(Message message) {
-        var frame = text(new MessageFrame("message", message.messageId(), message.content(),
+        var frame = text(new MessageFrame("message", message.messageId(), message.senderName(), message.content(),
                 RoomMessageController.UTC_MILLIS.format(message.sentAt())));
         synchronized (monitor) {
             if (stopped) {
@@ -410,6 +410,6 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements RoomM
 
     private record Output(WebSocketMessage<?> frame, CloseStatus closeStatus) {}
     private record ReadyFrame(String type, String roomId) {}
-    private record MessageFrame(String type, String messageId, String content, String sentAt) {}
+    private record MessageFrame(String type, String messageId, String senderName, String content, String sentAt) {}
     private record ErrorFrame(String type, String code, String message) {}
 }

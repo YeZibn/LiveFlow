@@ -104,6 +104,7 @@ async function submitProfile() {
 
 <template>
   <section class="profile-panel" aria-labelledby="profile-title">
+    <a class="directory-link" href="/">← 返回直播间列表</a>
     <header class="profile-header">
       <h1 id="profile-title">个人主页</h1>
       <button class="ui-button" type="button" :disabled="authBusy" @click="emit('logout')">
@@ -181,6 +182,8 @@ async function submitProfile() {
 </template>
 
 <style scoped>
+.directory-link { display: inline-block; margin-bottom: 0.75rem; font-size: 0.875rem; text-decoration: none; }
+.directory-link:hover { text-decoration: underline; }
 .profile-panel {
   width: min(100%, 44rem);
   margin: 0 auto;

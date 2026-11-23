@@ -5,6 +5,7 @@ import com.liveflow.core.profile.service.UserProfileService;
 import com.liveflow.core.room.mapper.RoomMapper;
 import com.liveflow.infrastructure.auth.AuthSessionRepository;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
@@ -459,7 +460,8 @@ class AuthIntegrationTest {
         assertThat(UUID.fromString(roomId).version()).isEqualTo(4);
         assertThat(roomId).isEqualTo(UUID.fromString(roomId).toString());
         var details = roomResponse(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + roomId, null, bearer, false), 200);
-        assertThat(details).isEqualTo(json.readTree(json.writeValueAsString(Map.of("roomId", roomId, "title", title))));
+        assertThat(details).isEqualTo(json.readTree(json.writeValueAsString(
+                Map.of("roomId", roomId, "title", title, "ownerName", username))));
         assertThat(created.get("createdAt").asString()).matches(".+\\.\\d{3}Z");
         assertThat(roomResponse(browser.sendPath("GET", ROOM_READ_PATH, null, bearer, false), 200).get("room"))
                 .isEqualTo(created);
@@ -564,6 +566,82 @@ class AuthIntegrationTest {
         doThrow(new DataAccessResourceFailureException("test")).when(rooms).findDetails(roomId);
         failure(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + roomId, null, bearer, false),
                 503, "ROOM_SERVICE_UNAVAILABLE");
+    }
+
+    @Test
+    void roomDirectoryUsesLiteralSearchAndStablePageBoundaries() throws Exception {
+        var browser = new Browser();
+        failure(browser.sendPath("GET", ROOM_CREATE_PATH, null, null, false), 401, "AUTH_REQUIRED");
+        String bearer = access(browser.login());
+        var others = new ArrayList<Long>();
+        String prefix = username + " Live 字";
+        String first = "7ea8af2a-721f-4f2a-8ff5-03e2fd31ee3c";
+        String second = "6ea8af2a-721f-4f2a-8ff5-03e2fd31ee3c";
+        String newer = "8ea8af2a-721f-4f2a-8ff5-03e2fd31ee3c";
+        String timestamp = "2026-11-23 08:30:00.123";
+        String insert = "INSERT INTO rooms (room_uuid, owner_user_id, title, created_at) VALUES (?, ?, ?, ?)";
+        try {
+            String otherName = registrationName("Viewer_");
+            long otherId = directoryAccount(otherName, others);
+            roomResponse(browser.sendPath("PUT", PROFILE_PATH, profileBody("目录房主", "default", ""),
+                    bearer, true), 200);
+            jdbc.update(insert, first, userId, prefix + " 50%_!", timestamp);
+            jdbc.update(insert, second, otherId, prefix + " 50abc", timestamp);
+
+            String query = ROOM_CREATE_PATH + "?limit=1&q="
+                    + URLEncoder.encode("　" + prefix.toLowerCase(Locale.ROOT) + " ", StandardCharsets.UTF_8);
+            JsonNode firstPage = roomResponse(browser.sendPath("GET", query, null, bearer, false), 200);
+            JsonNode item = firstPage.get("items").get(0);
+            assertThat(item.get("roomId").asString()).isEqualTo(first);
+            assertThat(item.get("ownerName").asString()).isEqualTo("目录房主");
+            assertThat(item.get("isMine").asBoolean()).isTrue();
+            assertThat(item.get("createdAt").asString()).isEqualTo("2026-11-23T08:30:00.123Z");
+            assertThat(item.has("userId")).isFalse();
+            String cursor = firstPage.get("nextCursor").asString();
+            assertThat(cursor).isNotBlank();
+
+            long newerId = directoryAccount(registrationName("New_"), others);
+            jdbc.update(insert, newer, newerId, prefix + " 新房间", "2026-11-23 08:30:00.124");
+            JsonNode secondPage = roomResponse(browser.sendPath("GET", query + "&cursor=" + cursor,
+                    null, bearer, false), 200);
+            JsonNode secondItem = secondPage.get("items").get(0);
+            assertThat(secondItem.get("roomId").asString()).isEqualTo(second);
+            assertThat(secondItem.get("isMine").asBoolean()).isFalse();
+            assertThat(secondItem.get("ownerName").asString()).isEqualTo(otherName);
+            assertThat(secondPage.get("nextCursor").isNull()).isTrue();
+            assertThat(roomResponse(browser.sendPath("GET", query, null, bearer, false), 200)
+                    .get("items").get(0).get("roomId").asString()).isEqualTo(newer);
+
+            JsonNode literal = roomResponse(browser.sendPath("GET", ROOM_CREATE_PATH + "?q=50%25_%21",
+                    null, bearer, false), 200).get("items");
+            assertThat(literal).anyMatch(row -> first.equals(row.get("roomId").asString()));
+            assertThat(literal).noneMatch(row -> second.equals(row.get("roomId").asString()));
+            JsonNode single = roomResponse(browser.sendPath("GET", ROOM_CREATE_PATH + "?q=%E5%AD%97",
+                    null, bearer, false), 200).get("items");
+            assertThat(single).anyMatch(row -> first.equals(row.get("roomId").asString()));
+            roomResponse(browser.sendPath("GET", ROOM_CREATE_PATH, null, bearer, false), 200);
+
+            for (String invalid : List.of("q=a&q=b", "unused=1", "q=%0A", "q=" + "a".repeat(41),
+                    "limit=", "limit=0", "limit=25", "cursor=", "cursor=bad", "q=other&cursor=" + cursor)) {
+                failure(browser.sendPath("GET", ROOM_CREATE_PATH + "?" + invalid, null, bearer, false),
+                        400, "INVALID_REQUEST");
+            }
+            doThrow(new DataAccessResourceFailureException("test")).when(rooms).list(userId, null, null, null, 13);
+            failure(browser.sendPath("GET", ROOM_CREATE_PATH, null, bearer, false), 503, "ROOM_SERVICE_UNAVAILABLE");
+        } finally {
+            for (long id : others) {
+                jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", id);
+                jdbc.update("DELETE FROM users WHERE id = ?", id);
+            }
+        }
+    }
+
+    private long directoryAccount(String name, List<Long> accounts) {
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?", name, userId);
+        long id = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, name);
+        accounts.add(id);
+        return id;
     }
 
     @Test
@@ -690,6 +768,8 @@ class AuthIntegrationTest {
             assertThat(event.get("type").asString()).isEqualTo("message");
             assertThat(event.get("messageId")).isEqualTo(receipt.get("messageId"));
             assertThat(event.get("sentAt")).isEqualTo(receipt.get("sentAt"));
+            assertThat(event.get("senderName").asString()).isEqualTo(username);
+            assertThat(event.has("userId")).isFalse();
             assertThat(event.get("content").asString()).isEqualTo("你好");
             assertThat(receiver.next()).isEqualTo(event);
             failure(browser.sendPath("POST", path, messageBody(id, "已修改"), bearer, true), 409, "MESSAGE_ID_CONFLICT");

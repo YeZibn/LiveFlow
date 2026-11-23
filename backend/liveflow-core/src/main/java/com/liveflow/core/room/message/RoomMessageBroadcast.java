@@ -13,5 +13,5 @@ public interface RoomMessageBroadcast {
     void enqueue(Message message);
 
     /** 本机分发使用的数据，房间 UUID 用于路由。 */
-    record Message(String roomId, String messageId, String content, Instant sentAt) {}
+    record Message(String roomId, String messageId, String senderName, String content, Instant sentAt) {}
 }

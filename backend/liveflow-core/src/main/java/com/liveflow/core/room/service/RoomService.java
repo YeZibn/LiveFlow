@@ -4,6 +4,7 @@ import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.room.mapper.RoomMapper;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -68,6 +69,49 @@ public class RoomService {
     }
 
     /**
+     * 仅检查房间是否存在，供票据和弹幕写入路径调用。
+     * @param roomId 已通过格式校验的房间 UUID
+     * @return 房间存在时为 true
+     * @throws DataAccessException 存储读取失败
+     */
+    public boolean exists(String roomId) {
+        return rooms.exists(roomId);
+    }
+
+    /**
+     * 使用相同排序读取统一目录或标题搜索结果。
+     * @param viewerUserId 已认证账号 ID
+     * @param rawKeyword 原始搜索词，缺省时为 null
+     * @param limit 请求的页大小
+     * @param token 当前搜索的游标，缺省时从首页读取
+     * @return 本页数据和可选的下一页游标
+     * @throws InvalidDirectoryQueryException 关键词、页大小或游标无效
+     * @throws DataAccessException 存储读取失败
+     */
+    public DirectoryPage list(long viewerUserId, String rawKeyword, int limit, String token) {
+        if (limit < 1 || limit > 24 || (rawKeyword != null && !isSingleLine(rawKeyword))) {
+            throw new InvalidDirectoryQueryException();
+        }
+        String keyword = rawKeyword == null ? "" : trim(rawKeyword);
+        if (keyword.codePointCount(0, keyword.length()) > 40) {
+            throw new InvalidDirectoryQueryException();
+        }
+        RoomCursor cursor = RoomCursor.decode(token, keyword);
+        // 先转义转义符本身，再转义 LIKE 通配符，只保留两端用于包含搜索的百分号。
+        String titlePattern = keyword.isEmpty() ? null
+                : "%" + keyword.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%";
+        List<RoomMapper.DirectoryRow> rows = rooms.list(viewerUserId, titlePattern,
+                cursor == null ? null : cursor.createdAt(), cursor == null ? null : cursor.roomId(), limit + 1);
+        if (rows.size() <= limit) {
+            return new DirectoryPage(rows, null);
+        }
+        // 多读的一条只确认有下一页。以最后一条已返回记录作为边界，避免跳过额外行。
+        var boundary = rows.get(limit - 1);
+        return new DirectoryPage(List.copyOf(rows.subList(0, limit)),
+                new RoomCursor(boundary.createdAt(), boundary.roomId()).encode(keyword));
+    }
+
+    /**
      * 校验房间名称，在同一事务中插入并回读记录。
      * @param ownerUserId 已认证的账号 ID
      * @param title 原始房间名称
@@ -117,12 +161,10 @@ public class RoomService {
 
     private static String normalizeTitle(String title) {
         // 先校验原始字符，避免首尾换行被去除后绕过单行校验。
-        if (title == null || title.codePoints().anyMatch(point -> Character.isISOControl(point)
-                || point == 0x2028 || point == 0x2029
-                || (point >= Character.MIN_SURROGATE && point <= Character.MAX_SURROGATE))) {
+        if (title == null || !isSingleLine(title)) {
             throw new InvalidTitleException();
         }
-        String normalized = EDGE_WHITESPACE.matcher(title).replaceAll("");
+        String normalized = trim(title);
         int length = normalized.codePointCount(0, normalized.length());
         if (length < 1 || length > 40) {
             throw new InvalidTitleException();
@@ -130,8 +172,24 @@ public class RoomService {
         return normalized;
     }
 
+    private static boolean isSingleLine(String value) {
+        return value.codePoints().noneMatch(point -> Character.isISOControl(point)
+                || point == 0x2028 || point == 0x2029
+                || (point >= Character.MIN_SURROGATE && point <= Character.MAX_SURROGATE));
+    }
+
+    private static String trim(String value) {
+        return EDGE_WHITESPACE.matcher(value).replaceAll("");
+    }
+
     /** 持久化房间的对外 UUID、名称和 UTC 创建时间。 */
     public record Room(String roomId, String title, Instant createdAt) {}
+
+    /** 有序的房间目录结果及下一页读取边界。 */
+    public record DirectoryPage(List<RoomMapper.DirectoryRow> items, String nextCursor) {}
+
+    /** 目录关键词、页大小或游标不符合接口契约。 */
+    public static final class InvalidDirectoryQueryException extends RuntimeException {}
 
     /** 名称无法保存为合法的单行文本。 */
     public static final class InvalidTitleException extends RuntimeException {

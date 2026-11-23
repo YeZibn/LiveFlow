@@ -63,7 +63,7 @@ Ticket 是仅供建立一次连接的不透明随机值。成功响应的 `expir
 | `409` | `MESSAGE_ID_CONFLICT` | 同一去重键已接受过不同规范化正文。新正文需使用新 ID。 |
 | `429` | `MESSAGE_RATE_LIMITED` | 超过账号发送额度。响应头 `Retry-After` 为允许重试前的整数秒数。保留正文。 |
 | `503` | `AUTH_SERVICE_UNAVAILABLE` | 当前会话无法确认。按认证契约处理。 |
-| `503` | `ROOM_MESSAGES_UNAVAILABLE` | 房间读取、Ticket 存储或服务端接收能力暂不可用。应用以此错误拒绝的新发送请求不会进入广播。 |
+| `503` | `ROOM_MESSAGES_UNAVAILABLE` | 房间或发送者资料读取、Ticket 存储或服务端接收能力暂不可用。应用以此错误拒绝的新发送请求不会进入广播。 |
 
 HTTP 超时、传输中断或无法确认来源的网关错误视为结果不确定。用户主动重试同一提交时继续使用原 ID 与输入快照。去重有效范围见 [短期状态](storage.md#jvm-状态与生命周期)。
 
@@ -77,7 +77,7 @@ HTTP 超时、传输中断或无法确认来源的网关错误视为结果不确
 | --- | --- | --- |
 | `auth` | 客户端 → 服务端 | `ticket`，申请接口返回的不透明字符串。 |
 | `ready` | 服务端 → 客户端 | `roomId`，该连接绑定的房间 UUID。 |
-| `message` | 服务端 → 客户端 | `messageId`、`content`、`sentAt`，所有连接收到同一条消息的数据。 |
+| `message` | 服务端 → 客户端 | `messageId`、`senderName`、`content`、`sentAt`，所有连接收到同一条消息的数据。 |
 | `error` | 服务端 → 客户端 | `code`、`message`，例如 `INVALID_REQUEST`、`TICKET_INVALID` 或认证相关错误码。 |
 
 ```json
@@ -89,9 +89,26 @@ HTTP 超时、传输中断或无法确认来源的网关错误视为结果不确
 ```
 
 ```json
-{"type":"message","messageId":"967b8ca4-0d7d-4656-b0aa-3dfaec51589e","content":"大家好！","sentAt":"2026-11-23T08:30:00.123Z"}
+{
+  "type": "message",
+  "messageId": "967b8ca4-0d7d-4656-b0aa-3dfaec51589e",
+  "senderName": "小叶",
+  "content": "大家好！",
+  "sentAt": "2026-11-23T08:30:00.123Z"
+}
 ```
 
 ```json
 {"type":"error","code":"TICKET_INVALID","message":"连接票据无效或已过期"}
 ```
+
+### 弹幕广播字段
+
+| 字段 | 类型 | 语义 |
+| --- | --- | --- |
+| `messageId` | string | 本次受理生成的标准小写 UUID v4，与 HTTP 回执相同。 |
+| `senderName` | string | 必填，发送者显示名。由服务端使用认证账号读取昵称，未设置时用保留原拼写的登录用户名。每条消息保存受理时使用的显示名。 |
+| `content` | string | 服务端规范化后的纯文本正文。 |
+| `sentAt` | string | 与 HTTP 回执相同的 UTC 时间，含三位小数秒。Vue 按本地时间渲染为 `HH:mm:ss`。 |
+
+发送请求仍由 `clientMessageId` 与 `content` 组成，HTTP 回执提供 `messageId` 与 `sentAt`。接收页所需的发送者信息由广播中的 `senderName` 提供。 [显示名规则](../profile/api.md#成功响应)

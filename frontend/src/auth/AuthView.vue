@@ -1,11 +1,13 @@
 <script setup lang="ts">
 import { nextTick, ref } from 'vue'
 import ProfileView from '../profile/ProfileView.vue'
+import RoomDirectory from '../room/RoomDirectory.vue'
 import RoomView from '../room/RoomView.vue'
 import RegisterForm from './RegisterForm.vue'
 import { useAuth } from './useAuth'
 
-defineProps<{ roomId?: string }>()
+defineProps<{ roomId?: string; showProfile: boolean; keyword: string; listReturn: string }>()
+const emit = defineEmits<{ search: [keyword: string] }>()
 
 const username = ref('')
 const password = ref('')
@@ -46,10 +48,12 @@ function completeRegistration(registeredUsername: string) {
 </script>
 
 <template>
-  <main v-if="!restoring && loggedIn" :class="roomId === undefined ? 'profile-main' : undefined">
-    <RoomView v-if="roomId !== undefined" :key="`${sessionId}:${roomId}`" :room-id="roomId" :with-access="withAccess" />
-    <ProfileView v-else :key="sessionId" :with-access="withAccess"
+  <main v-if="!restoring && loggedIn" :class="{ 'profile-main': showProfile }">
+    <RoomView v-if="roomId !== undefined" :key="`${sessionId}:${roomId}`" :room-id="roomId" :with-access="withAccess"
+      :list-return="listReturn" />
+    <ProfileView v-else-if="showProfile" :key="sessionId" :with-access="withAccess"
       :auth-busy="busy" :auth-error="error" @logout="logout" />
+    <RoomDirectory v-else :key="sessionId" :with-access="withAccess" :keyword="keyword" @search="emit('search', $event)" />
   </main>
 
   <main v-else class="auth-layout">

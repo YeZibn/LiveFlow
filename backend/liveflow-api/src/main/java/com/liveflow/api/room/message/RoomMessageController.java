@@ -75,7 +75,8 @@ public class RoomMessageController {
      * @return 不可缓存的消息标识和受理时间
      * @throws JacksonException 请求正文无法解析
      * @throws RoomMessageFailure 请求无效、冲突、超额或服务无法受理
-     * @throws DataAccessException 房间存储故障
+     * @throws AuthFailure 发送者账号已不存在
+     * @throws DataAccessException 房间或发送者资料读取失败
      */
     @PostMapping(path = "/messages", consumes = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<MessageReceipt> send(@AuthenticationPrincipal Jwt jwt,

@@ -1,5 +1,7 @@
 package com.liveflow.core.room.message;
 
+import com.liveflow.core.auth.AuthFailure;
+import com.liveflow.core.profile.service.UserProfileService;
 import com.liveflow.core.room.RoomUuid;
 import com.liveflow.core.room.service.RoomService;
 import java.time.Clock;
@@ -26,6 +28,7 @@ public class RoomMessageService {
 
     private static final Pattern EDGE_WHITESPACE = Pattern.compile("(?U)\\A\\s+|\\s+\\z");
     private final RoomService rooms;
+    private final UserProfileService profiles;
     private final RoomMessageBroadcast broadcast;
     private final LongSupplier ticker;
     private final Clock clock;
@@ -39,6 +42,7 @@ public class RoomMessageService {
 
     /**
      * @param rooms 房间查询服务
+     * @param profiles 根据已认证账号读取显示名的资料服务
      * @param broadcast 本机房间广播
      * @param windowSeconds 账号滚动窗口秒数
      * @param maxPerWindow 窗口内允许的消息数
@@ -46,20 +50,23 @@ public class RoomMessageService {
      * @param capacity 本实例可同时保留的受理记录上限
      */
     @Autowired
-    public RoomMessageService(RoomService rooms, RoomMessageBroadcast broadcast,
+    public RoomMessageService(RoomService rooms, UserProfileService profiles, RoomMessageBroadcast broadcast,
             @Value("${liveflow.room-messages.window-seconds:10}") int windowSeconds,
             @Value("${liveflow.room-messages.max-per-window:5}") int maxPerWindow,
             @Value("${liveflow.room-messages.replay-seconds:60}") int replaySeconds,
             @Value("${liveflow.room-messages.replay-capacity:4096}") int capacity) {
-        this(rooms, broadcast, System::nanoTime, Clock.systemUTC(), windowSeconds, maxPerWindow, replaySeconds, capacity);
+        this(rooms, profiles, broadcast, System::nanoTime, Clock.systemUTC(), windowSeconds, maxPerWindow, replaySeconds,
+                capacity);
     }
 
-    RoomMessageService(RoomService rooms, RoomMessageBroadcast broadcast, LongSupplier ticker, Clock clock,
+    RoomMessageService(RoomService rooms, UserProfileService profiles, RoomMessageBroadcast broadcast,
+            LongSupplier ticker, Clock clock,
             int windowSeconds, int maxPerWindow, int replaySeconds, int capacity) {
         if (windowSeconds <= 0 || maxPerWindow <= 0 || replaySeconds < windowSeconds || capacity <= 0) {
             throw new IllegalArgumentException("弹幕额度和受理容量必须为正，去重期限必须覆盖限流窗口");
         }
         this.rooms = rooms;
+        this.profiles = profiles;
         this.broadcast = broadcast;
         this.ticker = ticker;
         this.clock = clock;
@@ -78,28 +85,47 @@ public class RoomMessageService {
      * @param rawContent 输入的原始正文
      * @return 服务端消息标识和受理时间
      * @throws RoomMessageFailure 输入无效、房间不存在、正文冲突、超额或暂时无法受理
-     * @throws DataAccessException 房间查询失败
+     * @throws AuthFailure 发送者账号已不存在
+     * @throws DataAccessException 房间或发送者资料读取失败
      */
     public Receipt send(long userId, UUID sessionId, String roomId, String clientMessageId, String rawContent) {
         if (!RoomUuid.isCanonical(roomId) || !RoomUuid.isCanonical(clientMessageId)) {
             throw new RoomMessageFailure(INVALID_REQUEST);
         }
         String content = normalize(rawContent);
-        if (rooms.readDetails(roomId).isEmpty()) {
+        if (!rooms.exists(roomId)) {
             throw new RoomMessageFailure(ROOM_NOT_FOUND);
         }
 
         var key = new RequestKey(sessionId, roomId, clientMessageId);
+        synchronized (admission) {
+            expireReceipts(ticker.getAsLong());
+            Receipt replay = replay(key, content);
+            if (replay != null) {
+                return replay;
+            }
+        }
+
+        // 资料读取可能阻塞。释放受理锁，让其他发送和已有回执的重试继续处理。
+        String senderName = null;
+        RuntimeException profileFailure = null;
+        try {
+            senderName = profiles.read(userId).displayName();
+        } catch (DataAccessException | AuthFailure failure) {
+            profileFailure = failure;
+        }
+
         // 单实例的短临界区只访问内存。去重、额度和房间入队共享一次受理顺序。
         synchronized (admission) {
             long now = ticker.getAsLong();
             expireReceipts(now);
-            Accepted prior = accepted.get(key);
-            if (prior != null) {
-                if (!prior.content().equals(content)) {
-                    throw new RoomMessageFailure(MESSAGE_ID_CONFLICT);
-                }
-                return prior.receipt();
+            // 若另一标签页已受理，优先返回原结果，即使这次资料查询失败。
+            Receipt replay = replay(key, content);
+            if (replay != null) {
+                return replay;
+            }
+            if (profileFailure != null) {
+                throw profileFailure;
             }
             var recent = attempts.get(userId);
             if (recent != null) {
@@ -116,11 +142,24 @@ public class RoomMessageService {
 
             var receipt = new Receipt(UUID.randomUUID().toString(), clock.instant());
             // 广播只做有界入队。成功后才记录受理结果和额度，失败时两者均不提交。
-            broadcast.enqueue(new RoomMessageBroadcast.Message(roomId, receipt.messageId(), content, receipt.sentAt()));
+            broadcast.enqueue(new RoomMessageBroadcast.Message(roomId, receipt.messageId(), senderName, content,
+                    receipt.sentAt()));
             accepted.put(key, new Accepted(content, receipt, now));
             attempts.computeIfAbsent(userId, ignored -> new ArrayDeque<>()).addLast(now);
             return receipt;
         }
+    }
+
+    /** 在持有受理锁时判断是否已有结果，非空结果沿用原回执。 */
+    private Receipt replay(RequestKey key, String content) {
+        Accepted prior = accepted.get(key);
+        if (prior == null) {
+            return null;
+        }
+        if (!prior.content().equals(content)) {
+            throw new RoomMessageFailure(MESSAGE_ID_CONFLICT);
+        }
+        return prior.receipt();
     }
 
     /** 定期回收无请求的账号状态以及已过期的去重记录。 */
