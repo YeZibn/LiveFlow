@@ -31,7 +31,7 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 
 - [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。WebSocket Ticket 归入后续实时连接阶段。
 - [个人主页 V1](docs/design/profile/design.md) 涵盖登录后的个人主页、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
-- [直播间 V1](docs/design/room/design.md) 定义在个人主页创建和查询本人房间、一人一房规则、HTTP 接口及数据库约束。
+- [直播间 V1](docs/design/room/design.md) 定义一人一房、UUID 链接进入、房间页面框架、HTTP 接口及数据库迁移。
 
 ## 本地启动
 

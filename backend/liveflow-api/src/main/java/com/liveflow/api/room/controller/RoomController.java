@@ -8,6 +8,7 @@ import com.liveflow.core.room.service.RoomService.Room;
 import com.liveflow.core.room.service.RoomService.RoomAlreadyExistsException;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
+import java.util.regex.Pattern;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpStatus;
@@ -17,6 +18,7 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
 import org.springframework.transaction.TransactionException;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
@@ -26,17 +28,19 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectReader;
 import tools.jackson.databind.json.JsonMapper;
 
-/** 创建并读取当前登录账号的房间。 */
+/** 处理房间创建、本人查询及已登录用户的房间详情请求。 */
 @RestController
 public class RoomController {
 
     private static final DateTimeFormatter UTC_MILLIS = new DateTimeFormatterBuilder().appendInstant(3).toFormatter();
+    private static final Pattern ROOM_UUID = Pattern.compile(
+            "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}");
 
     private final RoomService rooms;
     private final ObjectReader requestReader;
 
     /**
-     * @param rooms 本人房间读写服务
+     * @param rooms 房间读写服务
      * @param json 应用的 JSON 映射器
      */
     public RoomController(RoomService rooms, JsonMapper json) {
@@ -58,6 +62,25 @@ public class RoomController {
     public ResponseEntity<CurrentRoomResponse> read(@AuthenticationPrincipal Jwt jwt) {
         RoomResponse room = rooms.read(Long.parseLong(jwt.getSubject())).map(RoomResponse::from).orElse(null);
         return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(new CurrentRoomResponse(room));
+    }
+
+    /**
+     * 查询任意已登录用户可访问的房间详情。
+     * @param roomId 路径中的标准小写 UUID v4
+     * @return 不可缓存的房间标题和对外标识
+     * @throws InvalidRoomRequestException 标识格式无效
+     * @throws RoomNotFoundException UUID 对应的房间不存在
+     * @throws DataAccessException 房间读取失败
+     */
+    @GetMapping("/api/v1/rooms/{roomId}")
+    public ResponseEntity<RoomDetailsResponse> readDetails(@PathVariable("roomId") String roomId) {
+        if (!ROOM_UUID.matcher(roomId).matches()) {
+            throw new InvalidRoomRequestException();
+        }
+        // 安全过滤链先校验当前会话，详情仅暴露渲染房间页所需的字段。
+        var room = rooms.readDetails(roomId).orElseThrow(RoomNotFoundException::new);
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .body(new RoomDetailsResponse(room.roomId(), room.title()));
     }
 
     /**
@@ -90,10 +113,16 @@ public class RoomController {
     /** 对外房间信息，ID 和时间均按接口约定序列化。 */
     public record RoomResponse(String roomId, String title, String createdAt) {
         private static RoomResponse from(Room room) {
-            return new RoomResponse(Long.toString(room.roomId()), room.title(), UTC_MILLIS.format(room.createdAt()));
+            return new RoomResponse(room.roomId(), room.title(), UTC_MILLIS.format(room.createdAt()));
         }
     }
 
-    /** 请求对象的字段或类型不符合创建接口约定。 */
+    /** 直播间详情的公开字段。 */
+    public record RoomDetailsResponse(String roomId, String title) {}
+
+    /** 房间请求的字段、类型或路径参数无效。 */
     static final class InvalidRoomRequestException extends RuntimeException {}
+
+    /** 请求中的房间 UUID 没有对应的记录。 */
+    static final class RoomNotFoundException extends RuntimeException {}
 }

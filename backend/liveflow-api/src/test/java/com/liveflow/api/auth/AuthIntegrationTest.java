@@ -44,6 +44,9 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 
 /** 用本地 Compose 中的 MySQL 和 Redis 验证经过真实 HTTP 过滤链的认证契约。 */
@@ -441,7 +444,11 @@ class AuthIntegrationTest {
                 roomBody("　" + title + " "), bearer, true), 201);
         assertThat(created.get("title").asString()).isEqualTo(title);
         assertThat(created.get("roomId").isString()).isTrue();
-        assertThat(created.get("roomId").asString()).matches("[1-9][0-9]*");
+        String roomId = created.get("roomId").asString();
+        assertThat(UUID.fromString(roomId).version()).isEqualTo(4);
+        assertThat(roomId).isEqualTo(UUID.fromString(roomId).toString());
+        var details = roomResponse(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + roomId, null, bearer, false), 200);
+        assertThat(details).isEqualTo(json.readTree(json.writeValueAsString(Map.of("roomId", roomId, "title", title))));
         assertThat(created.get("createdAt").asString()).matches(".+\\.\\d{3}Z");
         assertThat(roomResponse(browser.sendPath("GET", ROOM_READ_PATH, null, bearer, false), 200).get("room"))
                 .isEqualTo(created);
@@ -501,6 +508,10 @@ class AuthIntegrationTest {
             String otherBearer = access(other.login(otherName));
             assertThat(roomResponse(other.sendPath("GET", ROOM_READ_PATH, null, otherBearer, false), 200)
                     .get("room").isNull()).isTrue();
+            // 另一个账号可读取分享的房间，本人查询仍按各自归属。
+            var shared = roomResponse(other.sendPath("GET", ROOM_CREATE_PATH + "/" + winner.get("roomId").asString(),
+                    null, otherBearer, false), 200);
+            assertThat(shared.get("roomId")).isEqualTo(winner.get("roomId"));
             JsonNode sameTitle = roomResponse(other.sendPath("POST", ROOM_CREATE_PATH,
                     roomBody(winner.get("title").asString()), otherBearer, true), 201);
             assertThat(sameTitle.get("roomId")).isNotEqualTo(winner.get("roomId"));
@@ -524,6 +535,54 @@ class AuthIntegrationTest {
         failure(browser.sendPath("POST", ROOM_CREATE_PATH, roomBody("房间"), bearer, true),
                 503, "ROOM_SERVICE_UNAVAILABLE");
         assertThat(roomCount(userId)).isZero();
+    }
+
+    @Test
+    void roomDetailsValidateUuidAndMapMissingAndStorageFailure() throws Exception {
+        var browser = new Browser();
+        String roomId = "7ea8af2a-721f-4f2a-8ff5-03e2fd31ee3c";
+        failure(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + roomId, null, null, false),
+                401, "AUTH_REQUIRED");
+        String bearer = access(browser.login());
+        for (String invalid : List.of("73", roomId.toUpperCase(Locale.ROOT), roomId.replace("-4f2a-", "-1f2a-"))) {
+            failure(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + invalid, null, bearer, false),
+                    400, "INVALID_REQUEST");
+        }
+        failure(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + roomId, null, bearer, false),
+                404, "ROOM_NOT_FOUND");
+        doThrow(new DataAccessResourceFailureException("test")).when(rooms).findDetails(roomId);
+        failure(browser.sendPath("GET", ROOM_CREATE_PATH + "/" + roomId, null, bearer, false),
+                503, "ROOM_SERVICE_UNAVAILABLE");
+    }
+
+    @Test
+    void uuidConflictRetriesOnceWithANewId() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String occupied = UUID.randomUUID().toString();
+        String otherName = registrationName("Uuid_");
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?",
+                otherName, userId);
+        long otherId = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, otherName);
+        String insert = "INSERT INTO rooms (room_uuid, owner_user_id, title, created_at) VALUES (?, ?, ?, UTC_TIMESTAMP(3))";
+        jdbc.update(insert, occupied, otherId, "已有房间");
+        try {
+            var generated = new ArrayList<String>();
+            doAnswer(invocation -> {
+                String newId = invocation.getArgument(1);
+                generated.add(newId);
+                // 第一次让真实唯一索引拒绝写入，第二次使用服务生成的新值。
+                return jdbc.update(insert, generated.size() == 1 ? occupied : newId, userId, invocation.getArgument(2));
+            }).when(rooms).insert(eq(userId), anyString(), anyString());
+            JsonNode created = roomResponse(browser.sendPath("POST", ROOM_CREATE_PATH,
+                    roomBody("新房间"), bearer, true), 201);
+            assertThat(generated).hasSize(2).doesNotHaveDuplicates();
+            assertThat(created.get("roomId").asString()).isEqualTo(generated.getLast());
+            assertThat(roomCount(userId)).isOne();
+        } finally {
+            jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", otherId);
+        }
     }
 
     private String roomBody(String title) {

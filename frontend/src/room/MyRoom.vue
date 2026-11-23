@@ -120,6 +120,7 @@ async function submit() {
     </template>
     <template v-else-if="room">
       <p class="room-title">{{ room.title }}</p>
+      <a class="ui-button ui-button--primary" :href="`/rooms/${room.roomId}`">进入直播间</a>
       <p v-if="notice" class="ui-feedback" role="status">{{ notice }}</p>
     </template>
     <template v-else-if="room === null && !editing">

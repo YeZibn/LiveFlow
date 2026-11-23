@@ -82,6 +82,7 @@ class SecurityConfiguration {
                             .requestMatchers(HttpMethod.GET, "/api/v1/users/me/profile").authenticated()
                             .requestMatchers(HttpMethod.PUT, "/api/v1/users/me/profile").authenticated()
                             .requestMatchers(HttpMethod.GET, "/api/v1/users/me/room").authenticated()
+                            .requestMatchers(HttpMethod.GET, "/api/v1/rooms/{roomId}").authenticated()
                             .requestMatchers(HttpMethod.POST, "/api/v1/rooms").authenticated()
                             .anyRequest().denyAll();
                 }).build();

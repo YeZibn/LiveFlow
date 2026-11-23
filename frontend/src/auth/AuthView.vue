@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { nextTick, ref } from 'vue'
 import ProfileView from '../profile/ProfileView.vue'
+import RoomView from '../room/RoomView.vue'
 import RegisterForm from './RegisterForm.vue'
 import { useAuth } from './useAuth'
+
+defineProps<{ roomId?: string }>()
 
 const username = ref('')
 const password = ref('')
@@ -43,8 +46,9 @@ function completeRegistration(registeredUsername: string) {
 </script>
 
 <template>
-  <main v-if="!restoring && loggedIn" class="profile-main">
-    <ProfileView :key="sessionId" :with-access="withAccess"
+  <main v-if="!restoring && loggedIn" :class="roomId === undefined ? 'profile-main' : undefined">
+    <RoomView v-if="roomId !== undefined" :key="`${sessionId}:${roomId}`" :room-id="roomId" :with-access="withAccess" />
+    <ProfileView v-else :key="sessionId" :with-access="withAccess"
       :auth-busy="busy" :auth-error="error" @logout="logout" />
   </main>
 

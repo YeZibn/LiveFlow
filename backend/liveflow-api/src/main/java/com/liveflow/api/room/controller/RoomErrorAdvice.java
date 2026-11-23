@@ -31,6 +31,12 @@ class RoomErrorAdvice {
                 new RoomError("INVALID_REQUEST", "请检查请求字段", Map.of("title", failure.getMessage())));
     }
 
+    @ExceptionHandler(RoomController.RoomNotFoundException.class)
+    ResponseEntity<RoomError> notFound() {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(new RoomError("ROOM_NOT_FOUND", "房间不存在", Map.of()));
+    }
+
     @ExceptionHandler(RoomAlreadyExistsException.class)
     ResponseEntity<RoomError> alreadyExists(RoomAlreadyExistsException failure) {
         return ResponseEntity.status(HttpStatus.CONFLICT)

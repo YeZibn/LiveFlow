@@ -2,7 +2,10 @@
 import AuthView from './auth/AuthView.vue'
 import DevelopmentCheck from './DevelopmentCheck.vue'
 
-const showDevelopmentCheck = window.location.pathname === '/dev'
+const pathname = window.location.pathname
+const showDevelopmentCheck = pathname === '/dev'
+// 房间地址由浏览器保留，登录和刷新都使用同一个目标。
+const roomId = pathname.startsWith('/rooms/') ? pathname.slice('/rooms/'.length) : undefined
 const showDevelopmentLink = import.meta.env.DEV && !showDevelopmentCheck
 </script>
 
@@ -16,7 +19,7 @@ const showDevelopmentLink = import.meta.env.DEV && !showDevelopmentCheck
     <a v-else-if="showDevelopmentCheck" class="ui-button" href="/">返回首页</a>
   </header>
   <DevelopmentCheck v-if="showDevelopmentCheck" />
-  <AuthView v-else />
+  <AuthView v-else :room-id="roomId" />
 </template>
 
 <style scoped>

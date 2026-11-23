@@ -8,7 +8,7 @@
 
 ### Requirement: 登录用户创建本人房间
 
-系统 MUST 提供 `POST /api/v1/rooms`，要求有效 Bearer 会话和 CSRF，按认证账号创建房间。请求 MUST 为只含字符串 `title` 的 JSON 对象。名称先拒绝 C0、C1 控制字符及 Unicode 行段分隔符，再按 Unicode White_Space 去除首尾空白，结果 MUST 为 1–40 个 Unicode 码点，保留内部空白与大小写。提交成功 MUST 返回 `201`、`Cache-Control: no-store` 以及房间对象，其中 `roomId` 为十进制字符串，`createdAt` 为带三位小数秒的 UTC ISO 8601 字符串，`title` 为规范化后的名称。
+系统 MUST 提供 `POST /api/v1/rooms`，要求有效 Bearer 会话和 CSRF，按认证账号创建房间。请求 MUST 为只含字符串 `title` 的 JSON 对象。名称先拒绝 C0、C1 控制字符及 Unicode 行段分隔符，再按 Unicode White_Space 去除首尾空白，结果 MUST 为 1–40 个 Unicode 码点，保留内部空白与大小写。提交成功 MUST 返回 `201`、`Cache-Control: no-store` 以及房间对象，其中 `roomId` 为标准小写随机 UUID v4，保存后保持稳定，`createdAt` 为带三位小数秒的 UTC ISO 8601 字符串，`title` 为规范化后的名称。
 
 #### Scenario: 创建成功
 
@@ -27,7 +27,7 @@
 
 ### Requirement: 一人一房与本人查询
 
-系统 MUST 保证每账号最多一个房间。名称允许重复。重复创建 MUST 返回 `409 ROOM_ALREADY_EXISTS` 并保留原房间。系统 MUST 提供 `GET /api/v1/users/me/room`，仅查询当前有效会话对应账号的房间，返回不可缓存的 `200` 和 `room` 字段。房间存储不可用时 MUST 返回 `503 ROOM_SERVICE_UNAVAILABLE`，账号不存在时 MUST 按会话失效处理。
+系统 MUST 保证每账号最多一个房间。名称允许重复。重复创建 MUST 返回 `409 ROOM_ALREADY_EXISTS` 并保留原房间。系统 MUST 提供 `GET /api/v1/users/me/room`，仅查询当前有效会话对应账号的房间，返回不可缓存的 `200` 和 `room` 字段。房间存在时，`room.roomId` MUST 为该房间的标准小写 UUID v4。房间存储不可用时 MUST 返回 `503 ROOM_SERVICE_UNAVAILABLE`，账号不存在时 MUST 按会话失效处理。
 
 #### Scenario: 同账号并发创建
 
@@ -46,7 +46,7 @@
 
 ### Requirement: 个人主页房间操作与恢复
 
-Vue MUST 在个人主页独立显示「我的直播间」，区分加载、空结果、已有房间和读取失败。空结果时提供仅含房间名称的创建表单，提交期间禁止重复操作，成功时显示返回的名称，页面隐藏用户 ID。切换会话后，旧请求的结果 MUST 无法更新当前页面。
+Vue MUST 在个人主页独立显示「我的直播间」，区分加载、空结果、已有房间和读取失败。空结果时提供仅含房间名称的创建表单，提交期间禁止重复操作，成功时显示返回的名称，页面隐藏用户 ID。房间存在时 MUST 提供指向 `/rooms/{roomId}` 的「进入直播间」入口。切换会话后，旧请求的结果 MUST 无法更新当前页面。
 
 #### Scenario: 成功后刷新或重新登录
 
@@ -62,3 +62,51 @@ Vue MUST 在个人主页独立显示「我的直播间」，区分加载、空�
 
 - **WHEN** 进入个人主页后房间读取失败但个人资料加载成功
 - **THEN** 页面展示个人资料，房间区显示读取失败与重试入口
+
+### Requirement: 房间 UUID 与详情查询
+
+系统 MUST 为迁移前已存在的房间补齐唯一的随机 UUID v4，并保留房主、名称和创建时间。系统 MUST 提供 `GET /api/v1/rooms/{roomId}`，仅接受有效登录会话和标准小写 UUID v4。成功 MUST 返回 `200`、`Cache-Control: no-store` 和仅含 `roomId`、`title` 的 JSON。详情读取无写入副作用。
+
+#### Scenario: 查询已迁移的房间
+
+- **WHEN** 迁移前存在的房间完成迁移，用户从本人查询取得 UUID 并打开详情
+- **THEN** 三次读取所得标识保持一致，包括迁移后首次本人查询、详情和再次本人查询，原房主、名称及创建时间保持原值
+
+#### Scenario: 另一账号通过链接查询房间
+
+- **WHEN** 有效登录的其他账号请求存在房间的标准 UUID
+- **THEN** 详情返回 `200`、房间 UUID 和名称，后续本人查询仍只返回该访问者自己的房间
+
+#### Scenario: 无效路径参数与房间缺失
+
+- **WHEN** 有效登录用户使用无效 UUID 格式，或提交一个合法但不存在的 UUID
+- **THEN** 前者返回 `400 INVALID_REQUEST`，后者返回 `404 ROOM_NOT_FOUND`
+
+#### Scenario: 鉴权与详情读取故障
+
+- **WHEN** 详情请求缺少有效会话，或有效会话的请求遇到房间存储故障
+- **THEN** 前者按现有认证契约拒绝，后者返回 `503 ROOM_SERVICE_UNAVAILABLE`
+
+### Requirement: 进入直播间页面与分享
+
+Vue MUST 支持直接打开并刷新 `/rooms/{roomId}`。未登录时 MUST 保留当前房间地址，登录成功后加载同一房间。详情成功后页面 MUST 展示标题、返回个人主页、复制链接、16:9 直播画面占位区和独立弹幕占位区，移动端上下排列，页面隐藏用户 ID。只有属于当前路由和当前会话的响应才可更新页面。
+
+#### Scenario: 从个人主页进入并分享
+
+- **WHEN** 房主点击「进入直播间」并复制链接
+- **THEN** 页面显示对应房间，复制内容使用该房间 UUID 并反馈结果，其他有效登录用户可打开该链接
+
+#### Scenario: 从分享链接登录并刷新
+
+- **WHEN** 未登录用户通过房间链接进入，完成登录后刷新
+- **THEN** 登录和刷新均在原地址继续，恢复会话后请求并展示该房间
+
+#### Scenario: 房间页失败与重试
+
+- **WHEN** 房间链接无效、房间不存在或详情读取暂时失败
+- **THEN** 页面展示对应提示。前两种情况提供返回个人主页入口，暂时失败保留房间地址并支持重试
+
+#### Scenario: 路由或会话切换
+
+- **WHEN** 旧请求发出后切换房间或登录会话，旧响应晚于切换返回
+- **THEN** 当前页面只展示当前路由与会话对应的房间信息
