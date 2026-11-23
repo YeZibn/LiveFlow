@@ -72,74 +72,57 @@ async function submit() {
 </script>
 
 <template>
-  <h1 id="auth-title">注册 LiveFlow</h1>
-  <form :aria-busy="submitting" novalidate @submit.prevent="submit">
-    <div class="field">
-      <label for="register-username">账号</label>
-      <input id="register-username" v-model="username" autocomplete="username" autocapitalize="none"
-        spellcheck="false" :disabled="submitting" required />
+  <header class="auth-intro">
+    <h1 id="auth-title" tabindex="-1">注册 LiveFlow</h1>
+  </header>
+  <form class="ui-form" :aria-busy="submitting" novalidate @submit.prevent="submit">
+    <div class="ui-field">
+      <label for="register-username">用户名</label>
+      <input class="ui-input" id="register-username" v-model="username" autocomplete="username" autocapitalize="none"
+        spellcheck="false" aria-describedby="username-rules" :disabled="submitting" required />
+      <small id="username-rules">3–32 位字母、数字或下划线，首位为字母或数字。</small>
     </div>
-    <div class="field">
+    <div class="ui-field">
       <label for="register-password">密码</label>
       <div class="password-field">
-        <input id="register-password" v-model="password" :type="showPassword ? 'text' : 'password'"
+        <input class="ui-input" id="register-password" v-model="password" :type="showPassword ? 'text' : 'password'"
           autocomplete="new-password" aria-describedby="password-rules" :disabled="submitting" required />
-        <button type="button" aria-controls="register-password" :aria-label="showPassword ? '隐藏密码' : '显示密码'"
+        <button class="ui-link-button password-toggle" type="button" aria-controls="register-password" :aria-label="showPassword ? '隐藏密码' : '显示密码'"
           :disabled="submitting" @click="showPassword = !showPassword">
           {{ showPassword ? '隐藏' : '显示' }}
         </button>
       </div>
       <small id="password-rules">10–25 位，包含大小写字母、数字和符号，不能有空格。</small>
     </div>
-    <div class="field">
+    <div class="ui-field">
       <label for="register-confirmation">确认密码</label>
       <div class="password-field">
-        <input id="register-confirmation" v-model="confirmation" :type="showConfirmation ? 'text' : 'password'"
+        <input class="ui-input" id="register-confirmation" v-model="confirmation" :type="showConfirmation ? 'text' : 'password'"
           autocomplete="new-password" :disabled="submitting" required />
-        <button type="button" aria-controls="register-confirmation"
+        <button class="ui-link-button password-toggle" type="button" aria-controls="register-confirmation"
           :aria-label="showConfirmation ? '隐藏确认密码' : '显示确认密码'"
           :disabled="submitting" @click="showConfirmation = !showConfirmation">
           {{ showConfirmation ? '隐藏' : '显示' }}
         </button>
       </div>
     </div>
-    <p v-if="error" class="error" role="alert">{{ error }}</p>
-    <button class="primary" :disabled="submitting" type="submit">{{ submitting ? '正在注册…' : '注册' }}</button>
-    <button type="button" :disabled="submitting" @click="emit('back')">返回登录</button>
+    <p v-if="error" class="ui-feedback ui-feedback--error" role="alert">{{ error }}</p>
+    <button class="ui-button ui-button--primary auth-submit" :disabled="submitting" type="submit">{{ submitting ? '正在注册…' : '注册' }}</button>
   </form>
+  <p class="auth-switch">
+    已有账号？
+    <button class="ui-link-button" type="button" :disabled="submitting" @click="emit('back')">返回登录</button>
+  </p>
 </template>
 
 <style scoped>
-h1 { margin: 0 0 1.6rem; font-size: 1.85rem; line-height: 1.25; }
-form, .field { display: grid; gap: 0.6rem; }
-form { gap: 1.1rem; }
-label { font-size: 0.9rem; font-weight: 650; }
-small { color: #536781; }
-.password-field { display: flex; gap: 0.5rem; }
-input {
-  box-sizing: border-box;
-  min-width: 0;
-  width: 100%;
-  padding: 0.68rem 0.75rem;
-  border: 1px solid #b7c6d9;
-  border-radius: 0.45rem;
-  color: inherit;
-  font: inherit;
+.password-field { position: relative; }
+.password-field .ui-input { padding-inline-end: 4.5rem; }
+.password-toggle {
+  position: absolute;
+  inset-block: 0.15rem;
+  inset-inline-end: 0.4rem;
+  min-width: 3.35rem;
+  font-size: 0.8rem;
 }
-button {
-  min-height: 2.65rem;
-  padding: 0.55rem 0.85rem;
-  border: 1px solid #b7c6d9;
-  border-radius: 0.45rem;
-  color: #264876;
-  background: #fff;
-  font: inherit;
-  font-weight: 650;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.primary { color: #fff; background: #245cbd; border-color: #245cbd; }
-button:disabled { opacity: 0.65; cursor: wait; }
-:focus-visible { outline: 2px solid #2464d1; outline-offset: 3px; }
-.error { margin: 0; padding: 0.65rem; border-radius: 0.4rem; background: #fff1ef; color: #97281f; }
 </style>

@@ -1,0 +1,89 @@
+:root {
+  font-family: "Inter", system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #202823;
+  background: #faf9f6;
+  font-synthesis: none;
+  --surface: #fff;
+  --text: #202823;
+  --muted: #5c6961;
+  --line: #dedfd8;
+  --field-line: #aeb9af;
+  --accent: #195744;
+  --accent-hover: #124735;
+  --tint: #ecf4ee;
+  --danger: #942c28;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; }
+a { color: var(--accent); }
+button, input, textarea { font: inherit; }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.ui-button {
+  display: inline-flex;
+  min-height: 2.75rem;
+  padding: 0.55rem 1.15rem;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  background: var(--surface);
+  font-size: 0.9rem;
+  font-weight: 650;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.ui-button:hover:not(:disabled) { background: var(--tint); }
+.ui-button--primary { color: white; background: var(--accent); border-color: var(--accent); }
+.ui-button--primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button:disabled { opacity: 0.62; cursor: wait; }
+
+.ui-link-button {
+  min-height: 2.75rem;
+  padding: 0 0.25rem;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.ui-link-button:hover:not(:disabled) { text-decoration: underline; text-underline-offset: 0.22em; }
+
+.ui-form, .ui-field { display: grid; gap: 0.4rem; min-width: 0; }
+.ui-form { gap: 1.05rem; }
+.ui-field label, .ui-field legend { color: var(--text); font-size: 0.875rem; font-weight: 650; }
+.ui-field small { color: var(--muted); font-size: 0.8rem; line-height: 1.55; }
+
+.ui-input {
+  min-width: 0;
+  width: 100%;
+  min-height: 3.125rem;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--field-line);
+  border-radius: 0.85rem;
+  background: var(--surface);
+  color: var(--text);
+}
+.ui-input::placeholder { color: var(--muted); }
+.ui-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ui-input[aria-invalid="true"] { border-color: var(--danger); }
+.ui-input:disabled { background: #f3f3ef; }
+
+.ui-feedback {
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  border-radius: 0.75rem;
+  color: var(--accent);
+  background: var(--tint);
+  font-size: 0.875rem;
+  line-height: 1.55;
+}
+.ui-feedback--error { color: var(--danger); background: #fcf0ed; }

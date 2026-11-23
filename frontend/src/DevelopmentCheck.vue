@@ -87,73 +87,42 @@ onMounted(checkServices)
   <main class="development-check">
     <header>
       <h1>LiveFlow 开发环境</h1>
-      <button type="button" :disabled="checking" @click="checkServices">
+      <button class="ui-button ui-button--primary" type="button" :disabled="checking" @click="checkServices">
         {{ checking ? '检查中…' : '重新检查' }}
       </button>
     </header>
 
     <dl aria-live="polite">
-      <div><dt>Spring Boot</dt><dd>{{ health?.status ?? '待检查' }}</dd></div>
+      <div><dt>Spring Boot</dt><dd :data-status="health?.status">{{ health?.status ?? '待检查' }}</dd></div>
       <div v-for="service in services" :key="service.id">
         <dt>{{ service.name }}</dt>
-        <dd>{{ health?.components?.[service.id]?.status ?? '未知' }}</dd>
+        <dd :data-status="health?.components?.[service.id]?.status">{{ health?.components?.[service.id]?.status ?? '未知' }}</dd>
       </div>
-      <div><dt>WebSocket</dt><dd>{{ websocket }}</dd></div>
+      <div><dt>WebSocket</dt><dd :data-status="websocket">{{ websocket }}</dd></div>
     </dl>
   </main>
 </template>
 
-<style>
-:root {
-  font-family: system-ui, sans-serif;
-  color: #142437;
-  background: #f4f7fa;
-}
-
+<style scoped>
 .development-check {
-  max-width: 38rem;
-  margin: 4rem auto;
-  padding: 0 1.5rem;
+  width: min(calc(100% - 2rem), 38rem);
+  margin: clamp(1rem, 5vw, 4rem) auto 3rem;
 }
-
-.development-check header, .development-check dl > div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.development-check h1 {
-  font-size: clamp(1.25rem, 4vw, 2rem);
-}
-
-.development-check dl {
-  background: white;
-  border: 1px solid #dce5ee;
-  border-radius: 0.75rem;
-  padding: 0.5rem 1.25rem;
-}
-
-.development-check dl > div {
-  padding: 0.85rem 0;
-}
-
-.development-check dl > div + div {
-  border-top: 1px solid #dce5ee;
-}
-
-.development-check dd {
+header, dl > div { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+header { flex-wrap: wrap; }
+h1 { margin: 0; font-size: clamp(1.4rem, 4vw, 2rem); letter-spacing: -0.035em; }
+dl { padding: 0.35rem 1.15rem; border: 1px solid var(--line); border-radius: 1.25rem; background: var(--surface); }
+dl > div { padding: 0.85rem 0; }
+dl > div + div { border-top: 1px solid var(--line); }
+dd {
   margin: 0;
-  font-weight: 600;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: #f3f3ef;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 650;
 }
-
-.development-check button {
-  border: 1px solid #b8c8da;
-  border-radius: 0.4rem;
-  padding: 0.45rem 0.65rem;
-  color: inherit;
-  background: white;
-  font: inherit;
-  white-space: nowrap;
-}
+dd[data-status="UP"] { background: var(--tint); color: var(--accent); }
+dd:is([data-status="DOWN"], [data-status="OUT_OF_SERVICE"], [data-status="不可达"]) { background: #fcf0ed; color: var(--danger); }
 </style>

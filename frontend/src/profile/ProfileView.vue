@@ -105,39 +105,38 @@ async function submitProfile() {
   <section class="profile-panel" aria-labelledby="profile-title">
     <header class="profile-header">
       <h1 id="profile-title">个人主页</h1>
-      <button type="button" :disabled="authBusy" @click="emit('logout')">
+      <button class="ui-button" type="button" :disabled="authBusy" @click="emit('logout')">
         {{ authBusy ? '正在退出…' : '退出登录' }}
       </button>
     </header>
 
-    <p v-if="authError" class="error" role="alert">{{ authError }}</p>
+    <p v-if="authError" class="ui-feedback ui-feedback--error" role="alert">{{ authError }}</p>
     <p v-if="loading && !profile" role="status">正在读取资料…</p>
     <template v-if="profile">
       <div class="identity">
         <span class="avatar" :data-avatar="profile.avatarKey" aria-hidden="true">{{ [...profile.displayName][0] }}</span>
         <div>
           <h2>{{ profile.displayName }}</h2>
-          <p class="username">用户名 {{ profile.username }}</p>
+          <p class="username">@{{ profile.username }}</p>
         </div>
       </div>
 
       <template v-if="!draft">
-        <dl>
-          <div><dt>用户 ID</dt><dd>{{ profile.userId }}</dd></div>
+        <dl class="profile-details">
           <div><dt>个人简介</dt><dd class="bio">{{ profile.bio || '尚未填写简介' }}</dd></div>
         </dl>
-        <button type="button" class="primary" :disabled="authBusy" @click="startEditing">编辑资料</button>
+        <button type="button" class="ui-button ui-button--primary" :disabled="authBusy" @click="startEditing">编辑资料</button>
       </template>
 
-      <form v-else @submit.prevent="submitProfile">
+      <form v-else class="ui-form" :aria-busy="saving || loading" @submit.prevent="submitProfile">
         <fieldset class="edit-fields" :disabled="saving || loading || authBusy">
-          <div class="field">
+          <div class="ui-field">
             <label for="nickname">昵称</label>
-            <input id="nickname" v-model="draft.nickname" placeholder="留空使用登录用户名"
+            <input class="ui-input" id="nickname" v-model="draft.nickname" placeholder="留空使用登录用户名"
               :aria-invalid="Boolean(fieldErrors.nickname)" :aria-describedby="fieldErrors.nickname ? 'nickname-error' : undefined" />
             <p v-if="fieldErrors.nickname" id="nickname-error" class="field-error">{{ fieldErrors.nickname }}</p>
           </div>
-          <fieldset class="field avatars" :aria-describedby="fieldErrors.avatarKey ? 'avatar-error' : undefined">
+          <fieldset class="ui-field avatars" :aria-describedby="fieldErrors.avatarKey ? 'avatar-error' : undefined">
             <legend>头像</legend>
             <div class="avatar-options">
               <label v-for="option in avatarOptions" :key="option.key" class="avatar-option">
@@ -148,68 +147,101 @@ async function submitProfile() {
             </div>
             <p v-if="fieldErrors.avatarKey" id="avatar-error" class="field-error">{{ fieldErrors.avatarKey }}</p>
           </fieldset>
-          <div class="field">
+          <div class="ui-field">
             <label for="bio">个人简介</label>
-            <textarea id="bio" v-model="draft.bio" rows="4" placeholder="最多 160 个字符"
+            <textarea class="ui-input" id="bio" v-model="draft.bio" rows="4" placeholder="最多 160 个字符"
               :aria-invalid="Boolean(fieldErrors.bio)" :aria-describedby="fieldErrors.bio ? 'bio-error' : undefined" />
             <p v-if="fieldErrors.bio" id="bio-error" class="field-error">{{ fieldErrors.bio }}</p>
           </div>
         </fieldset>
-        <p v-if="error" class="error" role="alert">{{ error }}</p>
-        <div v-if="confirmed" class="confirmed" role="status">
+        <p v-if="error" class="ui-feedback ui-feedback--error" role="alert">{{ error }}</p>
+        <div v-if="confirmed" class="ui-feedback confirmed" role="status">
           <strong>已重新读取当前资料</strong>
           <p>{{ profile.displayName }} · {{ avatarOptions.find(option => option.key === profile?.avatarKey)?.label }}头像</p>
           <p class="bio">{{ profile.bio || '尚未填写简介' }}</p>
         </div>
         <div class="actions">
-          <button type="submit" class="primary" :disabled="saving || loading || authBusy">
+          <button type="submit" class="ui-button ui-button--primary" :disabled="saving || loading || authBusy">
             {{ saving ? '正在保存…' : '保存资料' }}
           </button>
-          <button type="button" :disabled="saving || loading || authBusy" @click="closeEditor">取消</button>
-          <button v-if="uncertain" type="button" :disabled="loading || saving || authBusy" @click="loadProfile">
+          <button class="ui-button" type="button" :disabled="saving || loading || authBusy" @click="closeEditor">取消</button>
+          <button v-if="uncertain" class="ui-button" type="button" :disabled="loading || saving || authBusy" @click="loadProfile">
             {{ loading ? '正在读取…' : '重新读取资料' }}
           </button>
         </div>
       </form>
     </template>
     <template v-else-if="error">
-      <p class="error" role="alert">{{ error }}</p>
-      <button type="button" :disabled="loading || authBusy" @click="loadProfile">重试读取</button>
+      <p class="ui-feedback ui-feedback--error" role="alert">{{ error }}</p>
+      <button class="ui-button" type="button" :disabled="loading || authBusy" @click="loadProfile">重试读取</button>
     </template>
   </section>
 </template>
 
 <style scoped>
-.profile-panel { box-sizing: border-box; width: min(100%, 41rem); padding: clamp(1.4rem, 5vw, 2.4rem); background: white; border: 1px solid #dfe6ef; border-radius: 1rem; }
+.profile-panel {
+  width: min(100%, 44rem);
+  margin: 0 auto;
+  padding: clamp(1rem, 4vw, 2rem);
+  border: 1px solid var(--line);
+  border-radius: 1.5rem;
+  background: var(--surface);
+}
 .profile-header, .identity { display: flex; align-items: center; gap: 1rem; }
-.profile-header { justify-content: space-between; margin-bottom: 1.5rem; }
+.profile-header { justify-content: space-between; margin-bottom: 1.35rem; }
 h1, h2, p, dd { margin: 0; }
-h1 { font-size: 1.5rem; }
-h2, dd { overflow-wrap: anywhere; }
-.identity { padding-block: 0.6rem; }
-.username { color: #536781; margin-top: 0.25rem; }
-.avatar { display: grid; flex-shrink: 0; place-items: center; width: 3.5rem; height: 3.5rem; border-radius: 50%; background: #e6ebf2; color: #2b4262; font-size: 1.3rem; font-weight: 700; }
+h1 { font-size: clamp(1.45rem, 4vw, 2rem); letter-spacing: -0.035em; }
+h2 { font-size: clamp(1.25rem, 3vw, 1.75rem); }
+h2, dd, .username { overflow-wrap: anywhere; }
+
+.identity {
+  padding: clamp(1rem, 4vw, 1.6rem);
+  border-radius: 1rem;
+  background: var(--tint);
+}
+.identity > div { min-width: 0; }
+.username { color: var(--muted); margin-top: 0.25rem; }
+.avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 3.5rem;
+  height: 3.5rem;
+  border-radius: 50%;
+  background: #d4e2d8;
+  color: #244939;
+  font-size: 1.3rem;
+  font-weight: 700;
+}
 .avatar[data-avatar="blue"] { background: #dbeaff; color: #184c9c; }
-.avatar[data-avatar="green"] { background: #d9f3e6; color: #145741; }
+.avatar[data-avatar="green"] { background: #cfecdc; color: #145741; }
 .avatar[data-avatar="orange"] { background: #ffe7cb; color: #824714; }
-dl, form, .edit-fields, .field { display: grid; gap: 0.9rem; }
-dl { padding-block: 1rem; border-block: 1px solid #e4ebf4; }
-dt { font-weight: 650; margin-bottom: 0.25rem; }
+
+.profile-details { margin: 0 0 1.25rem; }
+.profile-details > div { padding: 1rem 0; border-bottom: 1px solid var(--line); }
+dt { margin-bottom: 0.35rem; color: var(--muted); font-size: 0.85rem; font-weight: 650; }
 .bio { white-space: pre-wrap; overflow-wrap: anywhere; }
-form { margin-top: 1.2rem; }
+
+form { margin-top: 1.25rem; }
 fieldset { min-inline-size: 0; margin: 0; padding: 0; border: 0; }
-label, legend { font-weight: 650; }
-input:not([type="radio"]), textarea { box-sizing: border-box; width: 100%; padding: 0.65rem; font: inherit; color: inherit; border: 1px solid #b7c6d9; border-radius: 0.45rem; }
+.edit-fields { display: grid; gap: 1rem; }
+.avatars legend { margin-bottom: 0.4rem; padding: 0; }
 textarea { resize: vertical; }
-.avatar-options, .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; }
-.avatar-option { display: flex; align-items: center; gap: 0.4rem; padding: 0.5rem; font-size: 0.9rem; border: 1px solid #dfe6ef; border-radius: 0.45rem; }
-.swatch { width: 1.15rem; height: 1.15rem; }
-button { min-height: 2.65rem; padding: 0.55rem 0.85rem; color: #264876; font: inherit; font-weight: 650; background: #fff; border: 1px solid #b7c6d9; border-radius: 0.45rem; cursor: pointer; }
-.primary { background: #245cbd; border-color: #245cbd; color: #fff; }
-button:disabled { opacity: 0.65; cursor: wait; }
-:focus-visible { outline: 2px solid #2464d1; outline-offset: 3px; }
-.error, .field-error { color: #97281f; }
-.error, .confirmed { padding: 0.65rem; border-radius: 0.4rem; background: #fff1ef; }
-.confirmed { background: #f0f6ff; }
-.profile-panel > .error { margin-bottom: 0.8rem; }
+.avatar-options, .actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+.avatar-option {
+  display: inline-flex;
+  min-height: 2.75rem;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.avatar-option:has(input:checked) { border-color: var(--accent); background: var(--tint); }
+.avatar-option input { margin: 0; accent-color: var(--accent); }
+.swatch { width: 1rem; height: 1rem; }
+.field-error { color: var(--danger); font-size: 0.875rem; }
+.confirmed p { margin-top: 0.3rem; }
+.profile-panel > .ui-feedback { margin-bottom: 0.8rem; }
 </style>
