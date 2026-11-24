@@ -57,6 +57,7 @@ public class RoomMessageController {
     private final RoomKafkaRuntime kafka;
     private final io.micrometer.core.instrument.Counter unconfirmed;
     private final io.micrometer.core.instrument.Counter catchups;
+    private final io.micrometer.core.instrument.Counter sendUnknown;
 
     /**
      * @param tickets 房间票据服务
@@ -76,6 +77,7 @@ public class RoomMessageController {
         this.kafka = kafka;
         this.unconfirmed = metrics.counter("liveflow.room.messages.receipt.unconfirmed");
         this.catchups = metrics.counter("liveflow.room.messages.history.catchup");
+        this.sendUnknown = metrics.counter("liveflow.room.messages.send.unknown");
         this.reader = json.readerFor(JsonNode.class)
                 .with(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY)
                 .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -97,6 +99,7 @@ public class RoomMessageController {
     }
 
     /**
+     * 提交一次弹幕，在 Broker 确认后提供正式回执的查询地址。
      * @param jwt 安全链已验证的当前登录身份
      * @param roomId 路径中的房间 UUID
      * @param body 仅允许提交标识和正文的 UTF-8 JSON
@@ -112,17 +115,19 @@ public class RoomMessageController {
             throw invalid();
         }
 
-        // Servlet 等待超时只结束它自己的响应，生产确认和 Redis 写回仍可完成。
-        return messages.send(scope(jwt, roomId), input.get("clientMessageId").asString(),
-                input.get("content").asString()).copy().orTimeout(3, TimeUnit.SECONDS).handle((queued, failure) -> {
+        var attempt = messages.send(scope(jwt, roomId), input.get("clientMessageId").asString(),
+                input.get("content").asString());
+        // 只约束 HTTP 等待，实际生产、熔断回报与原预约写回继续完成。
+        return attempt.confirmation().copy().orTimeout(3, TimeUnit.SECONDS).handle((queued, failure) -> {
             if (failure != null) {
                 Throwable cause = failure instanceof CompletionException ? failure.getCause() : failure;
                 if (cause instanceof RuntimeException runtime) throw runtime;
-                throw new RoomMessageFailure(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN);
+                throw new RoomMessageFailure(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN)
+                        .withReceipt(attempt.reservation());
             }
             String location = "/api/v1/rooms/" + roomId + "/messages/submissions/" + queued.submissionId();
             var response = new QueuedResponse(queued.submissionId(), "queued",
-                    RoomEvents.UTC_MILLIS.format(queued.retryUntil()), RoomEvents.UTC_MILLIS.format(queued.receiptExpiresAt()));
+                    RoomEvents.UTC_MILLIS.format(queued.receiptExpiresAt()));
             return ResponseEntity.accepted().location(URI.create(location)).cacheControl(CacheControl.noStore()).body(response);
         });
     }
@@ -210,28 +215,37 @@ public class RoomMessageController {
     }
 
     @ExceptionHandler(RoomMessageFailure.class)
-    ResponseEntity<AuthHttpError> businessError(RoomMessageFailure failure) {
+    ResponseEntity<Map<String, Object>> businessError(RoomMessageFailure failure) {
         HttpStatus status = switch (failure.code()) {
             case INVALID_REQUEST, TICKET_INVALID -> HttpStatus.BAD_REQUEST;
             case ROOM_NOT_FOUND -> HttpStatus.NOT_FOUND;
-            case MESSAGE_ID_CONFLICT, MESSAGE_SUBMISSION_EXPIRED -> HttpStatus.CONFLICT;
+            case MESSAGE_ID_CONFLICT -> HttpStatus.CONFLICT;
             case MESSAGE_RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
             case ROOM_MESSAGES_UNAVAILABLE, MESSAGE_SUBMISSION_UNKNOWN -> HttpStatus.SERVICE_UNAVAILABLE;
         };
         var response = ResponseEntity.status(status).cacheControl(CacheControl.noStore());
-        if (failure.retryAfterSeconds() > 0) {
+        if (failure.code() == RoomMessageFailure.Code.MESSAGE_RATE_LIMITED && failure.retryAfterSeconds() > 0) {
             response.header(HttpHeaders.RETRY_AFTER, Long.toString(failure.retryAfterSeconds()));
         }
-        return response.body(new AuthHttpError(failure.code().name(), failure.getMessage()));
+        if (failure.code() == RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN) {
+            sendUnknown.increment();
+            var receipt = failure.receipt();
+            if (receipt != null) {
+                return response.body(Map.of("code", failure.code().name(), "message", failure.getMessage(),
+                        "submissionId", receipt.submissionId(),
+                        "receiptExpiresAt", RoomEvents.UTC_MILLIS.format(receipt.receiptExpiresAt())));
+            }
+        }
+        return response.body(Map.of("code", failure.code().name(), "message", failure.getMessage()));
     }
 
     @ExceptionHandler({JacksonException.class, HttpMessageNotReadableException.class})
-    ResponseEntity<AuthHttpError> invalidBody() {
+    ResponseEntity<Map<String, Object>> invalidBody() {
         return businessError(new RoomMessageFailure(RoomMessageFailure.Code.INVALID_REQUEST));
     }
 
     @ExceptionHandler({DataAccessException.class, TransactionException.class})
-    ResponseEntity<AuthHttpError> dependencyUnavailable() {
+    ResponseEntity<Map<String, Object>> dependencyUnavailable() {
         return businessError(new RoomMessageFailure(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE));
     }
 
@@ -253,8 +267,7 @@ public class RoomMessageController {
     /**
      * @param submissionId 本次预约的公开回执标识
      * @param status 固定为 queued
-     * @param retryUntil 同标识重试截止，UTC 毫秒
      * @param receiptExpiresAt 查询截止，UTC 毫秒
      */
-    public record QueuedResponse(UUID submissionId, String status, String retryUntil, String receiptExpiresAt) {}
+    public record QueuedResponse(UUID submissionId, String status, String receiptExpiresAt) {}
 }

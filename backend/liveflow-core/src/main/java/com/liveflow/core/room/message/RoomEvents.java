@@ -12,7 +12,6 @@ import java.util.UUID;
 /** 弹幕提交、正式事件和终态回执共用的领域契约。 */
 public final class RoomEvents {
     public static final long MAX_SEQUENCE = Long.MAX_VALUE - 1;
-    public static final int RETRY_SECONDS = 600;
     public static final int ACCEPT_SECONDS = 720;
     public static final int RECEIPT_SECONDS = 1800;
     public static final DateTimeFormatter UTC_MILLIS = new DateTimeFormatterBuilder().appendInstant(3).toFormatter();
@@ -31,11 +30,6 @@ public final class RoomEvents {
      * @param admittedAt 从 Redis 读取的首次许可时间
      */
     public record Queued(UUID submissionId, Instant admittedAt) {
-        /** @return 同标识可重试到的绝对时间 */
-        public Instant retryUntil() {
-            return admittedAt.plusSeconds(RETRY_SECONDS);
-        }
-
         /** @return 预约回执的绝对查询截止 */
         public Instant receiptExpiresAt() {
             return admittedAt.plusSeconds(RECEIPT_SECONDS);
@@ -48,7 +42,7 @@ public final class RoomEvents {
      * @param roomId 也是 Kafka 提交分区键的房间 UUID
      * @param userId 来自当前认证账号的十进制标识
      * @param sessionId 当前会话 UUID
-     * @param clientMessageId 重试中保持不变的客户端 UUID
+     * @param clientMessageId 用于识别同一业务提交的客户端 UUID
      * @param content 规范化的单行正文
      * @param contentHash 正文的 SHA-256 摘要
      * @param senderName 首次许可时固定的显示名

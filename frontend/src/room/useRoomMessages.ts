@@ -1,21 +1,20 @@
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
 import { authClient } from '../auth/authClient'
+import type { WithAccess } from '../auth/useAuth'
 import { decodeRoomFrame, openRoomSocket, requestMessageReceipt, requestRoomHistory, requestRoomTicket, sendRoomMessage,
-  type MessageSubmission, type QueuedSubmission, type RoomMessage } from './roomMessagesClient'
+  unknownSubmissionReceipt, type MessageSubmission, type RoomMessage, type SubmissionReceiptReference } from './roomMessagesClient'
 
-type WithAccess = <T>(call: (access: string) => Promise<T>) => Promise<T>
 const RECONNECT_DELAYS = [500, 1200, 3000]
 const HISTORY_LIMIT = 100
 const BUFFER_LIMIT = 300
-const RETRY_MILLIS = 600_000
 const POLL_MILLIS = 10_000
 
 interface PendingSubmission {
   body: MessageSubmission
-  retryUntil: number
-  queued?: QueuedSubmission
-  wasUncertain?: boolean
+  draftRevision: number
+  receipt?: SubmissionReceiptReference
+  unknown?: boolean
 }
 
 /**
@@ -34,8 +33,10 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   const failed = ref(false)
   const syncFeedback = ref('')
   const syncing = ref(false)
-  const pendingAction = ref<'retry' | 'receipt' | 'none'>('none')
+  const showSubmissionActions = ref(false)
   const pending = ref<PendingSubmission>()
+  const pendingContent = computed(() => pending.value?.unknown ? pending.value.body.content : '')
+  const canCheckReceipt = computed(() => pending.value?.receipt !== undefined)
   const checkingReceipt = ref(false)
   const buffered = new Map<bigint, RoomMessage>()
   let continuous: bigint | undefined
@@ -55,6 +56,8 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   let retries = 0
   let generation = 0
   let active = true
+  let draftRevision = 0
+  watch(content, () => { draftRevision++ }, { flush: 'sync' })
 
   const canSend = computed(() => state.value === 'ready' && !submitting.value
     && cooldownSeconds.value === 0 && pending.value === undefined && content.value.trim().length > 0)
@@ -315,7 +318,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     }
   }
 
-  /** @returns 校验当前输入，并用固定的标识、正文和期限发起提交 */
+  /** @returns 校验草稿、创建本次标识并至多发出一个发送 POST */
   async function send() {
     if (!canSend.value) return
     const raw = content.value
@@ -328,32 +331,14 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
       feedback.value = '请输入 1–100 个字符的单行弹幕。'
       return
     }
-    pending.value = { body: { clientMessageId: crypto.randomUUID(), content: raw },
-      retryUntil: Date.now() + RETRY_MILLIS }
-    await submitPending()
-  }
-
-  /** @returns 使用原正文和标识完成 POST，入队后开始限时查询终态 */
-  async function submitPending() {
+    pending.value = { body: { clientMessageId: crypto.randomUUID(), content: raw }, draftRevision }
     const submission = pending.value
-    if (!submission || submission.queued || submitting.value || state.value !== 'ready') return
-    if (Date.now() >= submission.retryUntil) {
-      expireSubmission(submission)
-      return
-    }
     submitting.value = true
-    failed.value = false
-    pendingAction.value = 'none'
-    feedback.value = ''
     try {
-      const queued = await withAccess(access => sendRoomMessage(access, roomId, submission.body))
+      const queued = await withAccess(access => sendRoomMessage(access, roomId, submission.body), { replayOnExpired: false })
       if (!active || pending.value !== submission) return
-      submission.queued = queued
-      submission.retryUntil = Math.min(submission.retryUntil, Date.parse(queued.retryUntil))
+      trackReceipt(submission, queued)
       feedback.value = '已入队，等待发送确认。'
-      window.clearTimeout(receiptExpiry)
-      receiptExpiry = window.setTimeout(() => expireSubmission(submission),
-        Math.max(0, Date.parse(queued.receiptExpiresAt) - Date.now()))
       const until = Date.now() + POLL_MILLIS
       receiptTimer = window.setTimeout(() => void checkReceipt(until, 500), 500)
     } catch (cause) {
@@ -361,12 +346,13 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
       failed.value = true
       if (!(cause instanceof ApiRequestError) || cause.status === 0
         || (cause.status >= 500 && !['ROOM_MESSAGES_UNAVAILABLE', 'AUTH_SERVICE_UNAVAILABLE'].includes(cause.code))) {
-        submission.wasUncertain = true
-        pendingAction.value = 'retry'
-        feedback.value = '发送结果待确认，可重试原弹幕。'
-        window.clearTimeout(receiptExpiry)
-        receiptExpiry = window.setTimeout(() => expireSubmission(submission),
-          Math.max(0, submission.retryUntil - Date.now()))
+        submission.unknown = true
+        // 将未知提交留在结果区，避免其文本作为尚未提交的草稿再次发送。
+        clearSubmittedDraft(submission)
+        const receipt = unknownSubmissionReceipt(cause)
+        if (receipt) trackReceipt(submission, receipt)
+        showSubmissionActions.value = true
+        feedback.value = '发送结果未确认，消息可能已送达。'
       } else {
         const waitSeconds = cause.retryAfterSeconds
         const limited = cause.code === 'MESSAGE_RATE_LIMITED' && waitSeconds !== undefined && waitSeconds > 0
@@ -374,18 +360,25 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
           startCooldown(waitSeconds)
           feedback.value = ''
         } else {
-          feedback.value = cause.message
+          feedback.value = ['ROOM_MESSAGES_UNAVAILABLE', 'AUTH_SERVICE_UNAVAILABLE'].includes(cause.code)
+            ? '弹幕暂未发送，服务暂时不可用。' : cause.message
         }
-        if (submission.wasUncertain && (limited || cause.status >= 500 || cause.code === 'AUTH_CSRF_INVALID')) {
-          pendingAction.value = 'retry'
-        } else {
-          clearPending()
-        }
+        clearPending()
         if (cause.code === 'AUTH_CSRF_INVALID') await authClient.csrf().catch(() => undefined)
       }
     } finally {
       if (active) submitting.value = false
     }
+  }
+
+  /**
+   * @param submission 原操作，换房或放弃跟踪后不会接收迟到结果
+   * @param receipt 服务端验证后的只读查询标识和截止时间
+   */
+  function trackReceipt(submission: PendingSubmission, receipt: SubmissionReceiptReference) {
+    submission.receipt = receipt
+    receiptExpiry = window.setTimeout(() => expireSubmission(submission),
+      Math.max(0, Date.parse(receipt.receiptExpiresAt) - Date.now()))
   }
 
   /**
@@ -395,19 +388,19 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
    */
   async function checkReceipt(until?: number, delay = 500) {
     const submission = pending.value
-    if (!submission?.queued || checkingReceipt.value || !active) return
-    const { submissionId, receiptExpiresAt } = submission.queued
+    if (!submission?.receipt || checkingReceipt.value || !active) return
+    const { submissionId, receiptExpiresAt } = submission.receipt
     if (Date.now() >= Date.parse(receiptExpiresAt)) {
       expireSubmission(submission)
       return
     }
     checkingReceipt.value = true
-    pendingAction.value = 'none'
     try {
       const receipt = await withAccess(access => requestMessageReceipt(access, roomId, submissionId))
       if (!active || pending.value !== submission) return
       if (receipt.status === 'accepted') {
-        if (content.value === submission.body.content) content.value = ''
+        clearSubmittedDraft(submission)
+        failed.value = false
         feedback.value = '弹幕已发送。'
         clearPending()
         return
@@ -427,14 +420,14 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
         return
       }
     } finally {
-      if (active) checkingReceipt.value = false
+      if (active && pending.value === submission) checkingReceipt.value = false
     }
     const next = Math.min(2 * delay, 2500)
     if (until !== undefined && Date.now() + next < until) {
       receiptTimer = window.setTimeout(() => void checkReceipt(until, next), next)
     } else {
-      feedback.value = '弹幕待确认，可手动查询。'
-      pendingAction.value = 'receipt'
+      feedback.value = submission.unknown ? '发送结果未确认，消息可能已送达。' : '弹幕待确认，可手动查询。'
+      showSubmissionActions.value = true
     }
   }
 
@@ -456,24 +449,40 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     update()
   }
 
-  /** @param submission 达到重试或查询截止的操作 */
+  /** @param submission 达到回执查询截止的操作 */
   function expireSubmission(submission: PendingSubmission) {
     if (!active || pending.value !== submission) return
     failed.value = true
-    feedback.value = submission.queued ? '回执查询期限已结束。' : '原弹幕已超过重试期限。'
+    feedback.value = '回执查询期限已结束，发送结果仍未确认。'
+    clearSubmittedDraft(submission)
     clearPending()
   }
 
   /** 停止追踪当前提交，保留草稿供用户明确提交新内容。 */
   function clearPending() {
     pending.value = undefined
-    pendingAction.value = 'none'
+    showSubmissionActions.value = false
+    checkingReceipt.value = false
     window.clearTimeout(receiptTimer)
     window.clearTimeout(receiptExpiry)
   }
 
+  /** @param submission 使用提交时的草稿代次，避免迟到的回执清除用户新编辑的内容 */
+  function clearSubmittedDraft(submission: PendingSubmission) {
+    if (draftRevision === submission.draftRevision) content.value = ''
+  }
+
+  /** 结束跟踪，保留用户已编辑的新草稿。 */
+  function dismissSubmission() {
+    if (pending.value) clearSubmittedDraft(pending.value)
+    clearPending()
+    feedback.value = ''
+    failed.value = false
+  }
+
   return { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
-    syncing, syncFeedback, cooldownSeconds, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending }
+    syncing, syncFeedback, cooldownSeconds, showSubmissionActions, pendingContent, canCheckReceipt,
+    checkingReceipt, checkReceipt, dismissSubmission }
 }
 
 function max(first: bigint, second: bigint) {

@@ -7,9 +7,10 @@ export class ApiRequestError extends Error {
    * @param message 可直接展示的简短说明
    * @param fieldErrors 可选的表单字段错误
    * @param retryAfterSeconds 限流时建议等待的整数秒数
+   * @param details 由具体接口负责校验的错误附加字段
    */
   constructor(readonly status: number, readonly code: string, message: string,
-    readonly fieldErrors?: Record<string, string>, readonly retryAfterSeconds?: number) {
+    readonly fieldErrors?: Record<string, string>, readonly retryAfterSeconds?: number, readonly details?: unknown) {
     super(message)
   }
 }
@@ -60,7 +61,7 @@ export async function requestJson<T>(path: string, options: {
       const retryAfter = response.headers.get('Retry-After')
       const seconds = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : undefined
       throw new ApiRequestError(response.status, body?.code ?? 'HTTP_ERROR',
-        body?.message ?? '服务暂不可用，请稍后再试。', body?.fieldErrors, seconds)
+        body?.message ?? '服务暂不可用，请稍后再试。', body?.fieldErrors, seconds, body)
     }
     if (body == null) {
       throw new ApiRequestError(0, 'RESPONSE_INVALID', '服务响应无法确认。')

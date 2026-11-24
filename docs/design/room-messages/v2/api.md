@@ -7,7 +7,7 @@ HTTP 沿用同源、Bearer 鉴权与账号当前会话校验，POST 继续校验
 | 方法和路径 | 用途 | 成功结果 |
 | --- | --- | --- |
 | `POST /api/v1/rooms/{roomId}/ws-ticket` | 为当前会话签发一次性连接 Ticket | `200`，`ticket` 与 `expiresIn` |
-| `POST /api/v1/rooms/{roomId}/messages` | 提交弹幕或重试同一提交 | `202`，提交已获得 Kafka 写入确认 |
+| `POST /api/v1/rooms/{roomId}/messages` | 单次提交弹幕 | `202`，提交已获得 Kafka 写入确认 |
 | `GET /api/v1/rooms/{roomId}/messages/submissions/{submissionId}` | 查询本人当前会话的提交结果 | `200`，当前可见回执 |
 | `GET /api/v1/rooms/{roomId}/messages` | 读取最近历史或按序补拉 | `200`，当前快照内的历史页 |
 | `/ws/rooms` | 首帧 Ticket 鉴权，实时接收和同步通知 | `ready` 确认就绪 |
@@ -25,18 +25,29 @@ Ticket 请求、响应、30 秒有效期沿用当前协议。客户端每次连�
 }
 ```
 
-`202 Accepted` 带 `Location` 响应头，指向同房间下的提交回执。响应中的 `submissionId` 是本次预约的查询标识，`retryUntil` 是首次获得许可后 10 分钟，`receiptExpiresAt` 是首次许可后 30 分钟。客户端应使用同一个 `clientMessageId` 和正文重试原提交，并保持原来的客户端重试期限。已经确认入队的同一预约返回原 `202` 信息。 [Kafka 写入确认](event-contract.md#生产和确认) · [HTTP 202 语义](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3)
+`202 Accepted` 带 `Location` 响应头，指向 `/api/v1/rooms/{roomId}/messages/submissions/{submissionId}`。响应使用下表字段。新版 Vue 和 API 同步切换，旧 `retryUntil` 字段随发送重试协议移除。通过发送熔断检查后，同一标识和正文的已入队预约可以读回原 `202`。 [Kafka 写入确认](event-contract.md#生产和确认) · [HTTP 202 语义](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3) · [发布与回退](../../resilience/deployment-and-operations.md#发布与回退)
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `submissionId` | string | 预约公开 UUID，也是回执查询标识。 |
+| `status` | string | 固定为 `queued`，表示 Kafka 已确认入队。正式接收由回执确认。 |
+| `receiptExpiresAt` | string | UTC 时间，首次 Redis 许可后 30 分钟。 |
 
 ```json
 {
   "submissionId": "4154ce3d-d846-4bd5-8fa9-a79b156a11ed",
   "status": "queued",
-  "retryUntil": "2026-11-24T08:40:00.000Z",
   "receiptExpiresAt": "2026-11-24T09:00:00.000Z"
 }
 ```
 
-收到 `429 MESSAGE_RATE_LIMITED` 时，页面保留草稿并按 `Retry-After` 显示等待时间，倒计时期间禁用新发送。原标识重试和回执查询可继续使用。 [账号冷却及 API 规则](../../resilience/api.md)
+鉴权和输入通过后，先检查发送熔断许可，再访问发送专用 Redis 及 MySQL。暂停或半开名额已用尽时返回 `503 ROOM_MESSAGES_UNAVAILABLE`，请求在房间存在性检查和建立预约前结束。 [发送熔断](../../resilience/design.md#发送熔断) · [账号冷却](../../resilience/api.md)
+
+### 发送交互
+
+- 用户点击发送后冻结本次正文和客户端标识。一轮操作最多发出一次 POST，提交期间禁用重复点击。可在提交前续期 Access Token。收到明确的过期响应时结束本次操作，认证封装禁止自动重发该 POST。移除「重试原弹幕」操作。
+- 收到 `429` 时保留输入，按 `Retry-After` 显示账号冷却。已知当前提交未发往 Kafka 时提示「弹幕暂未发送」并保留草稿。用户主动发起新的提交时生成新的客户端标识。
+- 已入队时显示「已入队，等待发送确认」。结果未知时显示「发送结果未确认，消息可能已送达」，保留独立的正文快照。服务端提供 `submissionId` 时可用 GET 查询；网络中断且未取得查询标识时，可通过实时列表或历史观察结果。
 
 ## 查询提交回执
 
@@ -58,7 +69,7 @@ Ticket 请求、响应、30 秒有效期沿用当前协议。客户端每次连�
 }
 ```
 
-前端获得 `202` 后可轮询回执，初始间隔为 500 毫秒，未确认时退避并限制同一提交只保留一个请求。连续尝试 10 秒仍未确认时，显示「待确认」并提供手动查询。到达回执截止、离开房间或会话切换时停止轮询。相同提交重试应保留刚才的原始正文和标识，明确发送新内容时生成新标识。
+前端获得 `202` 后可轮询回执，初始间隔为 500 毫秒，未确认时退避并限制同一提交只保留一个查询。连续查询 10 秒仍未确认时，显示「待确认」并提供手动查询。`MESSAGE_SUBMISSION_UNKNOWN` 带有回执标识时提供手动查询。到达回执截止、离开房间或会话切换时停止追踪。回执查询使用 GET。
 
 ## 查询历史
 
@@ -136,24 +147,34 @@ GET 请求要求有效 Bearer，可读取存在的房间。每个查询参数只
 | `content` | 服务端规范化的纯文本 |
 | `sentAt` | 受理时间，页面用本地时区格式化为 `HH:mm:ss` |
 
-## 错误和重试
+## HTTP 错误
 
 错误正文使用 `code`、`message`。历史范围过期时另带水位字段。
 
 | HTTP | 错误码 | 行为 |
 | --- | --- | --- |
 | `400` | `INVALID_REQUEST` | 房间、提交标识、正文或查询参数格式无效 |
-| `401`、`403` | 沿用认证及 CSRF 错误 | 明确的 Access Token 过期继续沿用同会话续期 |
+| `401`、`403` | 沿用认证及 CSRF 错误 | 发送遇到凭证错误时结束本次操作 |
 | `404` | `ROOM_NOT_FOUND` | 目标房间不存在 |
 | `409` | `MESSAGE_ID_CONFLICT` | 相同提交标识已绑定不同正文 |
-| `409` | `MESSAGE_SUBMISSION_EXPIRED` | 仍待确认的已知预约超出 10 分钟重试窗口，仍可在回执查询期内查询 |
 | `409` | `ROOM_HISTORY_GAP` | 所需前缀已清理，读取最近窗口 |
 | `429` | `MESSAGE_RATE_LIMITED` | 额度用尽，返回整数秒 `Retry-After` |
 | `503` | `AUTH_SERVICE_UNAVAILABLE` | 当前会话无法确认 |
-| `503` | `ROOM_MESSAGES_UNAVAILABLE` | 依赖故障或入口过载，本次调用在尝试生产前停止；回执和历史读取暂不可用也使用此码 |
-| `503` | `MESSAGE_SUBMISSION_UNKNOWN` | 已开始生产但得不到可靠结果，或同一提交仍有在途租约。保留原标识与正文，按需附 `Retry-After` |
+| `503` | `ROOM_MESSAGES_UNAVAILABLE` | 发送因熔断、依赖故障或本机容量拒绝在生产前停止。若 Redis 预约已登记，冷却按原截止到期。回执和历史读取各自不可用时也使用此码 |
+| `503` | `MESSAGE_SUBMISSION_UNKNOWN` | Kafka 提交结果未知，或同一绑定仍待确认。当前会话的预约已知时，响应体同时附 `submissionId` 与 `receiptExpiresAt` |
 
-HTTP 超时或网关响应来源不明确时按结果未知处理。收到 `202` 后，正式流程发现冲突或过期时通过终态回执报告。重连只恢复接收和历史合并，发送重试由用户触发。 [提交租约](storage.md#账号额度和提交绑定)
+发送 `503` 不附 `Retry-After`。HTTP 超时、连接中断或来源不明确的网关响应按结果未知处理。收到 `202` 后，正式流程发现冲突或过期时通过终态回执报告。 [提交绑定](storage.md#账号额度和提交绑定)
+
+结果未知且可查询时的 `503` 响应体示例。无法确定预约时只返回 `code` 和 `message`。
+
+```json
+{
+  "code": "MESSAGE_SUBMISSION_UNKNOWN",
+  "message": "发送结果未确认，消息可能已送达",
+  "submissionId": "4154ce3d-d846-4bd5-8fa9-a79b156a11ed",
+  "receiptExpiresAt": "2026-11-24T09:00:00.000Z"
+}
+```
 
 ## 前端合并与恢复
 

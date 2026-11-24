@@ -794,9 +794,10 @@ class AuthIntegrationTest {
     }
 
     @Test
-    void concurrentRoomMessageRetriesBroadcastOnceAndStayInTheRoom() throws Exception {
+    void concurrentRoomMessageDuplicatesBroadcastOnceAndStayInTheRoom() throws Exception {
         var browser = new Browser();
-        String bearer = access(browser.login());
+        var login = browser.login();
+        String bearer = access(login);
         String room = createRoomFor(browser, bearer);
         String otherName = registrationName("Msg_");
         jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
@@ -831,6 +832,17 @@ class AuthIntegrationTest {
             var queuedResponse = responses.stream().filter(response -> response.statusCode() == 202).findFirst().orElseThrow();
             var queued = roomResponse(queuedResponse, 202);
             assertThat(queued.get("status").asString()).isEqualTo("queued");
+            assertThat(queued.has("retryUntil")).isFalse();
+            assertThat(queued.size()).isEqualTo(3);
+            for (var response : responses) {
+                if (response.statusCode() == 503) {
+                    assertThat(json.readTree(response.body()).get("submissionId")).isEqualTo(queued.get("submissionId"));
+                }
+            }
+            String key = MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:submit:"
+                    + login.get("sessionId").asString() + ":" + room + ":" + id;
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(() ->
+                    assertThat(redis.opsForHash().get(key, "phase")).isEqualTo("QUEUED"));
             assertThat(roomResponse(browser.sendPath("POST", path, messageBody(id, "你好"), bearer, true), 202))
                     .isEqualTo(queued);
             String receiptPath = queuedResponse.headers().firstValue("Location").orElseThrow();
@@ -904,7 +916,7 @@ class AuthIntegrationTest {
     }
 
     @Test
-    void roomMessageLeaseKeepsItsOriginalDeadlineAndRejectsLateConfirmation() {
+    void singlePublicationPermitSurvivesTheOldLeaseDeadline() {
         var scope = new Scope(userId, UUID.randomUUID(), UUID.randomUUID().toString());
         String clientId = UUID.randomUUID().toString();
         String hash = RoomEvents.hash("你好");
@@ -915,25 +927,26 @@ class AuthIntegrationTest {
             assertThat(redis.getExpire(key)).isBetween(1790L, 1800L);
             var inFlight = assertThrows(RoomMessageFailure.class, () -> admissions.claim(scope, clientId, hash, "昵称"));
             assertThat(inFlight.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN);
-            assertThat(inFlight.retryAfterSeconds()).isBetween(1L, 5L);
+            assertThat(inFlight.receipt()).isEqualTo(old.queued());
+            assertThat(inFlight.retryAfterSeconds()).isZero();
             var conflict = assertThrows(RoomMessageFailure.class,
                     () -> admissions.claim(scope, clientId, RoomEvents.hash("异文"), "昵称"));
             assertThat(conflict.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_ID_CONFLICT);
 
-            // 加速制造旧租约到期。Redis 的 Lua 仍按真实服务器时间处理新租约。
+            long deadline = cooldownDeadline();
+            // 模拟切换前的旧绑定。这个字段只能随原绑定到期，不能再次授予许可。
             redis.opsForHash().put(key, "leaseUntilMs", "0");
-            var current = admissions.claim(scope, clientId, hash, "后来昵称");
-            assertThat(current.queued()).isEqualTo(old.queued());
-            assertThat(current.leaseId()).isNotEqualTo(old.leaseId());
-            assertThat(current.senderName()).isEqualTo("首次昵称");
+            var pending = assertThrows(RoomMessageFailure.class, () -> admissions.claim(scope, clientId, hash, "后来昵称"));
+            assertThat(pending.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN);
+            assertThat(pending.receipt()).isEqualTo(old.queued());
+            assertThat(redis.opsForHash().get(key, "leaseId")).isEqualTo(old.leaseId().toString());
+            assertThat(redis.opsForHash().get(key, "senderName")).isEqualTo("首次昵称");
+            admissions.markQueued(scope, clientId, new com.liveflow.core.room.message.RoomMessagePorts.Reservation(
+                    old.queued(), UUID.randomUUID(), "其他许可"));
+            assertThat(redis.opsForHash().get(key, "phase")).isEqualTo("PENDING");
             admissions.markQueued(scope, clientId, old);
-            assertThat(admissions.findQueued(scope, clientId, hash)).isEmpty();
-            redis.opsForHash().put(key, "leaseUntilMs", "0");
-            redis.opsForHash().put(key, "admittedAtMs", Long.toString(Instant.now().minusSeconds(601).toEpochMilli()));
-            var expired = assertThrows(RoomMessageFailure.class, () -> admissions.claim(scope, clientId, hash, "昵称"));
-            assertThat(expired.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_SUBMISSION_EXPIRED);
-            admissions.markQueued(scope, clientId, current);
-            assertThat(admissions.findQueued(scope, clientId, hash)).isPresent();
+            assertThat(admissions.findQueued(scope, clientId, hash)).contains(old.queued());
+            assertThat(cooldownDeadline()).isEqualTo(deadline);
         } finally {
             redis.delete(key);
             redis.delete(cooldownKey());
@@ -1029,7 +1042,7 @@ class AuthIntegrationTest {
                 + resource.getContentAsString(StandardCharsets.UTF_8);
         var claim = new org.springframework.data.redis.core.script.DefaultRedisScript<>(script, List.class);
         List<?> result = redis.execute(claim, List.of(cooldownKey(), reservation), UUID.randomUUID().toString(),
-                UUID.randomUUID().toString(), RoomEvents.hash("边界"), username, "10000", "5000", "600000", "1800000");
+                UUID.randomUUID().toString(), RoomEvents.hash("边界"), username, "10000", "1800000");
         return result.stream().map(Object::toString).toList();
     }
 
@@ -1045,7 +1058,7 @@ class AuthIntegrationTest {
     }
 
     @Test
-    void uncertainKafkaAcknowledgementKeepsCooldownAndAllowsRetryOfOriginalReservation() throws Exception {
+    void uncertainKafkaAcknowledgementKeepsCooldownAndCanBeReadWithoutRepublishing() throws Exception {
         var browser = new Browser();
         JsonNode login = browser.login();
         String bearer = access(login);
@@ -1064,8 +1077,11 @@ class AuthIntegrationTest {
         }).when(kafka).publish(org.mockito.ArgumentMatchers.argThat(
                 event -> event != null && id.equals(event.clientMessageId())));
 
-        failure(browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true),
-                503, "MESSAGE_SUBMISSION_UNKNOWN");
+        var unknown = browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true);
+        failure(unknown, 503, "MESSAGE_SUBMISSION_UNKNOWN");
+        assertThat(unknown.headers().firstValue("Retry-After")).isEmpty();
+        var reference = json.readTree(unknown.body());
+        assertThat(reference.get("receiptExpiresAt").asString()).endsWith("Z");
         long deadline = cooldownDeadline();
         String prefix = MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:submit:"
                 + login.get("sessionId").asString() + ":" + room + ":";
@@ -1075,15 +1091,16 @@ class AuthIntegrationTest {
         assertThat(redis.hasKey(prefix + deniedId)).isFalse();
         failure(browser.sendPath("POST", endpoint, messageBody(id, "改正文"), bearer, true), 409, "MESSAGE_ID_CONFLICT");
         redis.opsForHash().put(prefix + id, "leaseUntilMs", "0");
-        var retried = browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true);
-        assertThat(retried.statusCode()).isEqualTo(202);
-        var receipt = awaitJson(browser, bearer, retried.headers().firstValue("Location").orElseThrow(),
+        var duplicate = browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true);
+        failure(duplicate, 503, "MESSAGE_SUBMISSION_UNKNOWN");
+        assertThat(json.readTree(duplicate.body())).isEqualTo(reference);
+        var receipt = awaitJson(browser, bearer, endpoint + "/submissions/" + reference.get("submissionId").asString(),
                 value -> "accepted".equals(value.get("status").asString()));
         var history = awaitJson(browser, bearer, endpoint,
                 value -> "1".equals(value.get("storedThrough").asString()));
         assertThat(history.get("items").size()).isOne();
         assertThat(history.get("items").get(0).get("messageId")).isEqualTo(receipt.get("messageId"));
-        assertThat(calls.get()).isEqualTo(2);
+        assertThat(calls.get()).isEqualTo(1);
         assertThat(cooldownDeadline()).isEqualTo(deadline);
     }
 

@@ -11,6 +11,9 @@ const terminalErrors = new Set([
   'AUTH_REFRESH_INVALID', 'AUTH_REFRESH_REUSED',
 ])
 
+export type WithAccess = <T>(call: (access: string) => Promise<T>,
+  options?: { replayOnExpired?: boolean }) => Promise<T>
+
 /**
  * 在同源标签页间串行处理认证写操作。
  * @param action 持锁后才开始的操作，包含响应处理
@@ -168,23 +171,24 @@ export function useAuth() {
   }
 
   /**
-   * 发起一次受保护调用，仅在服务端拒绝过期 JWT 时续期并重发一次。
+   * 发起受保护调用，过期时续期，按调用方的策略决定是否重发请求。
    * @param call 使用当前 Access Token 发请求的入口
+   * @param options 弹幕发送关闭凭证过期后的业务请求重发
    * @returns 属于同一会话的调用结果
    * @throws ApiRequestError 会话已变更、续期失败或受保护请求失败
    */
-  async function withAccess<T>(call: (access: string) => Promise<T>): Promise<T> {
+  const withAccess: WithAccess = async (call, { replayOnExpired = true } = {}) => {
     const previous = token.value
     if (!previous) {
       throw new ApiRequestError(401, 'AUTH_REQUIRED', '请先登录。')
     }
     const version = generation
     try {
-      let result: T
+      let result
       try {
         result = await call(previous.accessToken)
       } catch (cause) {
-        // 仅凭服务端明确的过期错误重发一次。超时等不确定结果交给调用方处理。
+        // 只在服务端明确判定过期时续期，超时等不确定结果交给调用方处理。
         if (!(cause instanceof ApiRequestError) || cause.code !== 'AUTH_ACCESS_EXPIRED') {
           throw cause
         }
@@ -193,6 +197,8 @@ export function useAuth() {
         if (version !== generation || localStorage.getItem(sessionMarker) !== previous.sessionId) {
           throw sessionChanged()
         }
+        // 发送 POST 已明确被拒绝。续期只为后续操作准备凭证，本次不会再次提交。
+        if (!replayOnExpired) throw cause
         result = await call(next.accessToken)
       }
       // 即使请求成功，旧会话的迟到数据也不能覆盖现在的界面。

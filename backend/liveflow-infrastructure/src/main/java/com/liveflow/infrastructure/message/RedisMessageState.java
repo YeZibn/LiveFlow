@@ -1,5 +1,6 @@
 package com.liveflow.infrastructure.message;
 
+import com.liveflow.core.room.message.RoomEvents;
 import com.liveflow.core.room.message.RoomEvents.Queued;
 import com.liveflow.core.room.message.RoomEvents.Receipt;
 import com.liveflow.core.room.message.RoomEvents.Scope;
@@ -9,6 +10,8 @@ import com.liveflow.core.room.message.RoomMessagePorts.Reservation;
 import com.liveflow.core.room.message.RoomMessagePorts.Receipts;
 import com.liveflow.infrastructure.resilience.RateLimitMetrics;
 import com.liveflow.infrastructure.resilience.RateLimitSettings;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -22,6 +25,7 @@ import org.springframework.stereotype.Repository;
 import tools.jackson.databind.json.JsonMapper;
 
 import static com.liveflow.core.room.message.RoomMessageFailure.Code.*;
+import static com.liveflow.core.resilience.RoomMessageCircuitBreaker.Dependency.REDIS;
 import static com.liveflow.infrastructure.resilience.RateLimitMetrics.Outcome.*;
 import static com.liveflow.infrastructure.resilience.RateLimitMetrics.Policy.ROOM_MESSAGES;
 
@@ -36,7 +40,7 @@ public class RedisMessageState implements Admission, Receipts {
     private final String prefix;
     private final String cooldownMillis;
     private final RateLimitMetrics metrics;
-    private final String lease;
+    private final Counter writebackFailures;
 
     /**
      * @param redis 普通命令连接
@@ -44,34 +48,43 @@ public class RedisMessageState implements Admission, Receipts {
      * @param environment Redis 部署命名空间
      * @param settings 限流配置，提供账号两次新预约的间隔
      * @param metrics 限流决策指标
-     * @param lease 一次生产确认占用的毫秒数
+     * @param registry 预约状态写回指标仓储
      */
     public RedisMessageState(StringRedisTemplate redis, JsonMapper json, RateLimitSettings settings, RateLimitMetrics metrics,
-            @Value("${liveflow.room-messages.v2.environment:local}") String environment,
-            @Value("${liveflow.room-messages.v2.lease-millis:5000}") long lease) {
-        if (!environment.matches("[A-Za-z0-9_-]{1,32}") || lease < 3000 || lease >= com.liveflow.core.room.message.RoomEvents.RETRY_SECONDS * 1000L) {
-            throw new IllegalArgumentException("弹幕 Redis 命名或时限配置无效");
+            MeterRegistry registry, @Value("${liveflow.room-messages.v2.environment:local}") String environment) {
+        if (!environment.matches("[A-Za-z0-9_-]{1,32}")) {
+            throw new IllegalArgumentException("弹幕 Redis 命名无效");
         }
         this.redis = redis;
         this.json = json;
         this.prefix = environment + ":liveflow:rooms:";
         this.cooldownMillis = Integer.toString(settings.roomCooldownMillis());
         this.metrics = metrics;
-        this.lease = Long.toString(lease);
+        this.writebackFailures = registry.counter("liveflow.room.messages.reservation.writeback.failures");
     }
 
     @Override
     public Optional<Queued> findQueued(Scope scope, String clientMessageId, String hash) {
-        var entries = redis.opsForHash().multiGet(submitKey(scope, clientMessageId),
-                List.of("submissionId", "contentHash", "phase", "admittedAtMs"));
+        List<Object> entries;
+        try {
+            entries = redis.opsForHash().multiGet(submitKey(scope, clientMessageId),
+                    List.of("submissionId", "contentHash", "phase", "admittedAtMs"));
+        } catch (DataAccessException failure) {
+            throw unavailable(failure);
+        }
         if (entries.getFirst() == null) {
             return Optional.empty();
         }
+        if (entries.get(1) == null) throw unavailable(null);
         if (!hash.equals(entries.get(1))) {
             throw new RoomMessageFailure(MESSAGE_ID_CONFLICT);
         }
-        return "QUEUED".equals(entries.get(2))
-                ? Optional.of(queued(entries.getFirst(), entries.get(3))) : Optional.empty();
+        Queued reservation = queued(entries.getFirst(), entries.get(3));
+        if ("QUEUED".equals(entries.get(2))) return Optional.of(reservation);
+        if ("PENDING".equals(entries.get(2))) {
+            throw new RoomMessageFailure(MESSAGE_SUBMISSION_UNKNOWN).withReceipt(reservation);
+        }
+        throw unavailable(null);
     }
 
     @Override
@@ -81,12 +94,11 @@ public class RedisMessageState implements Admission, Receipts {
         List<?> result;
         try {
             result = redis.execute(CLAIM, List.of(account(scope) + ":cooldown", submitKey(scope, clientMessageId)),
-                    UUID.randomUUID().toString(), lease.toString(), hash, name, cooldownMillis, this.lease,
-                    Long.toString(com.liveflow.core.room.message.RoomEvents.RETRY_SECONDS * 1000L),
-                    Long.toString(com.liveflow.core.room.message.RoomEvents.RECEIPT_SECONDS * 1000L));
+                    UUID.randomUUID().toString(), lease.toString(), hash, name, cooldownMillis,
+                    Long.toString(RoomEvents.RECEIPT_SECONDS * 1000L));
         } catch (DataAccessException failure) {
             metrics.record(ROOM_MESSAGES, UNAVAILABLE, started);
-            throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
+            throw unavailable(failure);
         }
 
         String decision = result == null || result.isEmpty() ? "UNAVAILABLE" : result.getFirst().toString();
@@ -95,26 +107,31 @@ public class RedisMessageState implements Admission, Receipts {
                 metrics.record(ROOM_MESSAGES, ALLOWED, started);
                 yield new Reservation(queued(result.get(1), result.get(2)), lease, result.get(3).toString());
             }
-            case "GRANTED" -> new Reservation(queued(result.get(1), result.get(2)), lease, result.get(3).toString());
             case "QUEUED" -> new Reservation(queued(result.get(1), result.get(2)), null, null);
             case "CONFLICT" -> throw new RoomMessageFailure(MESSAGE_ID_CONFLICT);
-            case "EXPIRED" -> throw new RoomMessageFailure(MESSAGE_SUBMISSION_EXPIRED);
             case "RATE" -> {
                 metrics.record(ROOM_MESSAGES, LIMITED, started);
                 throw new RoomMessageFailure(MESSAGE_RATE_LIMITED, retryAfter(result.get(1)));
             }
-            case "IN_FLIGHT" -> throw new RoomMessageFailure(MESSAGE_SUBMISSION_UNKNOWN, retryAfter(result.get(1)));
+            case "PENDING" -> throw new RoomMessageFailure(MESSAGE_SUBMISSION_UNKNOWN)
+                    .withReceipt(queued(result.get(1), result.get(2)));
             default -> {
                 metrics.record(ROOM_MESSAGES, UNAVAILABLE, started);
-                throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
+                throw unavailable(null);
             }
         };
     }
 
     @Override
     public void markQueued(Scope scope, String clientMessageId, Reservation reservation) {
-        redis.execute(CONFIRM, List.of(submitKey(scope, clientMessageId)),
-                reservation.queued().submissionId().toString(), reservation.leaseId().toString());
+        try {
+            Long outcome = redis.execute(CONFIRM, List.of(submitKey(scope, clientMessageId)),
+                    reservation.queued().submissionId().toString(), reservation.leaseId().toString());
+            if (outcome == null) writebackFailures.increment();
+        } catch (RuntimeException failure) {
+            writebackFailures.increment();
+            throw failure;
+        }
     }
 
     @Override
@@ -158,7 +175,16 @@ public class RedisMessageState implements Admission, Receipts {
     }
 
     private static Queued queued(Object id, Object admitted) {
-        return new Queued(UUID.fromString(id.toString()), Instant.ofEpochMilli(Long.parseLong(admitted.toString())));
+        if (admitted == null) throw unavailable(null);
+        try {
+            return new Queued(UUID.fromString(id.toString()), Instant.ofEpochMilli(Long.parseLong(admitted.toString())));
+        } catch (IllegalArgumentException failure) {
+            throw unavailable(failure);
+        }
+    }
+
+    private static RoomMessageFailure unavailable(Throwable cause) {
+        return RoomMessageFailure.dependency(ROOM_MESSAGES_UNAVAILABLE, REDIS, cause);
     }
 
     private static long retryAfter(Object time) {

@@ -54,6 +54,19 @@ liveflow:
     signing-key: ${LIVEFLOW_JWT_SIGNING_KEY:}
     secure-cookie: true
   resilience:
+    circuit-breaker:
+      room-messages:
+        # 先采集发送链路的延迟和错误样本，再启用实际拒绝。
+        mode: ${LIVEFLOW_ROOM_MESSAGES_CIRCUIT_MODE:observe}
+        sliding-window-seconds: 10
+        minimum-number-of-calls: 30
+        failure-rate-threshold: 20
+        slow-call-duration-threshold: 800ms
+        slow-call-rate-threshold: 40
+        open-initial-wait: 5s
+        open-max-wait: 30s
+        half-open-permitted-calls: 5
+        half-open-max-wait: 60s
     rate-limit:
       login:
         window-seconds: 60

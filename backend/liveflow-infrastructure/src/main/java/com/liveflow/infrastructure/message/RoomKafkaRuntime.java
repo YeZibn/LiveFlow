@@ -45,6 +45,7 @@ import org.springframework.stereotype.Component;
 import tools.jackson.databind.json.JsonMapper;
 
 import static com.liveflow.core.room.message.RoomMessageFailure.Code.*;
+import static com.liveflow.core.resilience.RoomMessageCircuitBreaker.Dependency.KAFKA;
 
 /** 管理弹幕 Kafka 主题、事务拓扑和相互独立的外部投影。 */
 @Component
@@ -126,38 +127,44 @@ public final class RoomKafkaRuntime implements Producer, SmartLifecycle {
     }
 
     /**
-
-     * @param submission 已获得 Redis 许可的提交
-
-     * @return Broker 写入确认
-
+     * 将本次预约交给生产者一次，并在实际确认结束时归还生产并发额度。
+     * @param submission 已获得 Redis 单次发布许可的提交
+     * @return Broker 写入确认，结果未知时异常完成
+     * @throws RoomMessageFailure 本机拒绝或 Kafka 接入不可用
      */
     @Override
     public CompletableFuture<Void> publish(Submission submission) {
         KafkaProducer<String, String> current = producer;
         KafkaStreams topology = streams;
-        if (!running || !accepting || current == null || !ready(topology) || !available.tryAcquire()) {
+        if (!enabled || !accepting) {
             throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
         }
+        if (!running || current == null || !ready(topology)) {
+            throw RoomMessageFailure.dependency(ROOM_MESSAGES_UNAVAILABLE, KAFKA, null);
+        }
+        if (!available.tryAcquire()) throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
         var result = new CompletableFuture<Void>();
+        // 同步异常和异步回调共用一次完成边界，避免提前归还或者重复归还生产额度。
+        var completion = result.whenComplete((ignored, failure) -> available.release());
         long started = System.nanoTime();
         try {
             String json = codec.json().writeValueAsString(submission);
             current.send(new ProducerRecord<>(topic("submissions"), submission.roomId(), json), (metadata, failure) -> {
-                available.release();
                 if (failure == null) {
                     enqueue.record(System.nanoTime() - started, TimeUnit.NANOSECONDS);
                     result.complete(null);
                 } else {
-                    result.completeExceptionally(new RoomMessageFailure(MESSAGE_SUBMISSION_UNKNOWN));
+                    result.completeExceptionally(RoomMessageFailure.dependency(MESSAGE_SUBMISSION_UNKNOWN, KAFKA, failure));
                 }
             });
         } catch (RuntimeException failure) {
-            available.release();
-            throw new RoomMessageFailure(failure instanceof KafkaException
-                    ? MESSAGE_SUBMISSION_UNKNOWN : ROOM_MESSAGES_UNAVAILABLE);
+            result.completeExceptionally(switch (failure) {
+                case KafkaException kafkaFailure -> RoomMessageFailure.dependency(MESSAGE_SUBMISSION_UNKNOWN, KAFKA, kafkaFailure);
+                case IllegalStateException closed -> RoomMessageFailure.dependency(ROOM_MESSAGES_UNAVAILABLE, KAFKA, closed);
+                default -> new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
+            });
         }
-        return result;
+        return completion;
     }
 
     /** @return 正式接入是否已经恢复本实例负责的全部分区 */

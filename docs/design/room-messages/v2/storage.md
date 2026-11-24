@@ -2,7 +2,7 @@
 
 ## 数据归属
 
-账号当前会话和一次性 Ticket 延续现有 Redis 实现。V2 新增账号发送额度、提交绑定、回执投影和房间频道。终态回执可由 Kafka 重建，正式弹幕和顺序由 Kafka Streams 与 Kafka Topic 保存。JVM 持有 WebSocket、房间订阅状态和发送队列。 [现有 Ticket 与会话复查](../storage.md#redis-ticket) · [认证会话](../../auth/session.md) · [Kafka 回执](event-contract.md#终态回执事件)
+Redis 保存账号当前会话、一次性 Ticket、发送冷却、提交绑定和回执投影，并提供房间频道。终态回执可由 Kafka 重建，正式弹幕和顺序由 Kafka Streams 与 Kafka Topic 保存。JVM 持有发送断路器、WebSocket、房间订阅状态和发送队列。 [发送熔断](../../resilience/design.md#发送熔断) · [现有 Ticket 与会话复查](../storage.md#redis-ticket) · [认证会话](../../auth/session.md) · [Kafka 回执](event-contract.md#终态回执事件)
 
 ## 账号额度和提交绑定
 
@@ -11,18 +11,18 @@
 | Key | 类型和值 | 生命周期 |
 | --- | --- | --- |
 | `<env>:liveflow:rooms:message:{<userId>}:cooldown` | String，开启冷却的预约 `submissionId` | 默认在首次入队许可后 10 秒到期 |
-| `<env>:liveflow:rooms:message:{<userId>}:submit:<sessionId>:<roomId>:<clientMessageId>` | Hash，保存 `submissionId`、`contentHash`、`senderName`、`admittedAtMs`、`phase`、`leaseId`、`leaseUntilMs` | 从首次入队许可起保留 30 分钟，所有重试保持原绝对截止 |
+| `<env>:liveflow:rooms:message:{<userId>}:submit:<sessionId>:<roomId>:<clientMessageId>` | Hash，保存 `submissionId`、`contentHash`、`senderName`、`admittedAtMs`、`phase`、`leaseId` | 从首次入队许可起保留 30 分钟，后续读取和状态写回沿用原绝对截止 |
 | `<env>:liveflow:rooms:message:{<userId>}:receipt:<sessionId>:<roomId>:<submissionId>` | String，存放终态回执 JSON | 按 Kafka 回执中的绝对 `expiresAt` 过期 |
 
-发送入口先校验当前会话、房间和正文。对已经确认入队的相同提交，返回原入队回执。新提交读取发送者显示名后执行 Lua。Lua 再检查已有绑定，防止读取资料期间另一请求已经登记。绑定保存第一个获得许可的显示名快照，后续生产命令使用该值。
+通过发送许可后先读已确认入队的绑定，再查房间与发送者。新提交读取显示名后执行 Lua。Lua 再检查已有绑定，防止读取资料期间另一请求已登记。首次绑定持有正文摘要及显示名快照，生产命令使用该值。
 
-入队脚本接收冷却键与绑定键，参数为服务端预生成的候选 `submissionId` 和 `leaseId`、规范化正文摘要及显示名。冷却时长、预约保留期和租约时长由应用配置传入。首次创建采用候选标识，重复请求以既有绑定为准。租约确认脚本只访问绑定键，参数为本次 `submissionId` 和 `leaseId`。入队脚本使用 Redis 毫秒时间裁决截止。 [限流存储设计](../../resilience/storage.md)
+入队脚本接收冷却键、绑定键、候选 `submissionId` 和 `leaseId`、规范化正文摘要、显示名及相关时长。`leaseId` 是首次创建时生成的单次发布许可标识，后续用于核对写回归属。`phase` 初始为 `PENDING`，Broker 确认后可更新为 `QUEUED`。脚本使用 Redis 毫秒时间裁决截止。 [限流存储设计](../../resilience/storage.md)
 
-1. **绑定已存在时** · 先比较正文摘要。不同摘要返回 `CONFLICT`。相同摘要且为 `QUEUED` 时返回原标识和期限。仍待确认且租约有效时返回 `IN_FLIGHT`。租约已到期时，在首次许可后 10 分钟内可以续租，保留原标识、显示名、首次许可和冷却截止。
-2. **绑定不存在时** · 冷却生效则返回剩余毫秒，并保留原截止。冷却结束后，原子写入绑定与冷却并授予发送租约。两者基于同一次 Redis 当前时间。
-3. **生产返回时** · 调用方持有本次 `leaseId`。收到 Kafka 确认后，按绑定标识和租约标识将该绑定置为 `QUEUED`。Redis 写回异常时仍可使用本次已收到的 Kafka 确认返回 `202`。生产确认不明时保留待确认状态，租约到期后允许重新生产。已过期租约产生的迟到写回不能覆盖新租约。
+1. **已有绑定**。异文返回冲突。同正文且为 `QUEUED` 时返回原预约及期限；同正文且为 `PENDING` 时返回待确认及原预约信息。这两种同正文情形均为只读，直接或并发的重复请求都拿不到新的发布许可。
+2. **新绑定**。冷却生效时返回剩余毫秒并保留原截止。否则，同一次脚本原子建立绑定与冷却，只有首次创建者获得发布许可。两者基于同一次 Redis 当前时间。冷却键和预约键越过各自的截止时间后自然过期。
+3. **生产结果**。仅在 Broker 确认后，按 `submissionId` 和 `leaseId` 核对原绑定，再置为 `QUEUED`。过期或已换身份的绑定跳过写回。写回故障时，本次 `202` 仍以 Broker 确认为准。结果未知的绑定保留待确认，终态由回执查询提供。
 
-初始发送租约为 5 秒，生产者入队及确认等待预算合计 3 秒。应用收到 `IN_FLIGHT` 时使用 `MESSAGE_SUBMISSION_UNKNOWN`，可附整数秒 `Retry-After`。冷却从首次获得许可时开始，后续生产失败时仍按原截止到期；按请求速率和进程级在途上限约束额外传输流量。若 Redis 预约在故障中丢失，重试可拿到新的 `submissionId`。已进入 Kafka 的同一业务提交仍按正式去重状态裁决，相同正文复用原正式消息。生产应为会话、额度和回执预留 Redis 内存，使用拒绝新写入的淘汰策略保护有期限的绑定。 [HTTP 状态映射](api.md#错误和重试) · [正式去重](event-contract.md#正式接收和顺序)
+冷却从首次获得许可时开始。生产失败、未进入 Kafka 或无法确认时仍按原截止到期。旧绑定自然到期，脚本忽略旧 `leaseUntilMs` 并删除续领分支。单次许可由有效的 Redis 绑定保障；Redis 状态丢失时，已进入 Kafka 的相同提交还受 Streams 去重状态及其保留期保护。生产为会话、额度和回执预留 Redis 内存，使用拒绝新写入的淘汰策略保护有期限的绑定。 [HTTP 状态映射](api.md#http-错误) · [正式去重](event-contract.md#正式接收和顺序)
 
 ## 回执投影
 

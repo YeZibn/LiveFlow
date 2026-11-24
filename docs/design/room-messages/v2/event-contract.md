@@ -21,14 +21,14 @@ Kafka Value 采用 UTF-8 JSON，字段名使用小驼峰。时间为三位小数
 | 字段 | 语义 |
 | --- | --- |
 | `schemaVersion` | 事件结构版本 |
-| `submissionId` | Redis 首次允许入队时登记的 UUID，同一次入队预约的重试共用 |
+| `submissionId` | Redis 首次允许入队时登记的预约 UUID，也是回执关联标识 |
 | `roomId`、`userId`、`sessionId` | 经 HTTP 校验后的目标房间和可信身份 |
 | `clientMessageId` | 客户端原始提交 UUID |
 | `content`、`contentHash` | 规范化正文及其 UTF-8 SHA-256 小写十六进制摘要 |
 | `senderName` | HTTP 接入时取得的发送者显示名快照 |
 | `admittedAt` | 首次获得 Redis 入队许可的时间，同一次预约保持一致 |
 
-使用 `admittedAt` 推导三个界限。客户端重试截止为 **10 分钟**，新正式受理截止为 **12 分钟**，回执可查截止为 **30 分钟**。消费者遇到已经超过查询截止的命令时，推进处理进度并记录过期指标。 [时间窗口和键生命周期](storage.md#账号额度和提交绑定)
+从 `admittedAt` 起，新的正式受理截止为 **12 分钟**，回执可查截止为 **30 分钟**。消费者遇到已经超过查询截止的命令时，推进处理进度并记录过期指标。 [时间窗口和键生命周期](storage.md#账号额度和提交绑定)
 
 ```json
 {
@@ -51,7 +51,7 @@ Kafka Value 采用 UTF-8 JSON，字段名使用小驼峰。时间为三位小数
 | --- | --- |
 | `schemaVersion` | 事件结构版本 |
 | `roomId`、`roomSeq` | 房间和从 1 递增的正式顺序，消息排序以此为准 |
-| `messageId` | 正式接收时生成的 UUID，重试沿用原值 |
+| `messageId` | 首次正式接收时生成的 UUID，消费重放时沿用原值 |
 | `userId` | 仅供内部持久化的发送账号 |
 | `senderName`、`content` | 正式接收的显示名快照和纯文本正文 |
 | `sentAt` | 首次正式接收的 UTC 时间 |
@@ -90,14 +90,16 @@ Kafka Value 采用 UTF-8 JSON，字段名使用小驼峰。时间为三位小数
 
 ## 生产和确认
 
-Producer 启用 `enable.idempotence=true` 和 `acks=all`。应用收到 Broker 确认后，才能返回 `202` 或记录该预约已入队。请求进入 Producer 后无法判断是否成功时，通过 `MESSAGE_SUBMISSION_UNKNOWN` 暴露不确定结果，后续使用同一客户端标识和正文重试。Producer 幂等处理传输层重试，业务去重由 Streams 负责。生产环境业务 Topic 使用 3 副本、`min.insync.replicas=2` 和 `unclean.leader.election.enable=false`。事务日志、消费进度与 Streams changelog 按同等可靠性要求配置。 [Kafka Producer 配置](https://kafka.apache.org/43/configuration/producer-configs/) · [Kafka Topic 配置](https://kafka.apache.org/43/configuration/topic-configs/)
+每个获准的预约最多调用一次 `producer.send()`。Producer 启用 `enable.idempotence=true` 和 `acks=all`，在本次调用的交付期限内执行协议层交付。应用收到 Broker 确认后才返回 `202`，并尝试将预约标为已入队。无法确认结果时返回 `MESSAGE_SUBMISSION_UNKNOWN`，通过回执查询已知预约的结果。Streams 负责业务去重。
+
+生产环境业务 Topic 使用 3 副本、`min.insync.replicas=2` 和 `unclean.leader.election.enable=false`。事务日志、消费进度与 Streams changelog 按同等可靠性要求配置。 [Kafka Producer 配置](https://kafka.apache.org/43/configuration/producer-configs/) · [Kafka Topic 配置](https://kafka.apache.org/43/configuration/topic-configs/)
 
 ## 正式接收和顺序
 
 1. 同一提交分区由一个 Streams task 按 offset 顺序处理。业务去重键为 `sessionId + roomId + clientMessageId`，保存首次正式接收的正文摘要和回执。房间末序号、业务去重、按 `submissionId` 的终态分别存入有 changelog 的状态存储。房间末序号在房间生命周期内保留。接收逻辑验证负载与 Topic 键中的房间一致，再操作房间状态。
 2. 先裁决同一 `submissionId` 已有的终态。该终态不可被重放覆盖。新预约命中业务去重时，相同正文生成指向原弹幕的回执，异文生成冲突回执。无历史记录且超过 12 分钟接收期限的命令生成过期回执。符合接收条件的首条命令分配下一房间序号，发布一次正式事件。
-3. 房间末序号、判重与终态变更、正式事件、回执事件和输入进度使用 `exactly_once_v2` 一并提交。两个输出 Topic 的消费组使用 `read_committed`。业务去重状态自正式接收起保留 30 分钟；预约终态保留到该预约的查询截止，随后回收。进程重启或任务迁移时先从 changelog 恢复，再继续处理。发送方在同一操作的首次提交后最多重试 10 分钟。
-4. `roomSeq` 为各房间独立的业务序号，按 Broker 追加顺序分配。展示时间只用于阅读。重试、冲突和逾期命令均不占用序号。不同房间各自编号。 [Kafka Streams 状态与事务](https://kafka.apache.org/43/streams/core-concepts/#processing-guarantees) · [Kafka 事务隔离](https://kafka.apache.org/43/design/design/#using-transactions)
+3. 房间末序号、判重与终态变更、正式事件、回执事件和输入进度使用 `exactly_once_v2` 一并提交。两个输出 Topic 的消费组使用 `read_committed`。业务去重状态自正式接收起保留 30 分钟，预约终态保留到该预约的查询截止。进程重启或任务迁移时先从 changelog 恢复，再继续处理。
+4. `roomSeq` 为各房间独立的业务序号，按 Broker 追加顺序分配。展示时间只用于阅读。重复、冲突和逾期命令均不占用序号。不同房间各自编号。 [Kafka Streams 状态与事务](https://kafka.apache.org/43/streams/core-concepts/#processing-guarantees) · [Kafka 事务隔离](https://kafka.apache.org/43/design/design/#using-transactions)
 
 ## 三个输出消费组
 

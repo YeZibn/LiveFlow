@@ -11,14 +11,14 @@ import java.util.concurrent.CompletableFuture;
 /** 弹幕接入依赖的基础设施边界。 */
 public interface RoomMessagePorts {
 
-    /** 管理账号额度、预约及生产租约。 */
+    /** 管理账号冷却、预约与单次发布许可。 */
     interface Admission {
         /**
          * @param scope 已认证作用域
          * @param clientMessageId 客户端提交标识
          * @param contentHash 已规范化正文的摘要
-         * @return 已确认入队的原预约，尚未确认时为空
-         * @throws RoomMessageFailure 预约正文冲突
+         * @return 已确认入队的原预约，无绑定时为空
+         * @throws RoomMessageFailure 已有预约待确认、正文冲突或 Redis 不可用
          */
         Optional<Queued> findQueued(Scope scope, String clientMessageId, String contentHash);
 
@@ -27,20 +27,24 @@ public interface RoomMessagePorts {
          * @param clientMessageId 客户端提交标识
          * @param contentHash 规范化的正文摘要
          * @param senderName 当前认证用户的显示名
-         * @return 原入队结果或授予本次发布的租约
-         * @throws RoomMessageFailure 冲突、限流、过期或已有有效租约
+         * @return 原入队结果或首次预约的单次发布许可
+         * @throws RoomMessageFailure 冲突、限流、已有待确认预约或 Redis 不可用
          */
         Reservation claim(Scope scope, String clientMessageId, String contentHash, String senderName);
 
         /**
          * @param scope 已认证作用域
          * @param clientMessageId 客户端提交标识
-         * @param reservation 已获得 Broker 确认的预约及租约
+         * @param reservation 已获得 Broker 确认的预约及许可
          */
         void markQueued(Scope scope, String clientMessageId, Reservation reservation);
     }
 
-    /** 无租约表示预约早已收到 Broker 确认。 */
+    /**
+     * @param queued 预约标识及首次许可时间
+     * @param leaseId 首次发布许可的标识，读取已入队预约时为空
+     * @param senderName 首次预约保存的显示名，读取已入队预约时可为空
+     */
     record Reservation(Queued queued, UUID leaseId, String senderName) {}
 
     /** 将有效的领域提交交给 Kafka。 */

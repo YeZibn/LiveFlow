@@ -1,10 +1,10 @@
 # 直播间弹幕 V2 设计
 
-弹幕账号冷却与认证共享配置边界，旧额度清理见 [单实例限流设计](../../resilience/design.md)。
+弹幕账号冷却和发送熔断统一在单实例保护模块定义。本文的提交部分采用已确认的熔断和单次提交方案。 [业务规则与熔断范围](../../resilience/design.md) · [发布与切换](../../resilience/deployment-and-operations.md#发布与回退)
 
 ## 背景、目标与范围
 
-当前 V1 在 JVM 内完成弹幕受理、短期去重和本机广播，进程退出后无法恢复消息。V2 采用方案 B。Kafka 保存提交和正式弹幕，Redis Pub/Sub 转发实时事件，MySQL 提供历史查询。首轮在一个 LiveFlow 进程中运行完整链路，HTTP、Kafka 消费和 WebSocket 仍与现有部署单元一致。按房间的消息路由允许后续增加应用实例。 [当前 V1 设计](../design.md) · [部署与运行](deployment-and-operations.md)
+V1 在 JVM 内完成弹幕受理、短期去重和本机广播。V2 由 Kafka 保存提交和正式弹幕，Redis Pub/Sub 转发实时事件，MySQL 提供历史查询。首轮在一个 LiveFlow 进程中运行完整链路，HTTP、Kafka 消费和 WebSocket 位于同一部署单元。按房间的消息路由允许后续增加应用实例。 [V1 设计](../design.md) · [部署与运行](deployment-and-operations.md)
 
 本轮覆盖纯文本发送、异步回执、房间内有序广播、历史持久化和断线补拉。画面滚动弹幕、在线人数、超大房间实时采样和多应用实例部署留待后续讨论。
 
@@ -13,8 +13,9 @@
 ```mermaid
 flowchart LR
     Vue["Vue 发送"] --> MVC["Spring MVC"]
-    MVC --> Gate["Redis 账号限流与提交绑定"]
-    Gate --> Input["Kafka 提交 Topic"]
+    MVC --> Breaker["Resilience4j 发送熔断"]
+    Breaker --> Lookup["发送查询和 Redis 原子预约"]
+    Lookup --> Input["Kafka 提交 Topic"]
     Input --> Streams["Kafka Streams 正式接收"]
     Streams --> Events["Kafka 正式弹幕 Topic"]
     Streams --> Outcomes["Kafka 回执 Topic"]
@@ -42,10 +43,10 @@ flowchart LR
 
 ### 提交与正式接收
 
-1. Vue 固定正文和 `clientMessageId`，使用现有 Bearer 和 CSRF 规则发起 POST。后端规范化正文，从可信身份读取发送者显示名，检查房间和账号。同账号各房间、标签页和登录会话共用冷却，两次新预约获准默认至少间隔 10 秒。 [发送接口](api.md#发送弹幕) · [账号额度和提交绑定](storage.md#账号额度和提交绑定)
-2. Redis 原子绑定同一提交的正文摘要，登记一次额度，授予短期发送租约。后端收到 Kafka 提交 Topic 的确认后返回 `202`。若确认不明，页面保留原请求并按同一标识重试。重复提交沿用额度和提交绑定。 [确认规则](event-contract.md#生产和确认)
+1. Vue 为一次发送固定正文和 `clientMessageId`，使用 Bearer 和 CSRF 规则发起一次 POST。后端规范化正文，先取得发送熔断许可，再读取已登记的提交、检查房间和账号、取得显示名。 [发送接口](api.md#发送弹幕) · [发送熔断](../../resilience/design.md#发送熔断)
+2. Redis 原子绑定正文摘要，登记账号冷却并授予一次 Kafka 发布许可。同账号跨房间、标签页和会话共用两次新预约至少间隔 10 秒的规则。Broker 确认后返回 `202`，遇到确认不明时由页面提示未知并提供可用的回执查询。 [账号额度和提交绑定](storage.md#账号额度和提交绑定) · [生产和确认](event-contract.md#生产和确认)
 3. Kafka Streams 按提交 Topic 的分区顺序裁决。同一会话、房间和客户端标识下，首个有效命令分配 `messageId`、`roomSeq` 和 `sentAt`，将正式事件、终态回执、去重状态和房间序号纳入同一 Kafka 事务。相同正文的后续命令取回原结果，异文生成冲突回执。 [正式接收和顺序](event-contract.md#正式接收和顺序)
-4. Vue 通过回执接口确认正式接收。只有确认成功才清理与该提交对应的草稿。回执表示发送结果，消息列表通过 WebSocket 与历史查询更新。正在等待回执时，页面保留独立的提交快照，用户可继续编辑下一条。 [回执查询](api.md#查询提交回执)
+4. Vue 通过回执接口确认正式接收。已提交的正文快照独立保存，用户可继续编辑下一条。消息列表通过 WebSocket 和历史查询更新。 [发送交互](api.md#发送交互) · [回执查询](api.md#查询提交回执)
 
 ### 广播与历史
 
@@ -63,7 +64,8 @@ flowchart LR
 
 | 场景 | 系统行为 |
 | --- | --- |
-| 发送超时，Kafka 可能已经写入 | 明确提示结果未知。相同提交在约定窗口内重试时命中原绑定和正式去重。 |
+| 发送熔断或半开名额已满 | 发送入口提前返回 `503`。回执、历史和 WebSocket 接收各自按依赖状态处理。 |
+| 发送超时，Kafka 可能已经写入 | 显示结果未知。有预约 ID 时只读查询。Kafka 和 Redis 按原预约处理随后到达的结果。 |
 | Redis 发布成功后广播进程退出 | Kafka 可能再次投递同一正式事件。事件标识和序号保持一致，浏览器只显示一次。 |
 | Redis 订阅中断或连接过慢 | 受影响连接重新同步。历史保存仍由独立的消费组推进。 |
 | MySQL 写入后消费者退出 | Kafka 可能重放该批。历史唯一键和连续进度校验保证重复写入得到相同结果。 |

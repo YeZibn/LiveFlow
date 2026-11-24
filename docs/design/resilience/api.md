@@ -2,13 +2,13 @@
 
 ## 接口与身份
 
-三个入口沿用现有路由、请求字段和成功响应。来源 IP 取服务端可信连接地址，反向代理部署时按受信代理边界解析。弹幕账号和会话来自已验证的认证上下文，房间来自路径参数。 [认证接口](../auth/api.md) · [弹幕 V2 接口](../room-messages/v2/api.md)
+来源 IP 取服务端可信连接地址，反向代理部署时按受信代理边界解析。弹幕账号和会话来自已验证的认证上下文，房间来自路径参数。弹幕发送的响应字段和发送熔断错误由弹幕 V2 接口定义。 [认证接口](../auth/api.md) · [弹幕 V2 接口](../room-messages/v2/api.md#发送弹幕)
 
 | 方法和路径 | 请求 | 成功响应 | 超限 |
 | --- | --- | --- | --- |
 | `POST /api/v1/auth/login` | `username`、`password`，校验 CSRF | `200`，TokenResponse 和 Refresh Cookie | `429 AUTH_RATE_LIMITED`，新增 `Retry-After` |
 | `POST /api/v1/auth/register` | `username`、`password`，校验 CSRF | `201`，`userId`、`username` | `429 AUTH_RATE_LIMITED`，带 `Retry-After` |
-| `POST /api/v1/rooms/{roomId}/messages` | `clientMessageId`、`content`，校验 Bearer、当前会话和 CSRF | Broker 确认后返回 `202`、`Location`、`submissionId`、`status`、`retryUntil` 和 `receiptExpiresAt` | `429 MESSAGE_RATE_LIMITED`，带 `Retry-After` |
+| `POST /api/v1/rooms/{roomId}/messages` | `clientMessageId`、`content`，校验 Bearer、当前会话和 CSRF | Broker 确认后返回 `202`，见[发送响应](../room-messages/v2/api.md#发送弹幕) | `429 MESSAGE_RATE_LIMITED`，带 `Retry-After` |
 
 ## 超限响应
 
@@ -28,8 +28,8 @@ Content-Type: application/json
 | 认证限流状态无法读取或确认 | `503 AUTH_SERVICE_UNAVAILABLE` |
 | 弹幕冷却或预约状态无法读取或确认，尚未开始生产 | `503 ROOM_MESSAGES_UNAVAILABLE` |
 | 同标识绑定异文 | `409 MESSAGE_ID_CONFLICT`，在冷却判定前裁决 |
-| 已知预约仍在途，或已开始生产但写入结果未知 | 沿用 `503 MESSAGE_SUBMISSION_UNKNOWN` 及现有重试规则 |
+| 已知预约待确认，或已开始生产但写入结果未知 | `503 MESSAGE_SUBMISSION_UNKNOWN`，按可用的回执信息查询 |
 
 ## 页面交互
 
-登录和注册按认证限流响应提示等待。弹幕收到 `429 MESSAGE_RATE_LIMITED` 后保留草稿，按 `Retry-After` 显示剩余时间。倒计时期间禁用新发送，原提交的手动重试和回执查询沿用原入口。页面禁用状态用于反馈，服务端按账号冷却做最终裁决。
+登录和注册按认证限流响应提示等待。弹幕收到 `429 MESSAGE_RATE_LIMITED` 后保留草稿，按 `Retry-After` 显示剩余时间。倒计时结束恢复发送按钮，由用户主动发起新提交。已知回执可在查询期内读取。服务端按账号冷却做最终裁决。 [弹幕页面交互](../room-messages/v2/api.md#发送交互)

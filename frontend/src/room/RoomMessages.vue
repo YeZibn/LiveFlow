@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { nextTick, ref, watch } from 'vue'
+import type { WithAccess } from '../auth/useAuth'
 import { useRoomMessages } from './useRoomMessages'
 
 const props = defineProps<{
   roomId: string
-  withAccess: <T>(call: (access: string) => Promise<T>) => Promise<T>
+  withAccess: WithAccess
 }>()
 
 const { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
-  syncing, syncFeedback, cooldownSeconds, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending } =
+  syncing, syncFeedback, cooldownSeconds, showSubmissionActions, pendingContent, canCheckReceipt,
+  checkingReceipt, checkReceipt, dismissSubmission } =
   useRoomMessages(props.roomId, props.withAccess)
 const log = ref<HTMLElement>()
 const hasNewMessages = ref(false)
@@ -113,12 +115,11 @@ function handleEnter(event: KeyboardEvent) {
       </form>
       <p v-if="cooldownSeconds > 0" class="feedback">请等待 {{ cooldownSeconds }} 秒后发送下一条弹幕。</p>
       <p v-if="feedback" class="feedback" :class="{ failure: failed }" :role="failed ? 'alert' : 'status'">{{ feedback }}</p>
-      <div v-if="pendingAction !== 'none'" class="submission-actions">
-        <button v-if="pendingAction === 'retry'" type="button" class="ui-button reconnect"
-          :disabled="state !== 'ready' || submitting" @click="submitPending">重试原弹幕</button>
-        <button v-else type="button" class="ui-button reconnect" :disabled="checkingReceipt"
+      <p v-if="pendingContent" class="feedback submission-text">{{ pendingContent }}</p>
+      <div v-if="showSubmissionActions" class="submission-actions">
+        <button v-if="canCheckReceipt" type="button" class="ui-button reconnect" :disabled="checkingReceipt"
           @click="() => checkReceipt()">查询回执</button>
-        <button type="button" class="ui-button reconnect" @click="clearPending">发送新内容</button>
+        <button type="button" class="ui-button reconnect" @click="dismissSubmission">发送新内容</button>
       </div>
     </footer>
   </section>
@@ -175,6 +176,7 @@ h2 { margin: 0; font-size: 1rem; }
 .compose-form .ui-button { flex-shrink: 0; }
 .feedback { margin: 0; color: var(--muted); font-size: 0.78rem; }
 .feedback.failure { color: var(--danger); }
+.submission-text { overflow-wrap: anywhere; }
 .submission-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 
 @media (max-width: 50rem) {

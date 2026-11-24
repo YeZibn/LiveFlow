@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
+import type { WithAccess } from '../auth/useAuth'
 import RoomMessages from './RoomMessages.vue'
 import { readRoomDetails, type RoomDetails } from './roomClient'
 
 const props = defineProps<{
   roomId: string
   listReturn: string
-  withAccess: <T>(call: (access: string) => Promise<T>) => Promise<T>
+  withAccess: WithAccess
 }>()
 
 const uuidV4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/

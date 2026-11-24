@@ -19,7 +19,7 @@
 | --- | --- | --- |
 | Kafka 分区 | 提交、正式事件、回执 Topic 各 6 分区 | 不同房间可并行。提交与正式事件的分区变更依照迁移规则执行 |
 | Kafka 保留 | 应用 Topic 72 小时；业务和回执状态窗口见事件文档 | 最长停机、原始提交积压、历史追平和磁盘容量 |
-| Producer 预算 | 应用生产入口等待 3 秒以内；`max.block.ms=500`、`delivery.timeout.ms=2500`、`request.timeout.ms=1500` | 生产超时标记结果未知。Redis 租约 5 秒，覆盖入口等待预算 |
+| Producer 预算 | 应用生产阶段预算约 3 秒，`max.block.ms=500`、`delivery.timeout.ms=2500`、`request.timeout.ms=1500` | 生产超时标记结果未知，保留已登记的预约和回执查询期限 |
 | 广播新鲜窗口 | 正式受理后 10 秒 | 超期只由历史恢复，避免恢复后向实时连接突发回放 |
 | 入口在途生产上限 | 每实例初始 256，满时拒绝新生产请求 | Kafka 延迟、内存和 MVC 并发预算 |
 | 历史批写 | 每分区一次最多 200 条，低流量刷新间隔不超过 100 毫秒 | MySQL 提交开销和水位延迟 |
@@ -27,7 +27,7 @@
 | WebSocket 资源 | 先沿用每实例 512 条连接和 64 条待鉴权连接；每连接队列见 Redis 与本机状态设计 | 单机内存、出站带宽、握手峰值与复查成本 |
 | 历史水位通知 | 每 3 秒批读活跃房间，单次查询最多 100 个 UUID，每实例按房间分摊读取 | DB 读取量与静默漏收恢复延迟 |
 
-现有 [应用配置](../../../../backend/liveflow-api/src/main/resources/application.yaml) 提供 Kafka 地址。新增运行参数集中于 `liveflow.room-messages.v2`，启动时检查正数、时限关系、Topic 分区配置与启用的依赖。账号冷却配置与旧额度清理见 [限流运行设计](../../resilience/deployment-and-operations.md)。预约、租约、回执和队列的语义见 [Redis 设计](storage.md) 与 [事件设计](event-contract.md)。 [Kafka 生产等待参数](https://kafka.apache.org/43/configuration/producer-configs/)
+现有 [应用配置](../../../../backend/liveflow-api/src/main/resources/application.yaml) 提供 Kafka 地址。弹幕基础运行参数集中于 `liveflow.room-messages.v2`，启动时检查正数、时限关系、Topic 分区配置与启用的依赖。单次发布许可启用时撤下旧 `liveflow.room-messages.v2.lease-millis`。 [限流与熔断参数](../../resilience/deployment-and-operations.md) · [Redis 设计](storage.md) · [事件设计](event-contract.md) · [Kafka 生产等待参数](https://kafka.apache.org/43/configuration/producer-configs/)
 
 ## 本地启动和检查
 
@@ -65,6 +65,8 @@
 
 ## 发布与回退
 
+下面记录 V1 与 V2 的拓扑切换。本次在既有 V2 上发布发送熔断和单次提交时，按对应流程成对切换 API 和页面。 [发送方案发布与回退](../../resilience/deployment-and-operations.md#发布与回退)
+
 1. 先应用历史表的新增 Flyway 迁移，并创建三个 Kafka Topic。启动时核对分区、保留和副本配置。回执投影组启动后才开放回执路由。
 2. 切换时先在入口暂停 `POST /api/v1/rooms/{roomId}/messages` 并关闭旧连接，随后成对发布 Vue 和后端。待六个提交分区恢复、后台消费组确认分区后恢复入口流量，旧页面重新加载后申请新 Ticket。一个环境只保留一个弹幕发送入口。
 3. 回退时在流量入口暂停新的 V2 提交并保留当前进程，或者以 `LIVEFLOW_ROOM_MESSAGES_ACCEPTING=false` 启动 V2 进程排空。用消费组位点核对提交、正式事件和回执均已处理至停止写入后的终点，确认 MySQL 水位和回执，再正常关闭 V2 并启用 V1 前后端。保留历史表、Topic、Streams 应用 ID、状态存储和消费进度。
@@ -74,7 +76,7 @@
 
 | 故障 | 行为与恢复 |
 | --- | --- |
-| Kafka 无法确认写入 | 入口保留原请求语义，明确区分尚未生产和结果不确定。等待在途数量下降或依赖恢复，客户端沿用原提交标识。 |
+| Kafka 无法确认写入 | 返回结果未确认，有预约标识时通过 GET 查询。发送依赖故障计入熔断，恢复由用户发起的新弹幕验证。 [发送熔断](../../resilience/design.md#发送熔断) |
 | 正式受理积压 | 监控最老待处理提交的年龄，积压接近可接收期限时收紧入口。逾期命令按事件契约生成终态或结束查询期，减少长时间不确定。 |
 | Redis 发布暂时失败 | 广播组暂停受影响分区并退避，继续维持消费者心跳。恢复后按顺序重放；超过 10 秒新鲜窗口的事件推进广播组进度，历史组持续处理。网关的历史水位通知触发补拉。 |
 | Redis 整体不可用 | 认证、Ticket、提交限流、回执投影和广播可能同时受影响。已正式提交的 Kafka 事件保留，历史消费可单独继续。服务恢复后按 Kafka 重建未过期回执。 |

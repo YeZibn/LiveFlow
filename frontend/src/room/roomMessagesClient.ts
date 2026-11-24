@@ -17,12 +17,13 @@ type RoomFrame =
 
 interface TicketResponse { ticket: string; expiresIn: number }
 
-export interface QueuedSubmission {
+/** 可用于读取终态的原预约及期限。 */
+export interface SubmissionReceiptReference {
   submissionId: string
-  status: 'queued'
-  retryUntil: string
   receiptExpiresAt: string
 }
+
+export interface QueuedSubmission extends SubmissionReceiptReference { status: 'queued' }
 
 export type MessageReceipt =
   | { submissionId: string; status: 'unconfirmed' }
@@ -65,23 +66,35 @@ export async function requestRoomTicket(access: string, roomId: string): Promise
 /**
  * @param access 当前会话的 Access Token
  * @param roomId 已加载房间的 UUID
- * @param body 输入快照及重试时复用的客户端标识
- * @returns Broker 确认的预约和两个截止时间
+ * @param body 单次发送的输入快照及客户端标识
+ * @returns Broker 确认的预约及可查询的截止时间
  * @throws ApiRequestError 提交遭拒或发送结果无法确认
  */
 export async function sendRoomMessage(access: string, roomId: string, body: MessageSubmission): Promise<QueuedSubmission> {
   const result = await requestJson<QueuedSubmission>(`${roomUrl(roomId)}/messages`, { method: 'POST', access, body })
-  if (result.status !== 'queued' || !isUuid(result.submissionId) || !isTimestamp(result.retryUntil)
-    || !isTimestamp(result.receiptExpiresAt) || result.receiptExpiresAt <= result.retryUntil) {
+  if (result.status !== 'queued' || !isUuid(result.submissionId) || !isTimestamp(result.receiptExpiresAt)) {
     throw new ApiRequestError(0, 'RESPONSE_INVALID', '发送结果无法确认。')
   }
   return result
 }
 
 /**
+ * @param failure 发送响应携带的错误信息
+ * @returns 结果未知且查询信息有效时返回回执引用，否则返回 undefined
+ */
+export function unknownSubmissionReceipt(failure: unknown): SubmissionReceiptReference | undefined {
+  if (!(failure instanceof ApiRequestError) || failure.status !== 503 || failure.code !== 'MESSAGE_SUBMISSION_UNKNOWN') return
+  const details = failure.details
+  if (typeof details === 'object' && details !== null && 'submissionId' in details && 'receiptExpiresAt' in details
+    && isUuid(details.submissionId) && isTimestamp(details.receiptExpiresAt)) {
+    return { submissionId: details.submissionId, receiptExpiresAt: details.receiptExpiresAt }
+  }
+}
+
+/**
  * @param access 当前会话的 Access Token
  * @param roomId 房间 UUID
- * @param id 已获得入队确认的预约标识
+ * @param id 从提交响应取得的预约标识
  * @returns 该会话可见的预约结果
  * @throws ApiRequestError 查询失败或回执无效
  */
