@@ -3,6 +3,7 @@ package com.liveflow.core.auth.service;
 import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.auth.mapper.UserMapper;
 import com.liveflow.core.auth.session.AuthSessionStore;
+import com.liveflow.core.resilience.AuthRequestLimiter;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -27,6 +28,7 @@ public class AuthService {
 
     private final UserMapper users;
     private final AuthSessionStore sessions;
+    private final AuthRequestLimiter limits;
     private final AccessTokenService tokens;
     private final Argon2PasswordEncoder passwords = new Argon2PasswordEncoder(16, 32, 1, 19456, 2);
 
@@ -37,11 +39,13 @@ public class AuthService {
      * 创建认证编排服务并绑定账号存储、会话存储和 JWT 签发器。
      * @param users 用于创建账号及读取账号和密码哈希的入口
      * @param sessions 当前登录会话的权威仓储
+     * @param limits 登录和注册额度裁决
      * @param tokens 用于签发短期访问凭证的组件
      */
-    public AuthService(UserMapper users, AuthSessionStore sessions, AccessTokenService tokens) {
+    public AuthService(UserMapper users, AuthSessionStore sessions, AuthRequestLimiter limits, AccessTokenService tokens) {
         this.users = users;
         this.sessions = sessions;
+        this.limits = limits;
         this.tokens = tokens;
     }
 
@@ -60,7 +64,7 @@ public class AuthService {
             throw new AuthFailure(INVALID_REQUEST);
         }
         // 先预留来源额度，超限请求无需计算 Argon2id。
-        sessions.checkRegistrationLimit(source);
+        limits.checkRegistrationLimit(source);
         var account = new UserMapper.NewAccount(username, passwords.encode(password));
         try {
             // 直接插入以唯一索引裁决并发注册，避免先查后写产生竞态。
@@ -94,7 +98,7 @@ public class AuthService {
             throw new AuthFailure(INVALID_REQUEST);
         }
         // 限流键与数据库使用相同拼写，大小写不同的账号分别计数。
-        sessions.checkLoginLimit(username, source);
+        limits.checkLoginLimit(username, source);
         var account = users.findForLogin(username);
         boolean matches = passwords.matches(password, account == null ? absentAccountHash : account.passwordHash());
         if (account == null || !matches) {

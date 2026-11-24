@@ -55,7 +55,7 @@ public final class AuthFailure extends AuthenticationException {
      * @param retryAfterSeconds 允许重试前的等待秒数
      * @return 可映射到 HTTP 限流响应的认证失败
      */
-    public static AuthFailure registrationRateLimited(long retryAfterSeconds) {
+    public static AuthFailure rateLimited(long retryAfterSeconds) {
         return new AuthFailure(Code.AUTH_RATE_LIMITED, retryAfterSeconds);
     }
 

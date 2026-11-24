@@ -5,7 +5,6 @@ import com.liveflow.core.auth.session.AuthSessionStore;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -21,27 +20,11 @@ public class AuthSessionRepository implements AuthSessionStore {
     private static final DefaultRedisScript<Long> REPLACE = script("replace-session");
     private static final DefaultRedisScript<Long> ROTATE = script("rotate-refresh");
     private static final DefaultRedisScript<Long> REVOKE = script("revoke-session");
-    private static final DefaultRedisScript<Long> LIMIT = script("limit-login");
-    private static final DefaultRedisScript<Long> REGISTRATION_LIMIT = script("limit-registration");
     private final StringRedisTemplate redis;
-    private final String registrationMaxAttempts;
-    private final String registrationWindowSeconds;
 
-    /**
-     * @param redis 认证状态的 Redis 客户端
-     * @param registrationMaxAttempts 同一来源在注册窗口内允许的提交次数
-     * @param registrationWindowSeconds 固定窗口时长，单位为秒
-     * @throws IllegalArgumentException 限流次数或时长不是正数
-     */
-    public AuthSessionRepository(StringRedisTemplate redis,
-            @Value("${liveflow.auth.registration-limit.max-attempts:10}") int registrationMaxAttempts,
-            @Value("${liveflow.auth.registration-limit.window-seconds:600}") int registrationWindowSeconds) {
-        if (registrationMaxAttempts <= 0 || registrationWindowSeconds <= 0) {
-            throw new IllegalArgumentException("注册限流次数和窗口秒数必须为正数");
-        }
+    /** @param redis 认证会话的 Redis 客户端 */
+    public AuthSessionRepository(StringRedisTemplate redis) {
         this.redis = redis;
-        this.registrationMaxAttempts = Integer.toString(registrationMaxAttempts);
-        this.registrationWindowSeconds = Integer.toString(registrationWindowSeconds);
     }
 
     /**
@@ -93,34 +76,9 @@ public class AuthSessionRepository implements AuthSessionStore {
         }
     }
 
-    /** {@inheritDoc} 同一脚本原子检查并预留账号和来源两个固定窗口的额度。 */
-    @Override
-    public void checkLoginLimit(String username, String source) {
-        // 两个键共享 Redis Cluster 的哈希标签，保证可在同一个 Lua 脚本中操作。
-        String prefix = "liveflow:auth:{login}:";
-        if (execute(LIMIT, List.of(prefix + "account:" + username, prefix + "source:" + source),
-                "10", "60", "60") != 1) {
-            throw new AuthFailure(AUTH_RATE_LIMITED);
-        }
-    }
-
-    /** {@inheritDoc} 将脚本返回的毫秒等待时间向上取整，供 Retry-After 使用。 */
-    @Override
-    public void checkRegistrationLimit(String source) {
-        // 注册只按来源计数，登录仍使用自身的来源和账号窗口。
-        long waitMs = execute(REGISTRATION_LIMIT, List.of("liveflow:auth:registration:source:" + source),
-                registrationMaxAttempts, registrationWindowSeconds);
-        if (waitMs < 0) {
-            throw new AuthFailure(AUTH_SERVICE_UNAVAILABLE);
-        }
-        if (waitMs > 0) {
-            throw AuthFailure.registrationRateLimited(Math.ceilDiv(waitMs, 1000L));
-        }
-    }
-
     /**
      * 执行一次 Redis 脚本，并统一处理无法确认的执行结果。
-     * @param script 对应会话变更或限流的 Lua 脚本
+     * @param script 对应会话变更 Lua 脚本
      * @param keys 脚本按顺序读取的 KEYS
      * @param args 脚本按顺序读取的 ARGV，时间单位由各脚本定义
      * @return 脚本返回的整数状态或时间值

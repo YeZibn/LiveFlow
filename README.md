@@ -10,7 +10,7 @@ LiveFlow 是基于 Java 的直播弹幕系统。第一阶段用一个 Spring Boo
 | 实时接入 | Spring WebSocket、原生 WebSocket、JSON | 连接管理、房间订阅、客户端消息收发 |
 | 认证 | Spring Security、JWT Access Token、Redis 登录会话和 Refresh Token 轮换 | HTTP 鉴权、登录续期和单账户单登录 |
 | 数据 | MySQL 8.4.13、MyBatis-Plus 3.5.18、Flyway | 保存用户、房间和历史弹幕，管理数据库变更 |
-| 分布式状态 | Redis 8.2.11、Spring Data Redis | 跨实例广播、认证状态，后续用于在线统计和限流 |
+| 分布式状态 | Redis 8.2.11、Spring Data Redis | 房间频道广播、认证状态和限流 |
 | 消息 | Apache Kafka 4.3.2（KRaft）、Spring for Apache Kafka | 接收弹幕事件，供广播和持久化消费组分别消费 |
 | 前端 | Node.js 24、npm、Vue 3.5、TypeScript、Vite 8 | 开发代理、类型检查和浏览器客户端 |
 | 本地运维 | Docker Compose、Spring Boot Actuator | 启动基础依赖并检查服务和后端连接状态 |
@@ -34,6 +34,7 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 - [直播间 V1](docs/design/room/design.md) 定义一人一房、统一列表与名称搜索、UUID 进入、观看页布局，以及对应的 HTTP 接口和数据库索引。
 - [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、短期去重，以及显示发送者和秒级本地时间的弹幕列表。
 - [直播间弹幕 V2](docs/design/room-messages/v2/design.md) 定义 Kafka 异步受理、Redis 房间频道、MySQL 历史、发送回执和有序补拉。
+- [单实例限流设计](docs/design/resilience/design.md) 定义登录、注册限流边界与弹幕账号 10 秒冷却。
 
 ## 本地启动
 
@@ -93,7 +94,7 @@ curl --fail http://127.0.0.1:18080/actuator/health
 
 同一账号的新登录会替换原会话。可以用两个独立浏览器会话观察替换行为，用同一个浏览器的两个标签页观察刷新与退出协调。生产环境以 HTTPS 部署并注入独立的 Base64 随机签名密钥。回环 HTTP 覆盖只适用于 `local` profile。
 
-登录限流采用 60 秒固定窗口，每个原样账号 10 次，每个连接来源 60 次。注册独立计数，默认每个来源 600 秒内 10 次。可用 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` 和 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` 配置注册额度。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
+登录限流采用 60 秒固定窗口，每个原样账号 10 次，每个连接来源 60 次。注册独立计数，默认每个来源 600 秒内 10 次。两个入口超限都返回 `Retry-After`。可用 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` 和 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` 配置注册额度。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
 
 在本地 Compose 依赖健康时，可从仓库根目录运行认证集成测试。测试会创建并清理专用账号，连接配置沿用后端的本地默认值或当前终端覆盖值，Redis 使用测试数据库 15。
 

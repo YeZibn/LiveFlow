@@ -8,7 +8,7 @@ const props = defineProps<{
 }>()
 
 const { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
-  syncing, syncFeedback, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending } =
+  syncing, syncFeedback, cooldownSeconds, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending } =
   useRoomMessages(props.roomId, props.withAccess)
 const log = ref<HTMLElement>()
 const hasNewMessages = ref(false)
@@ -111,6 +111,7 @@ function handleEnter(event: KeyboardEvent) {
           {{ submitting ? '发送中…' : '发送' }}
         </button>
       </form>
+      <p v-if="cooldownSeconds > 0" class="feedback">请等待 {{ cooldownSeconds }} 秒后发送下一条弹幕。</p>
       <p v-if="feedback" class="feedback" :class="{ failure: failed }" :role="failed ? 'alert' : 'status'">{{ feedback }}</p>
       <div v-if="pendingAction !== 'none'" class="submission-actions">
         <button v-if="pendingAction === 'retry'" type="button" class="ui-button reconnect"

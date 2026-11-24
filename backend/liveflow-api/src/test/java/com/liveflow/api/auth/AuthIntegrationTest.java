@@ -72,6 +72,7 @@ import static org.mockito.Mockito.doThrow;
 @EnabledIfEnvironmentVariable(named = "LIVEFLOW_AUTH_INTEGRATION", matches = "true")
 class AuthIntegrationTest {
 
+    private static final String LOGIN_SOURCE = "liveflow:auth:{login}:source:127.0.0.1";
     private static final String REGISTRATION_SOURCE = "liveflow:auth:registration:source:127.0.0.1";
     private static final String REGISTRATION_PASSWORD = "Abcdefg1!_";
     private static final String PROFILE_PATH = "/api/v1/users/me/profile";
@@ -88,8 +89,8 @@ class AuthIntegrationTest {
         registry.add("liveflow.auth.signing-key", () -> Base64.getEncoder().encodeToString(KEY));
         registry.add("liveflow.auth.secure-cookie", () -> false);
         registry.add("spring.data.redis.database", () -> 15);
-        registry.add("liveflow.auth.registration-limit.max-attempts", () -> 10);
-        registry.add("liveflow.auth.registration-limit.window-seconds", () -> 600);
+        registry.add("liveflow.resilience.rate-limit.registration.max-attempts", () -> 10);
+        registry.add("liveflow.resilience.rate-limit.registration.window-seconds", () -> 600);
         registry.add("liveflow.room-messages.auth-seconds", () -> 2);
         registry.add("liveflow.room-messages.recheck-seconds", () -> 1);
         registry.add("liveflow.room-messages.v2.kafka-namespace", () -> MESSAGE_TEST_NAMESPACE);
@@ -102,7 +103,7 @@ class AuthIntegrationTest {
     @Autowired JsonMapper json;
     @Autowired Admission admissions;
     @Autowired RoomHistoryService history;
-    @Autowired RoomKafkaRuntime kafka;
+    @MockitoSpyBean RoomKafkaRuntime kafka;
     @MockitoSpyBean AuthSessionRepository sessions;
     @MockitoSpyBean UserProfileService profiles;
     @MockitoSpyBean RoomMapper rooms;
@@ -128,7 +129,7 @@ class AuthIntegrationTest {
         jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
                 + " VALUES (?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))", username, hash);
         userId = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, username);
-        redis.delete(REGISTRATION_SOURCE);
+        redis.delete(List.of(REGISTRATION_SOURCE, LOGIN_SOURCE));
     }
 
     @AfterEach
@@ -142,7 +143,7 @@ class AuthIntegrationTest {
                 jdbc.update("DELETE FROM users WHERE id = ?", id);
             }
         }
-        redis.delete(REGISTRATION_SOURCE);
+        redis.delete(List.of(REGISTRATION_SOURCE, LOGIN_SOURCE));
     }
 
     @Test
@@ -239,8 +240,8 @@ class AuthIntegrationTest {
         var browser = new Browser();
         browser.csrf();
         String name = registrationName("Unavailable_");
-        doThrow(new AuthFailure(AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE)).when(sessions)
-                .checkRegistrationLimit("127.0.0.1");
+        // 已存在但没有到期时间的计数无法可靠判断窗口。
+        redis.opsForValue().set(REGISTRATION_SOURCE, "1");
         failure(browser.send("POST", "register", credentials(name, REGISTRATION_PASSWORD), null, true),
                 503, "AUTH_SERVICE_UNAVAILABLE");
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM users WHERE username = ?", Integer.class, name)).isZero();
@@ -344,6 +345,42 @@ class AuthIntegrationTest {
         doThrow(new AuthFailure(AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE)).when(sessions)
                 .requireCurrent(userId, UUID.fromString(login.get("sessionId").asString()));
         failure(browser.send("GET", "me", null, access(login), false), 503, "AUTH_SERVICE_UNAVAILABLE");
+    }
+
+    @Test
+    void loginChecksBothFixedWindowsAndReturnsTheLongestWait() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String account = "liveflow:auth:{login}:account:" + username;
+        String otherCase = "liveflow:auth:{login}:account:" + username.toUpperCase(Locale.ROOT);
+        redis.opsForValue().set(account, "10", Duration.ofSeconds(8));
+        redis.opsForValue().set(LOGIN_SOURCE, "60", Duration.ofSeconds(37));
+        var bothLimited = browser.send("POST", "login", credentials(password), null, true);
+        failure(bothLimited, 429, "AUTH_RATE_LIMITED");
+        assertThat(Integer.parseInt(bothLimited.headers().firstValue("Retry-After").orElseThrow())).isBetween(36, 37);
+        assertThat(redis.opsForValue().get(account)).isEqualTo("10");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("60");
+        assertThat(redis.getExpire(account, TimeUnit.MILLISECONDS)).isBetween(1L, 8000L);
+        assertThat(redis.getExpire(LOGIN_SOURCE, TimeUnit.MILLISECONDS)).isBetween(1L, 37000L);
+
+        var sourceLimited = browser.send("POST", "login", credentials(username.toUpperCase(Locale.ROOT), password), null, true);
+        failure(sourceLimited, 429, "AUTH_RATE_LIMITED");
+        assertThat(redis.hasKey(otherCase)).isFalse();
+        redis.opsForValue().set(LOGIN_SOURCE, "1", Duration.ofSeconds(30));
+        var accountLimited = browser.send("POST", "login", credentials(password), null, true);
+        failure(accountLimited, 429, "AUTH_RATE_LIMITED");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("1");
+        failure(browser.send("POST", "login", credentials(username.toUpperCase(Locale.ROOT), password), null, true),
+                401, "AUTH_INVALID_CREDENTIALS");
+        assertThat(redis.opsForValue().get(otherCase)).isEqualTo("1");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("2");
+        assertThat(redis.getExpire(LOGIN_SOURCE, TimeUnit.MILLISECONDS)).isBetween(1L, 30000L);
+
+        redis.opsForValue().set(account, "1");
+        failure(browser.send("POST", "login", credentials(password), null, true), 503, "AUTH_SERVICE_UNAVAILABLE");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("2");
+        assertThat(browser.send("GET", "me", null, bearer, false).statusCode()).isEqualTo(200);
+        redis.delete(List.of(account, otherCase));
     }
 
     @Test
@@ -815,7 +852,16 @@ class AuthIntegrationTest {
             assertThat(history.get("items").size()).isEqualTo(1);
             assertThat(history.get("items").get(0).get("messageId")).isEqualTo(event.get("messageId"));
 
+            String deniedId = UUID.randomUUID().toString();
+            var limited = browser.sendPath("POST", messagePath(otherRoom, "messages"),
+                    messageBody(deniedId, "不同房间"), bearer, true);
+            failure(limited, 429, "MESSAGE_RATE_LIMITED");
+            assertThat(limited.headers().firstValue("Retry-After")).hasValueSatisfying(
+                    value -> assertThat(Integer.parseInt(value)).isBetween(1, 10));
+
             for (int i = 0; i < 4; i++) {
+                // 该用例关注广播、历史和分页。独立用例验证真实的 10 秒冷却。
+                redis.expire(cooldownKey(), Duration.ZERO);
                 roomResponse(secondTab.sendPath("POST", path, messageBody(UUID.randomUUID().toString(), "下一条"),
                         bearer, true), 202);
                 assertThat(nextMessage(sender).get("roomSeq").asString()).isEqualTo(Integer.toString(i + 2));
@@ -827,11 +873,6 @@ class AuthIntegrationTest {
             assertThat(first.get("nextAfterSeq").asString()).isEqualTo("2");
             var second = roomResponse(browser.sendPath("GET", path + "?limit=2&afterSeq=2&throughSeq=5", null, bearer, false), 200);
             assertThat(second.get("nextAfterSeq").asString()).isEqualTo("4");
-            var limited = browser.sendPath("POST", messagePath(otherRoom, "messages"),
-                    messageBody(UUID.randomUUID().toString(), "不同房间"), bearer, true);
-            failure(limited, 429, "MESSAGE_RATE_LIMITED");
-            assertThat(limited.headers().firstValue("Retry-After")).hasValueSatisfying(
-                    value -> assertThat(Integer.parseInt(value)).isBetween(1, 10));
             assertThat(isolated.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
         } finally {
             jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", otherId);
@@ -895,8 +936,155 @@ class AuthIntegrationTest {
             assertThat(admissions.findQueued(scope, clientId, hash)).isPresent();
         } finally {
             redis.delete(key);
-            redis.delete(MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:rate");
+            redis.delete(cooldownKey());
         }
+    }
+
+    private String cooldownKey() {
+        return MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:cooldown";
+    }
+
+    /** Redis 绝对截止用于验证重试和拒绝是否延长原冷却。 */
+    private long cooldownDeadline() {
+        var script = new org.springframework.data.redis.core.script.DefaultRedisScript<>(
+                "return redis.call('PEXPIRETIME', KEYS[1])", Long.class);
+        return redis.execute(script, List.of(cooldownKey()));
+    }
+
+    @Test
+    void accountCooldownIsAtomicAcrossRoomsAndSessionsAndExpiresAtOriginalDeadline() throws Exception {
+        var firstScope = new Scope(userId, UUID.randomUUID(), UUID.randomUUID().toString());
+        var secondScope = new Scope(userId, UUID.randomUUID(), UUID.randomUUID().toString());
+        String firstId = UUID.randomUUID().toString();
+        String secondId = UUID.randomUUID().toString();
+        String contentHash = RoomEvents.hash("并发消息");
+        var start = new CyclicBarrier(2);
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = executor.submit(() -> attemptRoomReservation(start, firstScope, firstId, contentHash));
+            var second = executor.submit(() -> attemptRoomReservation(start, secondScope, secondId, contentHash));
+            UUID firstWinner = first.get(4, TimeUnit.SECONDS);
+            UUID secondWinner = second.get(4, TimeUnit.SECONDS);
+            assertThat(firstWinner == null).isNotEqualTo(secondWinner == null);
+            var winningScope = firstWinner != null ? firstScope : secondScope;
+            var winningId = firstWinner != null ? firstId : secondId;
+            var losingScope = firstWinner != null ? secondScope : firstScope;
+            var losingId = firstWinner != null ? secondId : firstId;
+            var deadline = cooldownDeadline();
+            assertThat(redis.getExpire(cooldownKey(), TimeUnit.MILLISECONDS)).isBetween(9000L, 10000L);
+            assertThat(assertThrows(RoomMessageFailure.class, () ->
+                    admissions.claim(winningScope, winningId, contentHash, username)).code())
+                    .isEqualTo(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN);
+            assertThat(assertThrows(RoomMessageFailure.class, () ->
+                    admissions.claim(losingScope, losingId, contentHash, username)).code())
+                    .isEqualTo(RoomMessageFailure.Code.MESSAGE_RATE_LIMITED);
+            assertThat(cooldownDeadline()).isEqualTo(deadline);
+
+            // 让 Redis 自己按原始截止过期。到期后，相同的被拒标识仍可创建首个预约。
+            int ttl = redis.getExpire(cooldownKey(), TimeUnit.MILLISECONDS).intValue();
+            if (ttl > 0) Thread.sleep(ttl + 10L);
+            var next = admissions.claim(losingScope, losingId, contentHash, username);
+            assertThat(next.queued().admittedAt().toEpochMilli()).isGreaterThanOrEqualTo(deadline);
+            assertThat(cooldownDeadline()).isEqualTo(next.queued().admittedAt().toEpochMilli() + 10000);
+        } finally {
+            redis.delete(cooldownKey());
+        }
+    }
+
+    @Test
+    void luaOpensTheNextReservationExactlyAtTheCooldownDeadline() throws Exception {
+        long deadline = Instant.now().plusSeconds(60).toEpochMilli();
+        String reservation = cooldownKey() + ":test-reservation";
+        var expireAt = new org.springframework.data.redis.core.script.DefaultRedisScript<>(
+                "return redis.call('PEXPIREAT', KEYS[1], ARGV[1])", Long.class);
+        redis.opsForValue().set(cooldownKey(), UUID.randomUUID().toString());
+        redis.execute(expireAt, List.of(cooldownKey()), Long.toString(deadline));
+
+        try {
+            assertThat(claimAtMillis(reservation, deadline - 1)).containsExactly("RATE", "1");
+            assertThat(redis.hasKey(reservation)).isFalse();
+            assertThat(cooldownDeadline()).isEqualTo(deadline);
+            assertThat(claimAtMillis(reservation, deadline)).startsWith("NEW");
+            assertThat(redis.opsForHash().get(reservation, "admittedAtMs")).isEqualTo(Long.toString(deadline));
+            assertThat(cooldownDeadline()).isEqualTo(deadline + 10000);
+        } finally {
+            redis.delete(List.of(cooldownKey(), reservation));
+        }
+    }
+
+    /**
+     * 仅替换 Redis 脚本的 TIME 返回值，实际读写和 TTL 命令由真实 Redis 执行。
+     * @param reservation 测试预约键
+     * @param nowMillis 用于裁决的 Redis 毫秒时刻
+     * @return 间隔裁决与预约字段
+     */
+    private List<String> claimAtMillis(String reservation, long nowMillis) throws Exception {
+        var resource = new org.springframework.core.io.ClassPathResource("room/claim-message.lua");
+        String script = """
+                local native = redis
+                local redis = {call = function(command, ...)
+                    if command == 'TIME' then return {'%s', '%s'} end
+                    return native.call(command, ...)
+                end}
+                """.formatted(nowMillis / 1000, (nowMillis % 1000) * 1000)
+                + resource.getContentAsString(StandardCharsets.UTF_8);
+        var claim = new org.springframework.data.redis.core.script.DefaultRedisScript<>(script, List.class);
+        List<?> result = redis.execute(claim, List.of(cooldownKey(), reservation), UUID.randomUUID().toString(),
+                UUID.randomUUID().toString(), RoomEvents.hash("边界"), username, "10000", "5000", "600000", "1800000");
+        return result.stream().map(Object::toString).toList();
+    }
+
+    private UUID attemptRoomReservation(CyclicBarrier start, Scope scope, String id, String hash) throws Exception {
+        start.await(3, TimeUnit.SECONDS);
+        try {
+            return admissions.claim(scope, id, hash, username).queued().submissionId();
+        } catch (RoomMessageFailure failure) {
+            assertThat(failure.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_RATE_LIMITED);
+            assertThat(failure.retryAfterSeconds()).isBetween(1L, 10L);
+            return null;
+        }
+    }
+
+    @Test
+    void uncertainKafkaAcknowledgementKeepsCooldownAndAllowsRetryOfOriginalReservation() throws Exception {
+        var browser = new Browser();
+        JsonNode login = browser.login();
+        String bearer = access(login);
+        String room = createRoomFor(browser, bearer);
+        String endpoint = messagePath(room, "messages");
+        String id = UUID.randomUUID().toString();
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            CompletableFuture<Void> sent = (CompletableFuture<Void>) invocation.callRealMethod();
+            if (calls.getAndIncrement() == 0) {
+                return sent.thenCompose(ignored -> CompletableFuture.failedFuture(
+                        new RoomMessageFailure(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN)));
+            }
+            return sent;
+        }).when(kafka).publish(org.mockito.ArgumentMatchers.argThat(
+                event -> event != null && id.equals(event.clientMessageId())));
+
+        failure(browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true),
+                503, "MESSAGE_SUBMISSION_UNKNOWN");
+        long deadline = cooldownDeadline();
+        String prefix = MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:submit:"
+                + login.get("sessionId").asString() + ":" + room + ":";
+        String deniedId = UUID.randomUUID().toString();
+        failure(browser.sendPath("POST", endpoint, messageBody(deniedId, "新弹幕"), bearer, true),
+                429, "MESSAGE_RATE_LIMITED");
+        assertThat(redis.hasKey(prefix + deniedId)).isFalse();
+        failure(browser.sendPath("POST", endpoint, messageBody(id, "改正文"), bearer, true), 409, "MESSAGE_ID_CONFLICT");
+        redis.opsForHash().put(prefix + id, "leaseUntilMs", "0");
+        var retried = browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true);
+        assertThat(retried.statusCode()).isEqualTo(202);
+        var receipt = awaitJson(browser, bearer, retried.headers().firstValue("Location").orElseThrow(),
+                value -> "accepted".equals(value.get("status").asString()));
+        var history = awaitJson(browser, bearer, endpoint,
+                value -> "1".equals(value.get("storedThrough").asString()));
+        assertThat(history.get("items").size()).isOne();
+        assertThat(history.get("items").get(0).get("messageId")).isEqualTo(receipt.get("messageId"));
+        assertThat(calls.get()).isEqualTo(2);
+        assertThat(cooldownDeadline()).isEqualTo(deadline);
     }
 
     @Test

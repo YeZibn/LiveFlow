@@ -4,6 +4,8 @@
 
 LiveFlow 的 Vue 客户端需要支持用户自主创建账号，并在重新打开页面后恢复登录。本版采用账号密码注册，账号名严格区分大小写，昵称在登录后的个人主页设置。认证范围包括密码登录、HTTP 鉴权、续期、当前用户查询和退出。邮箱绑定与自助密码重设归入后续阶段。房间 WebSocket Ticket 和长连接鉴权由弹幕模块定义。 [直播间弹幕设计](../room-messages/design.md)
 
+登录和注册的窗口、等待响应及 Lua 裁决见 [单实例限流设计](../resilience/design.md)。
+
 ## 方案选择与设计思路
 
 - **JWT 与服务端会话共同鉴权。** JWT 用于 HTTP Bearer 调用，Redis 提供账号当前会话的权威状态。每次受保护请求多一次 Redis 查询，从而能在旧 Access Token 尚未过期时识别会话替换或撤销。Redis 不可用时，受保护请求拒绝放行。
@@ -21,7 +23,8 @@ LiveFlow 的 Vue 客户端需要支持用户自主创建账号，并在重新打
 | Security | `SecurityFilterChain`、JWT 和会话校验 | 在进入 MVC 前校验 Bearer 凭证和适用的 CSRF 规则，将认证身份写入安全上下文 |
 | Controller | `AuthController`、请求和响应 DTO | 处理请求格式、Cookie 和 HTTP 响应，调用 Service，从安全上下文获取当前用户身份 |
 | Service | `AuthService`、`AccessTokenService` | 编排注册、密码认证、会话替换、刷新和退出，签发 Access Token |
-| Repository | `UserMapper`、认证 Redis 仓储 | 通过 MyBatis-Plus 写入和读取账号，通过 Redis Lua 执行限流与原子会话变更 |
+| 限流 | `AuthRequestLimiter` | 在格式校验后、密码计算前裁决额度，Lua 负责认证固定窗口 |
+| Repository | `UserMapper`、认证 Redis 会话仓储 | 通过 MyBatis-Plus 写入和读取账号，通过 Redis Lua 执行原子会话变更 |
 | View | Vue | 提供注册、登录与退出界面，在内存维护凭证和会话标识，协调跨标签页认证请求 |
 
 Controller 异常处理和 Spring Security 过滤器错误处理共用 [错误响应约定](api.md#错误响应)。MySQL 是用户账号和密码哈希的权威来源，Redis 是账号当前登录会话的权威来源。

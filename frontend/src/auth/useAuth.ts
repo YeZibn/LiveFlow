@@ -261,7 +261,12 @@ export function useAuth() {
       })
       user.value = await withAccess(authClient.me)
     } catch (cause) {
-      error.value = messageFor(cause)
+      if (cause instanceof ApiRequestError && cause.code === 'AUTH_RATE_LIMITED'
+        && cause.retryAfterSeconds !== undefined && cause.retryAfterSeconds > 0) {
+        error.value = `登录请求过多，请在 ${cause.retryAfterSeconds} 秒后重试。`
+      } else {
+        error.value = messageFor(cause)
+      }
     } finally {
       busy.value = false
     }

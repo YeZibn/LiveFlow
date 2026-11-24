@@ -36,6 +36,8 @@ Ticket 请求、响应、30 秒有效期沿用当前协议。客户端每次连�
 }
 ```
 
+收到 `429 MESSAGE_RATE_LIMITED` 时，页面保留草稿并按 `Retry-After` 显示等待时间，倒计时期间禁用新发送。原标识重试和回执查询可继续使用。 [账号冷却及 API 规则](../../resilience/api.md)
+
 ## 查询提交回执
 
 `submissionId` 为标准小写 UUID v4。接口只查询当前认证账号、会话和房间的回执，无请求体或查询参数。回执由 Kafka 已提交的终态投影。读到 `accepted` 时可确认发送完成；`rejected` 给出业务错误码；`unconfirmed` 表示当前查不到终态。该结果也适用于无权查看的标识，避免透露其他会话的提交。 [Redis 回执投影](storage.md#回执投影)

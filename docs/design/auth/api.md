@@ -43,7 +43,7 @@
 
 ### 登录
 
-`POST /api/v1/auth/login` 携带 CSRF 请求头和以下 JSON。账号查询及账号维度限流按 `username` 的原始拼写执行，`Alice` 和 `alice` 分别匹配。密码验证通过且 Redis 确认会话替换后，返回 `200`、`TokenResponse` 和新的 `lf_refresh` Cookie。账号或密码错误统一返回 `AUTH_INVALID_CREDENTIALS`。
+`POST /api/v1/auth/login` 携带 CSRF 请求头和以下 JSON。账号查询及账号维度限流按 `username` 的原始拼写执行，`Alice` 和 `alice` 分别匹配。密码验证通过且 Redis 确认会话替换后，返回 `200`、`TokenResponse` 和新的 `lf_refresh` Cookie。账号或密码错误统一返回 `AUTH_INVALID_CREDENTIALS`。账号与来源 IP 共同裁决登录额度，任一超限即返回整数秒 `Retry-After`。 [限流接口](../resilience/api.md#超限响应)
 
 ```json
 {
@@ -150,5 +150,5 @@
 | `403` | `AUTH_CSRF_INVALID` | CSRF Cookie 或请求头缺失或不匹配，重新获取 CSRF 凭证 |
 | `409` | `AUTH_USERNAME_ALREADY_EXISTS` | 注册时发现完全相同的账号名，提示更换账号名或登录 |
 | `409` | `AUTH_SESSION_CHANGED` | 退出请求目标与浏览器 Refresh Cookie 所属会话不同，保留新会话 |
-| `429` | `AUTH_RATE_LIMITED` | 触发限流，注册按 `Retry-After` 提示等待时间 |
+| `429` | `AUTH_RATE_LIMITED` | 触发限流，登录和注册按 `Retry-After` 提示等待时间 |
 | `503` | `AUTH_SERVICE_UNAVAILABLE` | Redis 或 MySQL 等依赖不可用或写入结果无法确认。注册结果不明时可尝试登录，刷新结果不明时重新登录 |

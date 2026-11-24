@@ -30,6 +30,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   const content = ref('')
   const submitting = ref(false)
   const feedback = ref('')
+  const cooldownSeconds = ref(0)
   const failed = ref(false)
   const syncFeedback = ref('')
   const syncing = ref(false)
@@ -47,6 +48,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   let historyTimer: number | undefined
   let receiptTimer: number | undefined
   let receiptExpiry: number | undefined
+  let cooldownTimer: number | undefined
   let socket: WebSocket | undefined
   let reconnectTimer: number | undefined
   let readyTimer: number | undefined
@@ -55,7 +57,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   let active = true
 
   const canSend = computed(() => state.value === 'ready' && !submitting.value
-    && pending.value === undefined && content.value.trim().length > 0)
+    && cooldownSeconds.value === 0 && pending.value === undefined && content.value.trim().length > 0)
 
   onMounted(() => void connect())
   onBeforeUnmount(() => {
@@ -66,6 +68,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     window.clearTimeout(reconnectTimer)
     window.clearTimeout(historyTimer)
     historyTimer = undefined
+    window.clearTimeout(cooldownTimer)
     clearPending()
     socket?.close()
   })
@@ -365,9 +368,15 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
         receiptExpiry = window.setTimeout(() => expireSubmission(submission),
           Math.max(0, submission.retryUntil - Date.now()))
       } else {
-        feedback.value = cause.code === 'MESSAGE_RATE_LIMITED' && cause.retryAfterSeconds !== undefined
-          ? '发送过快，请等待 ' + cause.retryAfterSeconds + ' 秒。' : cause.message
-        if (submission.wasUncertain && (cause.status >= 500 || cause.code === 'AUTH_CSRF_INVALID')) {
+        const waitSeconds = cause.retryAfterSeconds
+        const limited = cause.code === 'MESSAGE_RATE_LIMITED' && waitSeconds !== undefined && waitSeconds > 0
+        if (limited) {
+          startCooldown(waitSeconds)
+          feedback.value = ''
+        } else {
+          feedback.value = cause.message
+        }
+        if (submission.wasUncertain && (limited || cause.status >= 500 || cause.code === 'AUTH_CSRF_INVALID')) {
           pendingAction.value = 'retry'
         } else {
           clearPending()
@@ -429,6 +438,24 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     }
   }
 
+  /**
+   * 以单调时钟计算本地剩余时间，后台标签页定时器延迟时直接追上实际截止。
+   * @param seconds 服务端 Retry-After 给出的整数秒
+   */
+  function startCooldown(seconds: number) {
+    const deadline = performance.now() + seconds * 1000
+    window.clearTimeout(cooldownTimer)
+    function update() {
+      const remainingMillis = deadline - performance.now()
+      cooldownSeconds.value = Math.max(0, Math.ceil(remainingMillis / 1000))
+      if (cooldownSeconds.value > 0) {
+        const nextTick = remainingMillis - (cooldownSeconds.value - 1) * 1000
+        cooldownTimer = window.setTimeout(update, nextTick)
+      }
+    }
+    update()
+  }
+
   /** @param submission 达到重试或查询截止的操作 */
   function expireSubmission(submission: PendingSubmission) {
     if (!active || pending.value !== submission) return
@@ -446,7 +473,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   }
 
   return { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
-    syncing, syncFeedback, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending }
+    syncing, syncFeedback, cooldownSeconds, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending }
 }
 
 function max(first: bigint, second: bigint) {
