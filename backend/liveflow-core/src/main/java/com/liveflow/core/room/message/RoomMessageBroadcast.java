@@ -1,24 +1,15 @@
 package com.liveflow.core.room.message;
 
-import java.time.Instant;
+import java.util.function.Consumer;
 
-/** 将已通过业务裁决的实时消息交给房间接收连接。 */
+/** 房间实时事件订阅。实时传输丢失的记录由历史接口补齐。 */
 public interface RoomMessageBroadcast {
-
     /**
-     * 在本机按调用顺序入队。实现应隔离单连接失败，禁止在此方法中执行网络写入。
-     * @param message 准备广播的房间弹幕
-     * @throws RoomMessageFailure 尚未开始分发且服务无法受理
+     * @param roomId 订阅的房间 UUID
+     * @param messages 每条公开弹幕的回调，按订阅连接收到的顺序调用
+     * @param subscribed Redis 确认订阅或恢复订阅时的回调
+     * @param disconnected Redis 订阅连接断开时的回调
+     * @return 撤销本次订阅的操作
      */
-    void enqueue(Message message);
-
-    /**
-     * 本机分发事件。同一事件为该房间的接收者提供一致的显示字段。
-     * @param roomId 仅用于路由到对应的房间
-     * @param messageId 与 HTTP 回执共用的消息 UUID
-     * @param senderName 受理该条消息时读取的发送者显示名
-     * @param content 已规范化的纯文本正文
-     * @param sentAt 服务端受理时间
-     */
-    record Message(String roomId, String messageId, String senderName, String content, Instant sentAt) {}
+    Runnable subscribe(String roomId, Consumer<RoomEvents.Message> messages, Runnable subscribed, Runnable disconnected);
 }

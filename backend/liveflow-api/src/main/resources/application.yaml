@@ -20,6 +20,11 @@ spring:
       port: ${LIVEFLOW_REDIS_PORT:16379}
       connect-timeout: 2s
       timeout: 2s
+  task:
+    scheduling:
+      pool:
+        # 水位、心跳、清理和回执重放各自推进。
+        size: 4
   kafka:
     # 可覆盖完整的 broker 地址列表，本地默认连接 Kafka 的 EXTERNAL 监听器。
     bootstrap-servers: ${LIVEFLOW_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:${LIVEFLOW_KAFKA_PORT:19092}}
@@ -36,8 +41,14 @@ management:
 
 liveflow:
   room-messages:
+    connection-limit: ${LIVEFLOW_ROOM_MESSAGES_CONNECTION_LIMIT:512}
     # 服务位于反向代理之后时，可显式配置浏览器地址。留空使用同源校验。
     allowed-origin: ${LIVEFLOW_ROOM_MESSAGES_ALLOWED_ORIGIN:}
+    v2:
+      accepting: ${LIVEFLOW_ROOM_MESSAGES_ACCEPTING:true}
+      replication-factor: ${LIVEFLOW_ROOM_MESSAGES_KAFKA_REPLICAS:1}
+      min-insync-replicas: ${LIVEFLOW_ROOM_MESSAGES_KAFKA_MIN_ISR:1}
+      state-directory: ${LIVEFLOW_ROOM_MESSAGES_STATE_DIRECTORY:/tmp/liveflow-room-streams-v2}
   auth:
     # 使用部署环境注入的 Base64 随机密钥，解码后至少 32 字节。
     signing-key: ${LIVEFLOW_JWT_SIGNING_KEY:}

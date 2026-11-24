@@ -1,7 +1,8 @@
 import { ApiRequestError, requestJson } from '../api/requestJson'
 
+/** 历史和 WebSocket 共用的公开消息。序号在线上传输时始终为字符串。 */
 export interface RoomMessage {
-  type: 'message'
+  roomSeq: string
   messageId: string
   senderName: string
   content: string
@@ -9,71 +10,136 @@ export interface RoomMessage {
 }
 
 type RoomFrame =
-  | RoomMessage
-  | { type: 'ready'; roomId: string }
+  | (RoomMessage & { type: 'message' })
+  | { type: 'ready' | 'resync_required'; roomId: string }
+  | { type: 'history_progress'; storedThrough: string }
   | { type: 'error'; code: string; message: string }
 
-interface TicketResponse {
-  ticket: string
-  expiresIn: number
+interface TicketResponse { ticket: string; expiresIn: number }
+
+export interface QueuedSubmission {
+  submissionId: string
+  status: 'queued'
+  retryUntil: string
+  receiptExpiresAt: string
 }
 
-interface MessageReceipt {
-  messageId: string
-  sentAt: string
-}
+export type MessageReceipt =
+  | { submissionId: string; status: 'unconfirmed' }
+  | { submissionId: string; status: 'accepted'; messageId: string; roomSeq: string; sentAt: string }
+  | { submissionId: string; status: 'rejected'; code: 'MESSAGE_ID_CONFLICT' | 'MESSAGE_SUBMISSION_EXPIRED' }
 
-export interface MessageSubmission {
-  clientMessageId: string
-  content: string
+export interface MessageSubmission { clientMessageId: string; content: string }
+
+export interface HistoryPage {
+  items: RoomMessage[]
+  earliestSeq: string
+  storedThrough: string
+  targetThrough: string
+  nextAfterSeq: string | null
 }
 
 /**
- * 构造同源房间接口的公共前缀。
- * @param roomId 房间的对外 UUID
- * @returns 包含已编码房间段的 API 路径
+ * @param roomId 对外房间 UUID
+ * @returns 同源房间 API 前缀
  */
 function roomUrl(roomId: string) {
   return `/api/v1/rooms/${encodeURIComponent(roomId)}`
 }
 
 /**
- * 申请当前房间的一次性 WebSocket 票据。
  * @param access 当前会话的 Access Token
  * @param roomId 已加载房间的 UUID
- * @returns 原始票据及其有效期
- * @throws ApiRequestError 认证、房间或存储故障
+ * @returns 一次性连接票据和有效期
+ * @throws ApiRequestError 会话、房间、存储或响应无效
  */
 export async function requestRoomTicket(access: string, roomId: string): Promise<TicketResponse> {
   const result = await requestJson<TicketResponse>(`${roomUrl(roomId)}/ws-ticket`, { method: 'POST', access })
   if (typeof result.ticket !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(result.ticket)
-    || typeof result.expiresIn !== 'number' || !Number.isInteger(result.expiresIn) || result.expiresIn <= 0) {
+    || !Number.isInteger(result.expiresIn) || result.expiresIn <= 0) {
     throw new ApiRequestError(0, 'RESPONSE_INVALID', '连接票据响应无效。')
   }
   return result
 }
 
 /**
- * 提交一次弹幕。相同提交的用户重试继续使用原始标识。
  * @param access 当前会话的 Access Token
  * @param roomId 已加载房间的 UUID
- * @param body 当前提交的输入快照及客户端标识
- * @returns 服务端的受理结果，列表由 WebSocket 独立更新
- * @throws ApiRequestError 提交被拒绝，或响应结果无法确认
+ * @param body 输入快照及重试时复用的客户端标识
+ * @returns Broker 确认的预约和两个截止时间
+ * @throws ApiRequestError 提交遭拒或发送结果无法确认
  */
-export async function sendRoomMessage(access: string, roomId: string, body: MessageSubmission): Promise<MessageReceipt> {
-  const result = await requestJson<MessageReceipt>(`${roomUrl(roomId)}/messages`, { method: 'POST', access, body })
-  if (!isUuid(result.messageId) || !isSentAt(result.sentAt)) {
+export async function sendRoomMessage(access: string, roomId: string, body: MessageSubmission): Promise<QueuedSubmission> {
+  const result = await requestJson<QueuedSubmission>(`${roomUrl(roomId)}/messages`, { method: 'POST', access, body })
+  if (result.status !== 'queued' || !isUuid(result.submissionId) || !isTimestamp(result.retryUntil)
+    || !isTimestamp(result.receiptExpiresAt) || result.receiptExpiresAt <= result.retryUntil) {
     throw new ApiRequestError(0, 'RESPONSE_INVALID', '发送结果无法确认。')
   }
   return result
 }
 
 /**
- * 创建同源房间接收连接。凭证随后通过应用首帧提交。
- * @returns 尚未完成房间认证的浏览器 WebSocket
- * @throws DOMException 浏览器无法建立连接
+ * @param access 当前会话的 Access Token
+ * @param roomId 房间 UUID
+ * @param id 已获得入队确认的预约标识
+ * @returns 该会话可见的预约结果
+ * @throws ApiRequestError 查询失败或回执无效
  */
+export async function requestMessageReceipt(access: string, roomId: string, id: string): Promise<MessageReceipt> {
+  const result = await requestJson<MessageReceipt>(
+    `${roomUrl(roomId)}/messages/submissions/${encodeURIComponent(id)}`, { access })
+  if (result.submissionId === id && (result.status === 'unconfirmed'
+    || (result.status === 'accepted' && isUuid(result.messageId) && isSequence(result.roomSeq) && result.roomSeq !== '0'
+      && isTimestamp(result.sentAt))
+    || (result.status === 'rejected' && ['MESSAGE_ID_CONFLICT', 'MESSAGE_SUBMISSION_EXPIRED'].includes(result.code)))) {
+    return result
+  }
+  throw new ApiRequestError(0, 'RESPONSE_INVALID', '回执响应无效。')
+}
+
+/**
+ * @param access 当前会话的 Access Token
+ * @param roomId 当前房间
+ * @param range 排他的连续游标、可选固定目标。省略时查询最近窗口
+ * @returns 同一数据库快照中的历史和水位
+ * @throws ApiRequestError 历史无法读取、已清理或响应无效
+ */
+export async function requestRoomHistory(access: string, roomId: string,
+  range?: { after: bigint; through?: bigint }): Promise<HistoryPage> {
+  const query = new URLSearchParams()
+  if (range) {
+    query.set('afterSeq', range.after.toString())
+    if (range.through !== undefined) query.set('throughSeq', range.through.toString())
+  }
+  const suffix = range ? `?${query}` : ''
+  const page = await requestJson<HistoryPage>(`${roomUrl(roomId)}/messages${suffix}`, { access })
+  if (!Array.isArray(page.items) || page.items.length > 100 || !page.items.every(isMessage)
+    || !isSequence(page.earliestSeq, 9223372036854775807n) || page.earliestSeq === '0'
+    || !isSequence(page.storedThrough) || !isSequence(page.targetThrough)
+    || (page.nextAfterSeq !== null && !isSequence(page.nextAfterSeq))) {
+    throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史响应无效。')
+  }
+  const stored = BigInt(page.storedThrough)
+  const earliest = BigInt(page.earliestSeq)
+  const target = BigInt(page.targetThrough)
+  const last = page.items.at(-1)
+  const first = page.items[0]
+  const max = stored > target ? target : stored
+  const requiredStart = range ? range.after + 1n : earliest
+  const expectsItems = requiredStart <= max
+  const continuous = page.items.every((item, i) => i === 0
+    || BigInt(item.roomSeq) === BigInt(page.items[i - 1]!.roomSeq) + 1n)
+  if (!continuous || expectsItems !== !!first || earliest > stored + 1n || (first && (BigInt(first.roomSeq) < earliest
+    || (range && BigInt(first.roomSeq) !== range.after + 1n))) || (last && BigInt(last.roomSeq) > max)
+    || (!range && (target !== stored || page.nextAfterSeq !== null || (last && BigInt(last.roomSeq) !== stored)))
+    || (range && (target < range.after || (range.through !== undefined && range.through !== target)))
+    || (page.nextAfterSeq !== null && (last?.roomSeq !== page.nextAfterSeq || BigInt(page.nextAfterSeq) >= max))) {
+    throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史顺序无法确认。')
+  }
+  return page
+}
+
+/** @returns 同源且尚未发出票据首帧的浏览器连接 */
 export function openRoomSocket(): WebSocket {
   const url = new URL('/ws/rooms', window.location.origin)
   url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -81,49 +147,55 @@ export function openRoomSocket(): WebSocket {
 }
 
 /**
- * 解析并校验 WebSocket 下行帧，调用方据此维护连接与列表状态。
- * @param data 浏览器收到的 WebSocket 载荷
- * @returns 受支持的帧，格式无效时返回 undefined
+ * @param data 浏览器收到的载荷
+ * @returns 合法的协议帧，非法时为空
  */
 export function decodeRoomFrame(data: unknown): RoomFrame | undefined {
   if (typeof data !== 'string') return undefined
-  let result: unknown
+  let frame: unknown
   try {
-    result = JSON.parse(data)
+    frame = JSON.parse(data)
   } catch {
     return undefined
   }
-  if (!result || typeof result !== 'object') return undefined
-  const frame = result as Record<string, unknown>
-  if (frame.type === 'ready' && isUuid(frame.roomId)) {
-    return { type: 'ready', roomId: frame.roomId }
+  if (!isObject(frame)) return undefined
+  if ((frame.type === 'ready' || frame.type === 'resync_required') && isUuid(frame.roomId)) {
+    return { type: frame.type, roomId: frame.roomId }
+  }
+  if (frame.type === 'history_progress' && isSequence(frame.storedThrough)) {
+    return { type: 'history_progress', storedThrough: frame.storedThrough }
   }
   if (frame.type === 'error' && typeof frame.code === 'string' && typeof frame.message === 'string') {
     return { type: 'error', code: frame.code, message: frame.message }
   }
-  if (frame.type === 'message' && isUuid(frame.messageId) && typeof frame.senderName === 'string'
-    && frame.senderName.length > 0 && typeof frame.content === 'string' && isSentAt(frame.sentAt)) {
-    return { type: 'message', messageId: frame.messageId, senderName: frame.senderName,
-      content: frame.content, sentAt: frame.sentAt }
-  }
+  if (frame.type === 'message' && isMessage(frame)) return { ...frame, type: 'message' }
   return undefined
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isMessage(value: unknown): value is RoomMessage {
+  return isObject(value) && isSequence(value.roomSeq) && value.roomSeq !== '0' && isUuid(value.messageId)
+    && typeof value.senderName === 'string' && value.senderName.length > 0
+    && typeof value.content === 'string' && isTimestamp(value.sentAt)
+}
+
 /**
- * 验证下行标识为规范的小写 UUID v4。
- * @param value 待验证的协议字段
- * @returns 字段可按对外房间或消息标识使用时为 true
+ * @param value 原始序号
+ * @param max 包含的最大值
+ * @returns 格式正确且可精确比较
  */
+function isSequence(value: unknown, max = 9223372036854775806n): value is string {
+  return typeof value === 'string' && /^(0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= max
+}
+
 function isUuid(value: unknown): value is string {
   return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 }
 
-/**
- * 验证消息时间为带毫秒的 UTC 字符串，并确认浏览器能解析。
- * @param value 从回执或广播读到的原始时间字段
- * @returns 时间满足客户端解析要求时为 true
- */
-function isSentAt(value: unknown): value is string {
+function isTimestamp(value: unknown): value is string {
   return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)
     && Number.isFinite(Date.parse(value))
 }

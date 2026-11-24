@@ -1,0 +1,209 @@
+package com.liveflow.core.room.message;
+
+import com.liveflow.core.room.RoomUuid;
+import com.liveflow.core.room.message.RoomEvents.Accepted;
+import com.liveflow.core.room.message.RoomEvents.Message;
+import com.liveflow.core.room.message.RoomHistoryMapper.Row;
+import com.liveflow.core.room.message.RoomHistoryMapper.State;
+import com.liveflow.core.room.service.RoomService;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
+
+import static com.liveflow.core.room.message.RoomMessageFailure.Code.*;
+
+/** 按房间事务化管理弹幕历史、连续位置和过期前缀。 */
+@Service
+public class RoomHistoryService {
+    private final RoomHistoryMapper mapper;
+    private final RoomService rooms;
+    private final TransactionTemplate write;
+    private final TransactionTemplate snapshot;
+    private final Set<String> conflicts = ConcurrentHashMap.newKeySet();
+
+    /**
+
+     * @param mapper 历史 Mapper
+
+     * @param rooms 房间验证
+
+     * @param transactions MySQL 事务管理器
+
+     */
+    public RoomHistoryService(RoomHistoryMapper mapper, RoomService rooms, PlatformTransactionManager transactions) {
+        this.mapper = mapper;
+        this.rooms = rooms;
+        this.write = new TransactionTemplate(transactions);
+        this.snapshot = new TransactionTemplate(transactions);
+        snapshot.setReadOnly(true);
+        snapshot.setIsolationLevel(TransactionDefinition.ISOLATION_REPEATABLE_READ);
+    }
+
+    /**
+     * 将单个 Kafka 分区的一批事件在一个事务内写入。
+     * @param batch 按该分区 offset 顺序提供的正式事件
+     * @throws IllegalStateException 遇到缺口或同一序号对应不同消息
+     */
+    public void append(List<Accepted> batch) {
+        Map<String, List<Row>> ordered = new TreeMap<>();
+        for (Accepted event : batch) {
+            ordered.computeIfAbsent(event.roomId(), ignored -> new ArrayList<>()).add(row(event));
+        }
+        write.executeWithoutResult(status -> ordered.forEach(this::writeRoom));
+        conflicts.removeAll(ordered.keySet());
+    }
+
+    private void writeRoom(String roomId, List<Row> rows) {
+        mapper.initialize(roomId);
+        State state = mapper.lock(roomId);
+        long latest = state.storedThrough();
+        var pending = new LinkedHashMap<Long, Row>();
+        for (Row row : rows) {
+            if (row.roomSeq() < state.earliestSeq()) {
+                continue; // 已清理的旧重放不能把历史重新写回来。
+            }
+            if (row.roomSeq() <= latest) {
+                Row original = pending.get(row.roomSeq());
+                if (original == null) original = mapper.one(roomId, row.roomSeq());
+                if (!same(row, original)) throw conflict(roomId);
+            } else if (row.roomSeq() != latest + 1) {
+                throw conflict(roomId);
+            } else {
+                pending.put(row.roomSeq(), row);
+                latest = row.roomSeq();
+            }
+        }
+        if (!pending.isEmpty()) {
+            try {
+                mapper.insert(List.copyOf(pending.values()));
+            } catch (DuplicateKeyException failure) {
+                conflicts.add(roomId);
+                throw failure;
+            }
+            mapper.update(new State(roomId, latest, state.earliestSeq()));
+        }
+    }
+
+    /**
+     * 从同一数据库快照读取水位及消息页。
+     * @param roomId 已校验的房间 UUID
+     * @param size 请求的历史条数
+     * @param after 可选的排他游标
+     * @param through 可选的补拉上界
+     * @return 向浏览器公开的有序历史页
+     * @throws RoomMessageFailure 房间无效、缺失或历史无法读取
+     * @throws Gap 客户端游标指向已清理范围
+     */
+    public Page page(String roomId, int size, Long after, Long through) {
+        if (!RoomUuid.isCanonical(roomId)) throw new RoomMessageFailure(INVALID_REQUEST);
+        if (!rooms.exists(roomId)) throw new RoomMessageFailure(ROOM_NOT_FOUND);
+        if (conflicts.contains(roomId)) throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
+        return snapshot.execute(status -> {
+            State state = mapper.state(roomId);
+            long earliest = state == null ? 1 : state.earliestSeq();
+            long stored = state == null ? 0 : state.storedThrough();
+            if (after == null) {
+                List<Message> items = mapper.latest(roomId, stored, size).reversed().stream()
+                        .map(RoomHistoryService::message).toList();
+                return new Page(items, Long.toString(earliest), Long.toString(stored), Long.toString(stored), null);
+            }
+            if (after < earliest - 1) throw new Gap(earliest, stored);
+            long target = through == null ? Math.max(after, stored) : through;
+            List<Row> rows = mapper.range(roomId, after, Math.min(stored, target), size + 1);
+            String next = rows.size() > size ? Long.toString(rows.get(size - 1).roomSeq()) : null;
+            return new Page(rows.stream().limit(size).map(RoomHistoryService::message).toList(),
+                    Long.toString(earliest), Long.toString(stored), Long.toString(target), next);
+        });
+    }
+
+    /**
+
+     * @param roomIds 活跃房间 UUID 分批列表
+
+     * @return 可用房间的连续落库水位
+
+     */
+    public List<State> watermarks(List<String> roomIds) {
+        if (roomIds.isEmpty()) return List.of();
+        return mapper.states(roomIds).stream().filter(state -> !conflicts.contains(state.roomId())).toList();
+    }
+
+    /** 每轮按房间裁剪有界、连续的过期前缀。 */
+    @Scheduled(fixedDelayString = "${liveflow.room-messages.v2.history-cleanup-millis:30000}")
+    public void clean() {
+        LocalDateTime cutoff = LocalDateTime.now(ZoneOffset.UTC).minusHours(24);
+        for (String roomId : mapper.expiredRooms(cutoff)) {
+            write.executeWithoutResult(status -> {
+                State state = mapper.lock(roomId);
+                if (state == null) return;
+                List<Row> rows = mapper.range(roomId, state.earliestSeq() - 1, state.storedThrough(), 500);
+                long through = state.earliestSeq() - 1;
+                for (Row row : rows) {
+                    if (row.roomSeq() != through + 1 || row.storedAt().isAfter(cutoff)) break;
+                    through = row.roomSeq();
+                }
+                if (through >= state.earliestSeq()) {
+                    mapper.trim(roomId, through);
+                    mapper.update(new State(roomId, state.storedThrough(), through + 1));
+                }
+            });
+        }
+    }
+
+    private IllegalStateException conflict(String roomId) {
+        conflicts.add(roomId);
+        return new IllegalStateException("房间历史存在序号缺口或内容冲突");
+    }
+
+    private static Row row(Accepted e) {
+        return new Row(e.roomId(), Long.parseLong(e.roomSeq()), e.messageId().toString(), Long.parseLong(e.userId()),
+                e.senderName(), e.content(), LocalDateTime.ofInstant(Instant.parse(e.sentAt()), ZoneOffset.UTC), null);
+    }
+
+    private static Message message(Row row) {
+        return new Message(Long.toString(row.roomSeq()), UUID.fromString(row.messageId()), row.senderName(),
+                row.content(), RoomEvents.UTC_MILLIS.format(row.sentAt().toInstant(ZoneOffset.UTC)));
+    }
+
+    private static boolean same(Row one, Row other) {
+        return other != null && one.messageId().equals(other.messageId()) && one.userId() == other.userId()
+                && one.senderName().equals(other.senderName()) && one.content().equals(other.content())
+                && Objects.equals(one.sentAt(), other.sentAt());
+    }
+
+    /**
+     * @param items 在数据库快照内按序号升序排列的历史
+     * @param earliestSeq 最早可取序号，空保留范围使用末序号加一
+     * @param storedThrough 同一数据库快照的连续落库水位
+     * @param targetThrough 本轮补拉固定的上界
+     * @param nextAfterSeq 当前快照仍有下一页时使用的排他游标
+     */
+    public record Page(List<Message> items, String earliestSeq, String storedThrough,
+            String targetThrough, String nextAfterSeq) {}
+
+    /** 历史已经清理，响应主动向客户端提供当前可读范围。 */
+    public static final class Gap extends RuntimeException {
+        public final long earliest;
+        public final long stored;
+
+        Gap(long earliest, long stored) {
+            this.earliest = earliest;
+            this.stored = stored;
+        }
+    }
+}

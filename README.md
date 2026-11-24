@@ -17,7 +17,7 @@ LiveFlow 是基于 Java 的直播弹幕系统。第一阶段用一个 Spring Boo
 
 Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应的 MyBatis-Plus Boot 4 starter。 [Spring Boot 3.5 发布说明](https://spring.io/blog/2026/06/25/spring-boot-3-5-16-available-now/) · [MyBatis-Plus 安装说明](https://baomidou.com/en/getting-started/install/)
 
-弹幕首版采用 HTTP 提交、WebSocket 接收和单实例内存广播。跨实例阶段计划将已接受的弹幕事件写入 Kafka，再由广播消费组发到 Redis Pub/Sub，各实例将消息推给本机房间连接。持久化消费组计划批量写入 MySQL，供历史查询。HTTP 认证依赖 MySQL、Redis 和 Flyway。Prometheus、Grafana 和 Nginx 随压测和部署阶段接入。
+当前弹幕使用 V2 链路。HTTP 提交在 Kafka 确认入队后返回 202，Kafka Streams 为各房间分配连续序号，Redis Pub/Sub 转发实时弹幕，MySQL 保存历史供浏览器按序补拉。V2 首轮拓扑为单个 LiveFlow 进程。HTTP 认证依赖 MySQL、Redis 和 Flyway。 [弹幕 V2 设计](docs/design/room-messages/v2/design.md)
 
 ## 模块设计
 
@@ -26,13 +26,14 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 | 模块 | 职责 |
 | --- | --- |
 | `liveflow-core` | 业务服务、会话存储接口、MyBatis Mapper、Flyway 迁移脚本 |
-| `liveflow-infrastructure` | Redis 会话存储及 Lua 脚本、Kafka 健康检查，依赖 `core` |
+| `liveflow-infrastructure` | Redis 会话和弹幕预约、Kafka Streams 裁决与消费组、Redis 房间订阅，依赖 `core` |
 | `liveflow-api` | MVC 控制器、HTTP 安全、WebSocket 接入和应用配置，依赖另外两个模块并打包可执行 JAR |
 
 - [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。
 - [个人主页 V1](docs/design/profile/design.md) 涵盖个人主页入口、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
 - [直播间 V1](docs/design/room/design.md) 定义一人一房、统一列表与名称搜索、UUID 进入、观看页布局，以及对应的 HTTP 接口和数据库索引。
 - [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、短期去重，以及显示发送者和秒级本地时间的弹幕列表。
+- [直播间弹幕 V2](docs/design/room-messages/v2/design.md) 定义 Kafka 异步受理、Redis 房间频道、MySQL 历史、发送回执和有序补拉。
 
 ## 本地启动
 

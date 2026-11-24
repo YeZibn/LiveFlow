@@ -3,6 +3,14 @@ package com.liveflow.api.auth;
 import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.profile.service.UserProfileService;
 import com.liveflow.core.room.mapper.RoomMapper;
+import com.liveflow.core.room.message.RoomEvents;
+import com.liveflow.core.room.message.RoomEvents.Accepted;
+import com.liveflow.core.room.message.RoomEvents.Scope;
+import com.liveflow.core.room.message.RoomEvents.Submission;
+import com.liveflow.core.room.message.RoomHistoryService;
+import com.liveflow.core.room.message.RoomMessageFailure;
+import com.liveflow.core.room.message.RoomMessagePorts.Admission;
+import com.liveflow.infrastructure.message.RoomKafkaRuntime;
 import com.liveflow.infrastructure.auth.AuthSessionRepository;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -71,6 +79,9 @@ class AuthIntegrationTest {
     private static final String ROOM_READ_PATH = "/api/v1/users/me/room";
     private static final byte[] KEY = new SecureRandom().generateSeed(32);
     private static final HttpClient HTTP = HttpClient.newHttpClient();
+    private static final String MESSAGE_TEST_NAMESPACE = "v2-it-" + UUID.randomUUID().toString().substring(0, 8);
+    private static final String STREAMS_TEST_DIRECTORY = java.nio.file.Path.of(
+            System.getProperty("java.io.tmpdir"), "liveflow-room-it-" + UUID.randomUUID()).toString();
 
     @DynamicPropertySource
     static void settings(DynamicPropertyRegistry registry) {
@@ -81,11 +92,17 @@ class AuthIntegrationTest {
         registry.add("liveflow.auth.registration-limit.window-seconds", () -> 600);
         registry.add("liveflow.room-messages.auth-seconds", () -> 2);
         registry.add("liveflow.room-messages.recheck-seconds", () -> 1);
+        registry.add("liveflow.room-messages.v2.kafka-namespace", () -> MESSAGE_TEST_NAMESPACE);
+        registry.add("liveflow.room-messages.v2.environment", () -> MESSAGE_TEST_NAMESPACE);
+        registry.add("liveflow.room-messages.v2.state-directory", () -> STREAMS_TEST_DIRECTORY);
     }
 
     @Autowired JdbcTemplate jdbc;
-    @Autowired StringRedisTemplate redis;
+    @MockitoSpyBean StringRedisTemplate redis;
     @Autowired JsonMapper json;
+    @Autowired Admission admissions;
+    @Autowired RoomHistoryService history;
+    @Autowired RoomKafkaRuntime kafka;
     @MockitoSpyBean AuthSessionRepository sessions;
     @MockitoSpyBean UserProfileService profiles;
     @MockitoSpyBean RoomMapper rooms;
@@ -97,7 +114,14 @@ class AuthIntegrationTest {
     final List<String> registeredNames = new ArrayList<>();
 
     @BeforeEach
-    void createAccount() {
+    void createAccount() throws InterruptedException {
+        long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
+        while ((!kafka.admissionReady() || !kafka.receiptsReady()) && System.nanoTime() < deadline) {
+            Thread.sleep(100);
+        }
+        assertThat(kafka.admissionReady()).as("Kafka Streams 分区已恢复").isTrue();
+        assertThat(kafka.receiptsReady()).as("回执消费组已取得分区").isTrue();
+
         username = "auth_" + UUID.randomUUID().toString().substring(0, 12).replace("-", "");
         password = UUID.randomUUID().toString();
         String hash = new Argon2PasswordEncoder(16, 32, 1, 19456, 2).encode(password);
@@ -762,25 +786,47 @@ class AuthIntegrationTest {
                         start.await(3, TimeUnit.SECONDS);
                         return secondTab.sendPath("POST", path, messageBody(id, "你好"), bearer, true);
                     }));
-            JsonNode receipt = roomResponse(submissions.getFirst().get(), 200);
-            assertThat(roomResponse(submissions.getLast().get(), 200)).isEqualTo(receipt);
-            JsonNode event = sender.next();
-            assertThat(event.get("type").asString()).isEqualTo("message");
+            var responses = List.of(submissions.getFirst().get(), submissions.getLast().get());
+            assertThat(responses).anySatisfy(response -> assertThat(response.statusCode()).isEqualTo(202));
+            for (var response : responses) {
+                if (response.statusCode() != 202) failure(response, 503, "MESSAGE_SUBMISSION_UNKNOWN");
+            }
+            var queuedResponse = responses.stream().filter(response -> response.statusCode() == 202).findFirst().orElseThrow();
+            var queued = roomResponse(queuedResponse, 202);
+            assertThat(queued.get("status").asString()).isEqualTo("queued");
+            assertThat(roomResponse(browser.sendPath("POST", path, messageBody(id, "你好"), bearer, true), 202))
+                    .isEqualTo(queued);
+            String receiptPath = queuedResponse.headers().firstValue("Location").orElseThrow();
+            JsonNode receipt = awaitJson(browser, bearer, receiptPath, result -> "accepted".equals(result.get("status").asString()));
+            JsonNode event = nextMessage(sender);
+            assertThat(event.get("roomSeq").asString()).isEqualTo("1");
             assertThat(event.get("messageId")).isEqualTo(receipt.get("messageId"));
             assertThat(event.get("sentAt")).isEqualTo(receipt.get("sentAt"));
             assertThat(event.get("senderName").asString()).isEqualTo(username);
             assertThat(event.has("userId")).isFalse();
             assertThat(event.get("content").asString()).isEqualTo("你好");
-            assertThat(receiver.next()).isEqualTo(event);
+            assertThat(nextMessage(receiver)).isEqualTo(event);
             failure(browser.sendPath("POST", path, messageBody(id, "已修改"), bearer, true), 409, "MESSAGE_ID_CONFLICT");
-            assertThat(sender.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
-            assertThat(receiver.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
-            assertThat(isolated.frames.poll(250, TimeUnit.MILLISECONDS)).isNull();
+            var otherReceipt = roomResponse(viewer.sendPath("GET", receiptPath, null, viewerBearer, false), 200);
+            assertThat(otherReceipt.get("status").asString()).isEqualTo("unconfirmed");
+            var history = awaitJson(browser, bearer, path + "?afterSeq=0&throughSeq=2",
+                    result -> "1".equals(result.get("storedThrough").asString()));
+            assertThat(history.get("targetThrough").asString()).isEqualTo("2");
+            assertThat(history.get("items").size()).isEqualTo(1);
+            assertThat(history.get("items").get(0).get("messageId")).isEqualTo(event.get("messageId"));
 
             for (int i = 0; i < 4; i++) {
                 roomResponse(secondTab.sendPath("POST", path, messageBody(UUID.randomUUID().toString(), "下一条"),
-                        bearer, true), 200);
+                        bearer, true), 202);
+                assertThat(nextMessage(sender).get("roomSeq").asString()).isEqualTo(Integer.toString(i + 2));
             }
+            var recent = awaitJson(browser, bearer, path + "?limit=2",
+                    result -> "5".equals(result.get("storedThrough").asString()));
+            assertThat(recent.get("items").get(0).get("roomSeq").asString()).isEqualTo("4");
+            var first = roomResponse(browser.sendPath("GET", path + "?limit=2&afterSeq=0&throughSeq=5", null, bearer, false), 200);
+            assertThat(first.get("nextAfterSeq").asString()).isEqualTo("2");
+            var second = roomResponse(browser.sendPath("GET", path + "?limit=2&afterSeq=2&throughSeq=5", null, bearer, false), 200);
+            assertThat(second.get("nextAfterSeq").asString()).isEqualTo("4");
             var limited = browser.sendPath("POST", messagePath(otherRoom, "messages"),
                     messageBody(UUID.randomUUID().toString(), "不同房间"), bearer, true);
             failure(limited, 429, "MESSAGE_RATE_LIMITED");
@@ -814,6 +860,188 @@ class AuthIntegrationTest {
                 assertThat(unavailable.closeCode.get(4, TimeUnit.SECONDS)).isEqualTo(1011);
             }
         }
+    }
+
+    @Test
+    void roomMessageLeaseKeepsItsOriginalDeadlineAndRejectsLateConfirmation() {
+        var scope = new Scope(userId, UUID.randomUUID(), UUID.randomUUID().toString());
+        String clientId = UUID.randomUUID().toString();
+        String hash = RoomEvents.hash("你好");
+        String key = MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:submit:" + scope.sessionId() + ":"
+                + scope.roomId() + ":" + clientId;
+        var old = admissions.claim(scope, clientId, hash, "首次昵称");
+        try {
+            assertThat(redis.getExpire(key)).isBetween(1790L, 1800L);
+            var inFlight = assertThrows(RoomMessageFailure.class, () -> admissions.claim(scope, clientId, hash, "昵称"));
+            assertThat(inFlight.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN);
+            assertThat(inFlight.retryAfterSeconds()).isBetween(1L, 5L);
+            var conflict = assertThrows(RoomMessageFailure.class,
+                    () -> admissions.claim(scope, clientId, RoomEvents.hash("异文"), "昵称"));
+            assertThat(conflict.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_ID_CONFLICT);
+
+            // 加速制造旧租约到期。Redis 的 Lua 仍按真实服务器时间处理新租约。
+            redis.opsForHash().put(key, "leaseUntilMs", "0");
+            var current = admissions.claim(scope, clientId, hash, "后来昵称");
+            assertThat(current.queued()).isEqualTo(old.queued());
+            assertThat(current.leaseId()).isNotEqualTo(old.leaseId());
+            assertThat(current.senderName()).isEqualTo("首次昵称");
+            admissions.markQueued(scope, clientId, old);
+            assertThat(admissions.findQueued(scope, clientId, hash)).isEmpty();
+            redis.opsForHash().put(key, "leaseUntilMs", "0");
+            redis.opsForHash().put(key, "admittedAtMs", Long.toString(Instant.now().minusSeconds(601).toEpochMilli()));
+            var expired = assertThrows(RoomMessageFailure.class, () -> admissions.claim(scope, clientId, hash, "昵称"));
+            assertThat(expired.code()).isEqualTo(RoomMessageFailure.Code.MESSAGE_SUBMISSION_EXPIRED);
+            admissions.markQueued(scope, clientId, current);
+            assertThat(admissions.findQueued(scope, clientId, hash)).isPresent();
+        } finally {
+            redis.delete(key);
+            redis.delete(MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:rate");
+        }
+    }
+
+    @Test
+    void transactionalKafkaReplayReturnsCanonicalMessageAndRebuildsReceipts() throws Exception {
+        var browser = new Browser();
+        JsonNode login = browser.login();
+        String bearer = access(login);
+        String room = createRoomFor(browser, bearer);
+        UUID session = UUID.fromString(login.get("sessionId").asString());
+        String user = Long.toString(userId);
+        String client = UUID.randomUUID().toString();
+        String recent = RoomEvents.UTC_MILLIS.format(Instant.now());
+        String overdue = RoomEvents.UTC_MILLIS.format(Instant.now().minusSeconds(721));
+        String messages = messagePath(room, "messages");
+        var first = new Submission(1, UUID.randomUUID(), room, user, session, client, "首条",
+                RoomEvents.hash("首条"), username, recent);
+        var repeat = new Submission(1, UUID.randomUUID(), room, user, session, client, "首条",
+                first.contentHash(), "其他昵称", recent);
+        var changed = new Submission(1, UUID.randomUUID(), room, user, session, client, "异文",
+                RoomEvents.hash("异文"), username, recent);
+        var expired = new Submission(1, UUID.randomUUID(), room, user, session, UUID.randomUUID().toString(),
+                "超期", RoomEvents.hash("超期"), username, overdue);
+        for (var record : List.of(first, first, repeat, changed, expired)) {
+            kafka.publish(record).get(5, TimeUnit.SECONDS);
+        }
+
+        String prefix = messages + "/submissions/";
+        var accepted = awaitJson(browser, bearer, prefix + first.submissionId(),
+                value -> value.get("status").asString().equals("accepted"));
+        var replay = awaitJson(browser, bearer, prefix + repeat.submissionId(),
+                value -> value.get("status").asString().equals("accepted"));
+        assertThat(replay.get("messageId")).isEqualTo(accepted.get("messageId"));
+        assertThat(replay.get("roomSeq").asString()).isEqualTo("1");
+        assertThat(replay.get("sentAt")).isEqualTo(accepted.get("sentAt"));
+        var conflict = awaitJson(browser, bearer, prefix + changed.submissionId(),
+                value -> "rejected".equals(value.get("status").asString()));
+        assertThat(conflict.get("code").asString()).isEqualTo("MESSAGE_ID_CONFLICT");
+        var rejection = awaitJson(browser, bearer, prefix + expired.submissionId(),
+                value -> "rejected".equals(value.get("status").asString()));
+        assertThat(rejection.get("code").asString()).isEqualTo("MESSAGE_SUBMISSION_EXPIRED");
+
+        var latest = awaitJson(browser, bearer, messages, value -> value.get("storedThrough").asString().equals("1"));
+        assertThat(latest.get("items").size()).isOne();
+        assertThat(latest.get("items").get(0).get("senderName").asString()).isEqualTo(username);
+
+        String receiptKey = MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:{" + userId + "}:receipt:" + session + ":" + room + ":"
+                + first.submissionId();
+        redis.delete(receiptKey);
+        redis.delete(MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:receipt-projection:" + MESSAGE_TEST_NAMESPACE);
+        kafka.restoreReceipts();
+        assertThat(awaitJson(browser, bearer, prefix + first.submissionId(),
+                value -> value.get("status").asString().equals("accepted"))).isEqualTo(accepted);
+        assertThat(redis.getExpire(receiptKey)).isBetween(1740L, 1800L);
+
+        String wrongRoom = messagePath(UUID.randomUUID().toString(), "messages/submissions/" + first.submissionId());
+        assertThat(roomResponse(browser.sendPath("GET", wrongRoom, null, bearer, false), 200)
+                .get("status").asString()).isEqualTo("unconfirmed");
+        var newBrowser = new Browser();
+        String replacement = access(newBrowser.login());
+        assertThat(roomResponse(newBrowser.sendPath("GET", prefix + first.submissionId(), null, replacement, false), 200)
+                .get("status").asString()).isEqualTo("unconfirmed");
+    }
+
+    @Test
+    void roomHistoryReplaysTrimsAndRejectsConflictingSequences() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        String path = messagePath(room, "messages");
+        var empty = roomResponse(browser.sendPath("GET", path, null, bearer, false), 200);
+        assertThat(empty.get("storedThrough").asString()).isEqualTo("0");
+        assertThat(empty.get("items").size()).isZero();
+        for (String query : List.of("?limit=0", "?afterSeq=01", "?throughSeq=1", "?limit=1&limit=2", "?other=a",
+                "?afterSeq=9223372036854775807", "?afterSeq=5&throughSeq=2")) {
+            failure(browser.sendPath("GET", path + query, null, bearer, false), 400, "INVALID_REQUEST");
+        }
+        String timestamp = RoomEvents.UTC_MILLIS.format(Instant.now());
+        var one = new Accepted(1, room, "1", UUID.randomUUID(), Long.toString(userId), username, "甲", timestamp);
+        var two = new Accepted(1, room, "2", UUID.randomUUID(), Long.toString(userId), username, "乙", timestamp);
+        history.append(List.of(one, two));
+        history.append(List.of(one, two));
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM room_messages WHERE room_id = ?", Integer.class, room))
+                .isEqualTo(2);
+        jdbc.update("UPDATE room_messages SET stored_at = UTC_TIMESTAMP(3) - INTERVAL 25 HOUR WHERE room_id = ? AND room_seq = 1", room);
+        history.clean();
+        history.append(List.of(one)); // 过期事件重放不能令已清理的前缀复活。
+        var gap = browser.sendPath("GET", path + "?afterSeq=0", null, bearer, false);
+        failure(gap, 409, "ROOM_HISTORY_GAP");
+        var metadata = json.readTree(gap.body());
+        assertThat(metadata.get("earliestSeq").asString()).isEqualTo("2");
+        assertThat(metadata.get("storedThrough").asString()).isEqualTo("2");
+        var fork = new Accepted(1, room, "2", UUID.randomUUID(), two.userId(), username, "冲突", timestamp);
+        assertThrows(IllegalStateException.class, () -> history.append(List.of(fork)));
+        failure(browser.sendPath("GET", path, null, bearer, false), 503, "ROOM_MESSAGES_UNAVAILABLE");
+        assertThat(jdbc.queryForObject("SELECT content FROM room_messages WHERE room_id = ? AND room_seq = 2",
+                String.class, room)).isEqualTo("乙");
+    }
+
+    @Test
+    void retriesUnconfirmedRedisPublishWithTheSameMessageAndKeepsOtherRoomsIndependent() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        String channel = MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:" + room + ":messages:v1";
+        var publishCount = new java.util.concurrent.atomic.AtomicInteger();
+
+        try (var socket = readyRoom(browser, bearer, room)) {
+            doAnswer(invocation -> {
+                // Redis 已实际发布。本地只丢失调用结果，消费者不能提交该批进度。
+                Object receivers = invocation.callRealMethod();
+                if (publishCount.incrementAndGet() == 1) {
+                    throw new org.springframework.dao.DataAccessResourceFailureException("模拟发布结果丢失");
+                }
+                return receivers;
+            }).when(redis).convertAndSend(eq(channel), anyString());
+
+            var submitted = browser.sendPath("POST", messagePath(room, "messages"),
+                    messageBody(UUID.randomUUID().toString(), "同一正式弹幕"), bearer, true);
+            assertThat(submitted.statusCode()).isEqualTo(202);
+            var first = nextMessage(socket);
+            assertThat(nextMessage(socket)).isEqualTo(first);
+            assertThat(publishCount.get()).isEqualTo(2);
+            var stored = awaitJson(browser, bearer, messagePath(room, "messages"),
+                    page -> "1".equals(page.get("storedThrough").asString()));
+            assertThat(stored.get("items").size()).isOne();
+        }
+    }
+
+    private JsonNode awaitJson(Browser browser, String access, String path,
+            java.util.function.Predicate<JsonNode> condition) throws Exception {
+        long until = System.nanoTime() + Duration.ofSeconds(6).toNanos();
+        do {
+            var value = roomResponse(browser.sendPath("GET", path, null, access, false), 200);
+            if (condition.test(value)) return value;
+            Thread.sleep(75);
+        } while (System.nanoTime() < until);
+        throw new AssertionError("投影在等待期限内未到达");
+    }
+
+    private JsonNode nextMessage(SocketClient client) throws Exception {
+        for (int i = 0; i < 8; i++) {
+            JsonNode frame = client.next();
+            if ("message".equals(frame.get("type").asString())) return frame;
+        }
+        throw new AssertionError("没有收到消息帧");
     }
 
     private static String messagePath(String roomId, String action) {

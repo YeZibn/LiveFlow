@@ -7,7 +7,8 @@ const props = defineProps<{
   withAccess: <T>(call: (access: string) => Promise<T>) => Promise<T>
 }>()
 
-const { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send } =
+const { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
+  syncing, syncFeedback, pendingAction, checkingReceipt, submitPending, checkReceipt, clearPending } =
   useRoomMessages(props.roomId, props.withAccess)
 const log = ref<HTMLElement>()
 const hasNewMessages = ref(false)
@@ -80,6 +81,9 @@ function handleEnter(event: KeyboardEvent) {
         </p>
       </div>
       <p v-if="connectionError" class="feedback" role="status">{{ connectionError }}</p>
+      <p v-else-if="syncing || syncFeedback" class="feedback" role="status">
+        {{ syncing ? '正在同步弹幕…' : syncFeedback }}
+      </p>
       <button v-if="state === 'offline' || state === 'reconnecting'" class="ui-button reconnect"
         type="button" @click="reconnect">重连</button>
     </header>
@@ -102,12 +106,19 @@ function handleEnter(event: KeyboardEvent) {
     <footer class="composer">
       <form class="compose-form" :aria-busy="submitting" @submit.prevent="send">
         <input v-model="content" class="ui-input" aria-label="弹幕内容" placeholder="发送一条弹幕"
-          :disabled="state !== 'ready' || submitting" autocomplete="off" @keydown.enter="handleEnter" />
+          :disabled="state !== 'ready'" autocomplete="off" @keydown.enter="handleEnter" />
         <button class="ui-button ui-button--primary" type="submit" :disabled="!canSend">
           {{ submitting ? '发送中…' : '发送' }}
         </button>
       </form>
       <p v-if="feedback" class="feedback" :class="{ failure: failed }" :role="failed ? 'alert' : 'status'">{{ feedback }}</p>
+      <div v-if="pendingAction !== 'none'" class="submission-actions">
+        <button v-if="pendingAction === 'retry'" type="button" class="ui-button reconnect"
+          :disabled="state !== 'ready' || submitting" @click="submitPending">重试原弹幕</button>
+        <button v-else type="button" class="ui-button reconnect" :disabled="checkingReceipt"
+          @click="() => checkReceipt()">查询回执</button>
+        <button type="button" class="ui-button reconnect" @click="clearPending">发送新内容</button>
+      </div>
     </footer>
   </section>
 </template>
@@ -163,6 +174,7 @@ h2 { margin: 0; font-size: 1rem; }
 .compose-form .ui-button { flex-shrink: 0; }
 .feedback { margin: 0; color: var(--muted); font-size: 0.78rem; }
 .feedback.failure { color: var(--danger); }
+.submission-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
 
 @media (max-width: 50rem) {
   .room-messages { height: min(29rem, max(22rem, 60svh)); }

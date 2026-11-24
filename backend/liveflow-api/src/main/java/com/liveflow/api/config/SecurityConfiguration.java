@@ -3,6 +3,7 @@ package com.liveflow.api.config;
 import com.liveflow.core.auth.session.AuthSessionStore;
 import com.liveflow.api.auth.security.AuthSecurityErrors;
 import com.liveflow.core.auth.service.AccessTokenService;
+import jakarta.servlet.DispatcherType;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.boot.security.autoconfigure.actuate.web.servlet.EndpointRequest;
@@ -18,6 +19,9 @@ import org.springframework.security.oauth2.server.resource.authentication.JwtAut
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
 import org.springframework.security.web.csrf.CsrfFilter;
+import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
+import org.springframework.security.web.util.matcher.AndRequestMatcher;
+import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatcher;
 
 /**
  * 定义 LiveFlow 的 HTTP 请求授权规则。
@@ -76,9 +80,15 @@ class SecurityConfiguration {
                         })))
                 .authorizeHttpRequests(authorize -> {
                     // 按 Actuator 端点 ID 匹配，管理端点的基础路径调整后仍能识别健康检查。
+                    // 入口已完成 Bearer、会话与 CSRF 校验，仅放行该 POST 的内部响应重派发。
+                    authorize.requestMatchers(new AndRequestMatcher(new DispatcherTypeRequestMatcher(DispatcherType.ASYNC),
+                            PathPatternRequestMatcher.withDefaults().matcher(HttpMethod.POST,
+                                    "/api/v1/rooms/{roomId}/messages"))).permitAll();
                     authorize.requestMatchers(EndpointRequest.to("health")).permitAll();
                     if (environment.matchesProfiles("local")) {
                         authorize.requestMatchers("/ws/smoke").permitAll();
+                        // 指标需在本地 profile 下另外显式暴露，供压测和开发排查读取。
+                        authorize.requestMatchers(EndpointRequest.to("metrics")).permitAll();
                     }
                     authorize.requestMatchers(HttpMethod.GET, "/api/v1/auth/csrf").permitAll()
                             .requestMatchers(HttpMethod.POST, "/api/v1/auth/register", "/api/v1/auth/login", "/api/v1/auth/refresh",
@@ -87,7 +97,9 @@ class SecurityConfiguration {
                             .requestMatchers(HttpMethod.GET, "/api/v1/users/me/profile").authenticated()
                             .requestMatchers(HttpMethod.PUT, "/api/v1/users/me/profile").authenticated()
                             .requestMatchers(HttpMethod.GET, "/api/v1/users/me/room").authenticated()
-                            .requestMatchers(HttpMethod.GET, "/api/v1/rooms", "/api/v1/rooms/{roomId}").authenticated()
+                            .requestMatchers(HttpMethod.GET, "/api/v1/rooms", "/api/v1/rooms/{roomId}",
+                                    "/api/v1/rooms/{roomId}/messages",
+                                    "/api/v1/rooms/{roomId}/messages/submissions/{submissionId}").authenticated()
                             .requestMatchers(HttpMethod.POST, "/api/v1/rooms", "/api/v1/rooms/{roomId}/ws-ticket",
                                     "/api/v1/rooms/{roomId}/messages").authenticated()
                             // HTTP 升级后先等待一次性票据，验票前连接不属于任何房间。

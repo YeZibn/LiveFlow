@@ -7,6 +7,8 @@ public final class RoomMessageFailure extends RuntimeException {
         ROOM_NOT_FOUND("房间不存在"),
         TICKET_INVALID("连接票据无效或已过期"),
         MESSAGE_ID_CONFLICT("该提交标识已用于另一条消息"),
+        MESSAGE_SUBMISSION_EXPIRED("该提交已超过重试期限"),
+        MESSAGE_SUBMISSION_UNKNOWN("暂时无法确认提交结果，请沿用原消息重试"),
         MESSAGE_RATE_LIMITED("发送过快，请稍后再试"),
         ROOM_MESSAGES_UNAVAILABLE("弹幕服务暂不可用")
         ;

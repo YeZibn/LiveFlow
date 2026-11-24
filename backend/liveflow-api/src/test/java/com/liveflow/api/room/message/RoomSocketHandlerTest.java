@@ -1,7 +1,12 @@
 package com.liveflow.api.room.message;
 
 import com.liveflow.core.auth.session.AuthSessionStore;
+import com.liveflow.core.room.message.RoomEvents;
+import com.liveflow.core.room.message.RoomHistoryService;
 import com.liveflow.core.room.message.RoomMessageBroadcast;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import com.liveflow.core.room.message.RoomTicketService;
 import com.liveflow.core.room.message.RoomTicketStore.Binding;
 import java.time.Instant;
@@ -30,7 +35,17 @@ class RoomSocketHandlerTest {
         when(ticketService.redeem("slow")).thenReturn(new Binding(1, UUID.randomUUID(), roomId));
         when(ticketService.redeem("fast")).thenReturn(new Binding(2, UUID.randomUUID(), roomId));
         JsonMapper json = JsonMapper.builder().build();
-        var handler = new RoomSocketHandler(ticketService, mock(AuthSessionStore.class), json, 8, 4, 2, 5, 15, 5000);
+        var callback = new AtomicReference<Consumer<RoomEvents.Message>>();
+        var subscribed = new AtomicReference<Runnable>();
+        var registered = new CountDownLatch(1);
+        RoomMessageBroadcast broadcast = (id, events, ready, disconnected) -> {
+            callback.set(events);
+            subscribed.set(ready);
+            registered.countDown();
+            return () -> {};
+        };
+        var handler = new RoomSocketHandler(ticketService, mock(AuthSessionStore.class), broadcast,
+                mock(RoomHistoryService.class), new SimpleMeterRegistry(), json, 8, 4, 2, 5, 15, 5000);
         var slow = mock(WebSocketSession.class);
         when(slow.getId()).thenReturn("slow");
         when(slow.isOpen()).thenReturn(true);
@@ -67,11 +82,15 @@ class RoomSocketHandlerTest {
             handler.afterConnectionEstablished(fast);
             handler.handleMessage(slow, new TextMessage("{\"type\":\"auth\",\"ticket\":\"slow\"}"));
             handler.handleMessage(fast, new TextMessage("{\"type\":\"auth\",\"ticket\":\"fast\"}"));
+            assertThat(registered.await(2, TimeUnit.SECONDS)).isTrue();
+            assertThat(fastEvents.poll(100, TimeUnit.MILLISECONDS)).isNull();
+            subscribed.get().run();
             assertThat(slowReady.await(2, TimeUnit.SECONDS)).isTrue();
             assertThat(fastEvents.poll(2, TimeUnit.SECONDS)).isEqualTo("ready");
+            int sequence = 0;
             for (String text : new String[] {"甲", "乙", "丙", "丁"}) {
-                handler.enqueue(new RoomMessageBroadcast.Message(roomId, UUID.randomUUID().toString(), "观众", text,
-                        Instant.now()));
+                callback.get().accept(new RoomEvents.Message(Integer.toString(++sequence), UUID.randomUUID(),
+                        "观众", text, RoomEvents.UTC_MILLIS.format(Instant.now())));
                 assertThat(fastEvents.poll(2, TimeUnit.SECONDS)).isEqualTo(text);
                 if (text.equals("甲")) {
                     assertThat(slowWrite.await(2, TimeUnit.SECONDS)).isTrue();
