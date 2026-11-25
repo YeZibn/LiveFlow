@@ -12,7 +12,10 @@ import com.liveflow.core.room.message.RoomHistoryService;
 import com.liveflow.core.room.message.RoomHistoryService.HistoryRecord;
 import com.liveflow.core.room.message.RoomMessageFailure;
 import com.liveflow.core.room.message.RoomMessagePorts.Admission;
-import com.liveflow.infrastructure.message.RoomKafkaRuntime;
+import com.liveflow.infrastructure.message.RoomKafkaConsumerGroupRuntime;
+import com.liveflow.infrastructure.message.RoomKafkaMaintenanceScheduler;
+import com.liveflow.infrastructure.message.RoomKafkaProducer;
+import com.liveflow.infrastructure.message.RoomKafkaStreamsRuntime;
 import com.liveflow.infrastructure.auth.AuthSessionRepository;
 import java.net.URI;
 import java.net.URLEncoder;
@@ -115,7 +118,10 @@ class AuthIntegrationTest {
     @MockitoSpyBean RoomHistoryService history;
     @Autowired KafkaAdmin kafkaAdmin;
     @Autowired RoomSocketHandler sockets;
-    @MockitoSpyBean RoomKafkaRuntime kafka;
+    @MockitoSpyBean RoomKafkaProducer producer;
+    @Autowired RoomKafkaStreamsRuntime streams;
+    @Autowired RoomKafkaConsumerGroupRuntime consumerGroups;
+    @Autowired RoomKafkaMaintenanceScheduler maintenance;
     @MockitoSpyBean AuthSessionRepository sessions;
     @MockitoSpyBean UserProfileService profiles;
     @MockitoSpyBean RoomMapper rooms;
@@ -129,11 +135,11 @@ class AuthIntegrationTest {
     @BeforeEach
     void createAccount() throws InterruptedException {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
-        while ((!kafka.admissionReady() || !kafka.receiptsReady()) && System.nanoTime() < deadline) {
+        while ((!streams.admissionReady() || !consumerGroups.receiptsReady()) && System.nanoTime() < deadline) {
             Thread.sleep(100);
         }
-        assertThat(kafka.admissionReady()).as("Kafka Streams 分区已恢复").isTrue();
-        assertThat(kafka.receiptsReady()).as("回执消费组已取得分区").isTrue();
+        assertThat(streams.admissionReady()).as("Kafka Streams 分区已恢复").isTrue();
+        assertThat(consumerGroups.receiptsReady()).as("回执消费组已取得分区").isTrue();
 
         username = "auth_" + UUID.randomUUID().toString().substring(0, 12).replace("-", "");
         password = UUID.randomUUID().toString();
@@ -1089,7 +1095,7 @@ class AuthIntegrationTest {
                         new RoomMessageFailure(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN)));
             }
             return sent;
-        }).when(kafka).publish(org.mockito.ArgumentMatchers.argThat(
+        }).when(producer).publish(org.mockito.ArgumentMatchers.argThat(
                 event -> event != null && id.equals(event.clientMessageId())));
 
         var unknown = browser.sendPath("POST", endpoint, messageBody(id, "原弹幕"), bearer, true);
@@ -1140,7 +1146,7 @@ class AuthIntegrationTest {
         var expired = new Submission(1, UUID.randomUUID(), room, user, session, UUID.randomUUID().toString(),
                 "超期", RoomEvents.hash("超期"), username, overdue);
         for (var record : List.of(first, first, repeat, changed, expired)) {
-            kafka.publish(record).get(5, TimeUnit.SECONDS);
+            producer.publish(record).get(5, TimeUnit.SECONDS);
         }
 
         String prefix = messages + "/submissions/";
@@ -1166,7 +1172,7 @@ class AuthIntegrationTest {
                 + first.submissionId();
         redis.delete(receiptKey);
         redis.delete(MESSAGE_TEST_NAMESPACE + ":liveflow:rooms:message:receipt-projection:" + MESSAGE_TEST_NAMESPACE);
-        kafka.restoreReceipts();
+        maintenance.restoreReceipts();
         assertThat(awaitJson(browser, bearer, prefix + first.submissionId(),
                 value -> value.get("status").asString().equals("accepted"))).isEqualTo(accepted);
         assertThat(redis.getExpire(receiptKey)).isBetween(1740L, 1800L);

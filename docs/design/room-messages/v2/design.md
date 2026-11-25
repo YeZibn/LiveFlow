@@ -8,7 +8,7 @@ V1 在 JVM 内完成弹幕受理、短期去重和本机广播。V2 由 Kafka �
 
 三份相同的 Spring Boot 应用使用同源代理与共享 Kafka、Redis、MySQL。每份应用运行 MVC、WebSocket、Kafka Producer、Streams 和各消费组。接入和后台独立部署、Kafka 分区扩展、Redis Cluster、MySQL 历史分库分表留待后续阶段。
 
-当前历史实现要求序号连续。遇到房间 A 的历史缺口或冲突时，消费会暂停 A 所在分区。映射到同一分区的房间 B 可能继续返回历史页，但失去新落库记录。本轮将序号用于排序和识别消息，允许可用记录先入库、先展示，迟到时补入。可判定的冲突仅影响本条历史写入。 [现有历史服务](../../../../backend/liveflow-core/src/main/java/com/liveflow/core/room/message/RoomHistoryService.java) · [历史写入规则](database.md#历史写入和水位)
+历史写入允许缺号和迟到补写。可判定的冲突只跳过单条，后续有效消息继续落库。同房间弹幕按序号排序，页面在实时消息到达后即可展示，并通过最近历史窗口补入迟到项。 [历史写入规则](database.md#历史写入和水位)
 
 ## 整体设计
 
@@ -51,6 +51,30 @@ flowchart LR
 本机负责的分区数量只用于后台分工。新提交由目标分区状态及生产确认决定，回执由共享 Redis 决定，历史由已提交的 MySQL 快照及受影响范围的阻断记录决定。实例间共享短期运行状态与持久故障记录，供接入判断和接管恢复使用。 [Redis 运行状态](storage.md#三实例运行状态与定时任务) · [持久阻断记录](database.md#处理阻断记录)
 
 Ticket 签发、WebSocket 兑票、发送和历史共用房间模块的存在性判断。缓存启用后，这些入口可以跨实例复用同一房间的查库结果。历史仍在 MySQL 快照内检查持久阻断并读取水位和消息页，回执按当前会话作用域直接查询业务 Redis。 [房间存在性缓存](../../room/storage.md) · [调用契约](api.md#房间存在性判定)
+
+### Kafka 运行时拆分
+
+拆分前，`RoomKafkaRuntime` 同时实现发送端口与 `SmartLifecycle`，持有生产者、Streams、三个消费组和维护任务。拆分后，`liveflow-infrastructure` 的弹幕包按下表组织，每个客户端由一个组件创建和关闭，各实例运行同一套组件。Kafka 多 Broker 与副本扩容作为后续阶段。 [生命周期协调器](../../../../backend/liveflow-infrastructure/src/main/java/com/liveflow/infrastructure/message/RoomKafkaRuntime.java)
+
+| 组件 | 职责与依赖 |
+| --- | --- |
+| `RoomKafkaProducer` | 实现 `RoomMessagePorts.Producer` 的 `requireAdmission(roomId)` 和 `publish(submission)`。使用 `RoomAdmissionStatus` 检查目标分区，持有生产客户端、在途名额以及入队指标。Broker 确认完成后才完成成功结果。同步异常与异步回调通过同一完成信号归还名额，HTTP 等待超时不提前归还。 |
+| `RoomKafkaStreamsRuntime` | 管理 `KafkaStreams`、`RoomAdmissionProbe`、实例状态目录和正式接收指标。通过 `RoomAdmissionStatus` 对外发布本机分区采样和退出状态。采样失败沿用现有快照新鲜度规则，任务异常沿用现有退出与接管策略。 |
+| `RoomKafkaConsumerGroupRuntime` | 管理广播、历史、回执三个正式消费组。复用 `RoomKafkaConsumer` 的拉取、位点确认、暂停和退避机制。各组按自身职责确认 Redis 发布、MySQL 历史事务或 Redis 回执投影，保留各自的指标和阻断范围。 |
+| `RoomKafkaMaintenanceScheduler` | 独立调度回执重建与历史清理，沿用各自的 Redis 租约。回执重建使用临时消费者和本轮捕获的分区末尾，完成时由租约持有者写恢复标记。正式回执组继续推进自己的位点。历史清理继续由 `RoomHistoryService` 分批处理。 |
+| `RoomKafkaRuntime` | 保留为唯一的 Kafka 生命周期协调器。使用既有 `RoomMessageTopology` 创建或校验业务 Topic，并统一管理组件启停及部分启动失败后的清理。 |
+
+发送服务继续经现有业务端口调用 Producer。分区准入检查在新预约之前执行。本机停写与后台运行分别受控，停写期间后台仍可处理已入队提交。历史组在数据库事务成功后提交消费位点，事务结果不明时按原位置恢复。维护任务按批确认租约和停止状态，临时客户端由本次任务关闭。 [生产和确认](event-contract.md#生产和确认) · [消费确认规则](event-contract.md#三个输出消费组) · [维护租约](storage.md#三实例运行状态与定时任务)
+
+| 范围 | 本轮影响 |
+| --- | --- |
+| 对外接口 | 沿用 MVC、WebSocket 和 Vue 契约。接口路径、字段、错误码、发送状态和恢复行为均按现有定义。 [接口设计](api.md) |
+| MySQL | 沿用 `room_messages`、`room_message_history_state` 与 `room_message_processing_blocks`。拆分只调整调用归属，部署无需 DDL、Flyway 迁移或回填。 [数据库设计](database.md) |
+| Redis | 沿用广播频道、回执、分区准入状态和维护租约的 Key、TTL 与 Lua 操作。 [Redis 设计](storage.md) |
+| Kafka | 沿用业务 Topic、6 个分区、事件结构、消费组、Streams 应用 ID、状态存储、已提交位点及副本配置。 [消息队列设计](event-contract.md) |
+| 配置与指标 | 沿用现有配置项、默认值、指标名称和标签。指标由对应职责组件注册一次。 [运行参数](deployment-and-operations.md#初始参数) |
+
+启动、停机和新版三实例检查见部署文档。 [Kafka 运行时拆分切换](deployment-and-operations.md#kafka-运行时拆分切换)
 
 ## 端到端流程
 

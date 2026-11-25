@@ -34,7 +34,7 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 - [直播间 V1](docs/design/room/design.md) 定义一人一房、统一列表与名称搜索、UUID 进入、观看页布局，以及对应的 HTTP 接口和数据库索引。
 - [房间存在性缓存方案](docs/design/room/design.md#房间存在性缓存) 定义三实例共享回填、创建后预热和 MySQL 回源保护。
 - [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、短期去重，以及显示发送者和秒级本地时间的弹幕列表。
-- [直播间弹幕 V2](docs/design/room-messages/v2/design.md) 定义 Kafka 异步受理、Redis 房间广播、MySQL 历史和发送回执，并记录缺号继续展示、迟到补入、单条冲突跳过的历史容错方案。
+- [直播间弹幕 V2](docs/design/room-messages/v2/design.md) 定义 Kafka 异步受理、Redis 房间广播、MySQL 历史和发送回执，包含历史容错及 Kafka 运行时拆分设计。
 - [LiveFlow 三实例部署方案](docs/design/room-messages/v2/deployment-and-operations.md#三实例部署) 定义对等实例、分区接管、连接排空和滚动发布。本地启动仍使用下方现行流程。
 - [单实例限流与弹幕发送熔断设计](docs/design/resilience/design.md) 定义认证限流、弹幕账号 10 秒冷却，以及 Resilience4j 发送熔断和单次提交的目标行为。
 
