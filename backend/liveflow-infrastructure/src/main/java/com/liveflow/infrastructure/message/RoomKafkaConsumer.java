@@ -1,7 +1,6 @@
 package com.liveflow.infrastructure.message;
 
 import java.time.Duration;
-import com.liveflow.core.room.message.RoomHistoryService.Conflict;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
@@ -170,8 +169,6 @@ final class RoomKafkaConsumer implements AutoCloseable {
             lagAge.get(partition.partition()).set(0);
         } catch (WakeupException shutdown) {
             throw shutdown;
-        } catch (Conflict failure) {
-            pause(partition);
         } catch (InvalidEvent failure) {
             recordBlock(partition, new Fault("PROCESSING_ERROR", failure.offset));
         } catch (RuntimeException failure) {

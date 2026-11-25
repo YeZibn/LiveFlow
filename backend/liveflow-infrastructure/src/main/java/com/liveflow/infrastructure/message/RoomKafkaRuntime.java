@@ -2,6 +2,7 @@ package com.liveflow.infrastructure.message;
 
 import com.liveflow.core.room.message.RoomEvents.Submission;
 import com.liveflow.core.room.message.RoomHistoryService;
+import com.liveflow.core.room.message.RoomHistoryService.HistoryRecord;
 import com.liveflow.core.room.message.RoomMessageFailure;
 import com.liveflow.core.room.message.RoomMessagePorts.Producer;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -89,7 +90,7 @@ public final class RoomKafkaRuntime implements Producer, SmartLifecycle {
 
     /**
      * @param kafka Kafka 连接配置入口
-     * @param history MySQL 连续历史写入
+     * @param history MySQL 历史批量写入与过期清理
      * @param state Redis 回执存储及频道规则
      * @param redis 频道发布与回执恢复标记
      * @param json 弹幕事件序列化
@@ -299,10 +300,22 @@ public final class RoomKafkaRuntime implements Producer, SmartLifecycle {
                 }
             }));
             consumers.add(new RoomKafkaConsumer(consumerBase, group("history"), "history", topic("accepted"), PARTITIONS, metrics, blocks, records -> {
-                var events = records.stream().map(record -> decode(record, codec::accepted)).toList();
-                history.append(events, records.getFirst().offset());
+                var events = records.stream()
+                        .map(record -> new HistoryRecord(decode(record, codec::accepted), record.offset())).toList();
+                var result = history.append(events);
+                var first = records.getFirst();
+                for (var conflict : result.conflicts()) {
+                    String kind = conflict.sequenceMatch() == null ? "message_id"
+                            : conflict.messageIdMatch() == null ? "room_sequence" : "both";
+                    var event = conflict.record().event();
+                    metrics.counter("liveflow.room.messages.history.conflicts", "kind", kind).increment();
+                    LOG.warn("跳过弹幕历史冲突 group={} topic={} partition={} offset={} room={} sequence={} "
+                                    + "incomingMessageId={} sequenceMatch={} messageIdMatch={}",
+                            group("history"), first.topic(), first.partition(), conflict.record().offset(), event.roomId(),
+                            event.roomSeq(), event.messageId(), conflict.sequenceMatch(), conflict.messageIdMatch());
+                }
                 Instant now = Instant.now();
-                events.forEach(event -> storage.record(Duration.between(Instant.parse(event.sentAt()), now).abs()));
+                result.inserted().forEach(event -> storage.record(Duration.between(Instant.parse(event.sentAt()), now).abs()));
             }));
             receiptConsumer = new RoomKafkaConsumer(consumerBase, group("receipt"), "receipt", topic("receipts"), PARTITIONS, metrics, blocks, records -> {
                 for (var record : records) state.project(decode(record, codec::receipt));
@@ -340,7 +353,7 @@ public final class RoomKafkaRuntime implements Producer, SmartLifecycle {
         }
     }
 
-    /** 按共享租约清理过期历史，各实例仍独立通知自己的水位。 */
+    /** 按共享租约清理过期历史，各实例独立通知本机连接的历史进度。 */
     @Scheduled(fixedDelayString = "${liveflow.room-messages.v2.history-cleanup-millis:30000}")
     public void cleanHistory() {
         if (!running) return;

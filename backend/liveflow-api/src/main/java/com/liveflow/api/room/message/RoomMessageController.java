@@ -161,11 +161,11 @@ public class RoomMessageController {
     }
 
     /**
+     * 读取最近窗口或指定序号范围内仍在保留期的消息。
      * @param roomId 已认证客户端读取的房间
      * @param query 分页参数，每个名称只允许出现一次
-     * @return 最近窗口或固定目标的连续历史页
+     * @return 包含最大落库序号、实际读取上限及分页游标的不可缓存历史页
      * @throws RoomMessageFailure 参数不合法或历史不可用
-     * @throws RoomHistoryService.Gap 客户端的历史前缀已清理
      */
     @GetMapping("/messages")
     public ResponseEntity<RoomHistoryService.Page> history(@PathVariable("roomId") String roomId,
@@ -180,13 +180,6 @@ public class RoomMessageController {
         if (after != null) catchups.increment();
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(history.page(roomId, limit == null ? 100 : limit.intValue(), after, through));
-    }
-
-    @ExceptionHandler(RoomHistoryService.Gap.class)
-    ResponseEntity<Map<String, String>> historyGap(RoomHistoryService.Gap gap) {
-        return ResponseEntity.status(HttpStatus.CONFLICT).cacheControl(CacheControl.noStore()).body(Map.of(
-                "code", "ROOM_HISTORY_GAP", "message", "所需弹幕已超出历史保留范围",
-                "earliestSeq", Long.toString(gap.earliest), "storedThrough", Long.toString(gap.stored)));
     }
 
     private static RoomMessageFailure invalid() {

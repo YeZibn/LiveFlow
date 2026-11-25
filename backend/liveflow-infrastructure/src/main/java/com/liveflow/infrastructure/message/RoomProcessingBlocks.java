@@ -44,7 +44,7 @@ class RoomProcessingBlocks implements RoomHistoryProtection {
 
     /** @param group 职责组
      * @param topic 事件主题
-     * @return 该职责下所有需要暂停的分区，包括含房间级冲突的分区
+     * @return 该职责下所有需要暂停的分区，包括切换时尚未处置的旧历史冲突分区
      */
     Set<Integer> partitions(String group, String topic) {
         return Set.copyOf(jdbc.queryForList("""
@@ -81,12 +81,4 @@ class RoomProcessingBlocks implements RoomHistoryProtection {
         }, topology.group("history"), topology.topic("accepted"));
     }
 
-    /** @param roomId 发生历史冲突的房间
-     * @param offset 未确认的批次起点
-     */
-    @Override
-    public void recordConflict(String roomId, Long offset) {
-        record(topology.group("history"), topology.topic("accepted"), RoomMessageTopology.partition(roomId),
-                roomId, "HISTORY_SEQUENCE_CONFLICT", offset);
-    }
 }

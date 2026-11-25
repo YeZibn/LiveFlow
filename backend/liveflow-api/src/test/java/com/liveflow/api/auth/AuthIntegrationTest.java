@@ -1,5 +1,6 @@
 package com.liveflow.api.auth;
 
+import com.liveflow.api.room.message.RoomSocketHandler;
 import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.profile.service.UserProfileService;
 import com.liveflow.core.room.mapper.RoomMapper;
@@ -8,6 +9,7 @@ import com.liveflow.core.room.message.RoomEvents.Accepted;
 import com.liveflow.core.room.message.RoomEvents.Scope;
 import com.liveflow.core.room.message.RoomEvents.Submission;
 import com.liveflow.core.room.message.RoomHistoryService;
+import com.liveflow.core.room.message.RoomHistoryService.HistoryRecord;
 import com.liveflow.core.room.message.RoomMessageFailure;
 import com.liveflow.core.room.message.RoomMessagePorts.Admission;
 import com.liveflow.infrastructure.message.RoomKafkaRuntime;
@@ -38,6 +40,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import javax.crypto.spec.SecretKeySpec;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.common.utils.Utils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -48,6 +56,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.KafkaAdmin;
 import org.springframework.security.crypto.argon2.Argon2PasswordEncoder;
 import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
 import org.springframework.security.oauth2.jwt.JwsHeader;
@@ -63,6 +72,7 @@ import tools.jackson.databind.json.JsonMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -102,7 +112,9 @@ class AuthIntegrationTest {
     @MockitoSpyBean StringRedisTemplate redis;
     @Autowired JsonMapper json;
     @Autowired Admission admissions;
-    @Autowired RoomHistoryService history;
+    @MockitoSpyBean RoomHistoryService history;
+    @Autowired KafkaAdmin kafkaAdmin;
+    @Autowired RoomSocketHandler sockets;
     @MockitoSpyBean RoomKafkaRuntime kafka;
     @MockitoSpyBean AuthSessionRepository sessions;
     @MockitoSpyBean UserProfileService profiles;
@@ -135,11 +147,13 @@ class AuthIntegrationTest {
     @AfterEach
     void removeAccount() {
         redis.delete("liveflow:auth:session:{" + userId + "}");
+        jdbc.update("DELETE FROM room_messages WHERE sender_user_id = ?", userId);
         jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", userId);
         jdbc.update("DELETE FROM users WHERE id = ?", userId);
         for (String name : registeredNames) {
             for (Long id : jdbc.queryForList("SELECT id FROM users WHERE username = ?", Long.class, name)) {
                 redis.delete("liveflow:auth:session:{" + id + "}");
+                jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", id);
                 jdbc.update("DELETE FROM users WHERE id = ?", id);
             }
         }
@@ -692,6 +706,7 @@ class AuthIntegrationTest {
         } finally {
             for (long id : others) {
                 jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", id);
+                jdbc.update("DELETE FROM rooms WHERE owner_user_id = ?", id);
                 jdbc.update("DELETE FROM users WHERE id = ?", id);
             }
         }
@@ -859,8 +874,8 @@ class AuthIntegrationTest {
             var otherReceipt = roomResponse(viewer.sendPath("GET", receiptPath, null, viewerBearer, false), 200);
             assertThat(otherReceipt.get("status").asString()).isEqualTo("unconfirmed");
             var history = awaitJson(browser, bearer, path + "?afterSeq=0&throughSeq=2",
-                    result -> "1".equals(result.get("storedThrough").asString()));
-            assertThat(history.get("targetThrough").asString()).isEqualTo("2");
+                    result -> "1".equals(result.get("latestStoredSeq").asString()));
+            assertThat(history.get("throughSeq").asString()).isEqualTo("1");
             assertThat(history.get("items").size()).isEqualTo(1);
             assertThat(history.get("items").get(0).get("messageId")).isEqualTo(event.get("messageId"));
 
@@ -879,7 +894,7 @@ class AuthIntegrationTest {
                 assertThat(nextMessage(sender).get("roomSeq").asString()).isEqualTo(Integer.toString(i + 2));
             }
             var recent = awaitJson(browser, bearer, path + "?limit=2",
-                    result -> "5".equals(result.get("storedThrough").asString()));
+                    result -> "5".equals(result.get("latestStoredSeq").asString()));
             assertThat(recent.get("items").get(0).get("roomSeq").asString()).isEqualTo("4");
             var first = roomResponse(browser.sendPath("GET", path + "?limit=2&afterSeq=0&throughSeq=5", null, bearer, false), 200);
             assertThat(first.get("nextAfterSeq").asString()).isEqualTo("2");
@@ -1097,7 +1112,7 @@ class AuthIntegrationTest {
         var receipt = awaitJson(browser, bearer, endpoint + "/submissions/" + reference.get("submissionId").asString(),
                 value -> "accepted".equals(value.get("status").asString()));
         var history = awaitJson(browser, bearer, endpoint,
-                value -> "1".equals(value.get("storedThrough").asString()));
+                value -> "1".equals(value.get("latestStoredSeq").asString()));
         assertThat(history.get("items").size()).isOne();
         assertThat(history.get("items").get(0).get("messageId")).isEqualTo(receipt.get("messageId"));
         assertThat(calls.get()).isEqualTo(1);
@@ -1143,7 +1158,7 @@ class AuthIntegrationTest {
                 value -> "rejected".equals(value.get("status").asString()));
         assertThat(rejection.get("code").asString()).isEqualTo("MESSAGE_SUBMISSION_EXPIRED");
 
-        var latest = awaitJson(browser, bearer, messages, value -> value.get("storedThrough").asString().equals("1"));
+        var latest = awaitJson(browser, bearer, messages, value -> value.get("latestStoredSeq").asString().equals("1"));
         assertThat(latest.get("items").size()).isOne();
         assertThat(latest.get("items").get(0).get("senderName").asString()).isEqualTo(username);
 
@@ -1166,48 +1181,258 @@ class AuthIntegrationTest {
     }
 
     @Test
-    void roomHistoryReplaysTrimsAndRejectsConflictingSequences() throws Exception {
+    void historyAllowsSparsePagesAndCleanUpByAcceptanceTime() throws Exception {
         var browser = new Browser();
         String bearer = access(browser.login());
         String room = createRoomFor(browser, bearer);
         String path = messagePath(room, "messages");
         var empty = roomResponse(browser.sendPath("GET", path, null, bearer, false), 200);
-        assertThat(empty.get("storedThrough").asString()).isEqualTo("0");
+        assertThat(empty.get("latestStoredSeq").asString()).isEqualTo("0");
+        assertThat(empty.get("throughSeq").asString()).isEqualTo("0");
         assertThat(empty.get("items").size()).isZero();
         for (String query : List.of("?limit=0", "?afterSeq=01", "?throughSeq=1", "?limit=1&limit=2", "?other=a",
                 "?afterSeq=9223372036854775807", "?afterSeq=5&throughSeq=2")) {
             failure(browser.sendPath("GET", path + query, null, bearer, false), 400, "INVALID_REQUEST");
         }
-        String timestamp = RoomEvents.UTC_MILLIS.format(Instant.now());
-        var one = new Accepted(1, room, "1", UUID.randomUUID(), Long.toString(userId), username, "甲", timestamp);
-        var two = new Accepted(1, room, "2", UUID.randomUUID(), Long.toString(userId), username, "乙", timestamp);
-        history.append(List.of(one, two), null);
-        history.append(List.of(one, two), null);
+
+        var high = historyEvent(room, 103, UUID.randomUUID(), "先到", Instant.now());
+        var late = historyEvent(room, 101, UUID.randomUUID(), "晚到", Instant.now());
+        var middle = historyEvent(room, 102, UUID.randomUUID(), "稍晚", Instant.now());
+        history.append(List.of(new HistoryRecord(high, 0)));
+        String range = path + "?afterSeq=100&throughSeq=103";
+        var sparse = roomResponse(browser.sendPath("GET", range, null, bearer, false), 200);
+        assertThat(sparse.get("items").get(0).get("roomSeq").asString()).isEqualTo("103");
+        assertThat(sparse.get("items").size()).isOne();
+        assertThat(sparse.get("nextAfterSeq").isNull()).isTrue();
+        assertThat(history.append(List.of(new HistoryRecord(late, 1), new HistoryRecord(high, 2),
+                new HistoryRecord(middle, 3))).inserted()).containsExactly(late, middle);
+        var first = roomResponse(browser.sendPath("GET", range + "&limit=1", null, bearer, false), 200);
+        assertThat(first.get("nextAfterSeq").asString()).isEqualTo("101");
+        assertThat(first.get("throughSeq").asString()).isEqualTo("103");
+        assertThat(first.get("latestStoredSeq").asString()).isEqualTo("103");
+        var bounded = roomResponse(browser.sendPath("GET", path + "?afterSeq=101&throughSeq=102", null, bearer, false), 200);
+        assertThat(bounded.get("items").get(0).get("roomSeq").asString()).isEqualTo("102");
+        assertThat(bounded.get("throughSeq").asString()).isEqualTo("102");
+        assertThat(bounded.get("latestStoredSeq").asString()).isEqualTo("103");
+        var pastEnd = roomResponse(browser.sendPath("GET", path + "?afterSeq=104", null, bearer, false), 200);
+        assertThat(pastEnd.get("items").size()).isZero();
+        assertThat(pastEnd.get("throughSeq").asString()).isEqualTo("103");
+
+        // 过期的是更高的序号，清理不得连带删除较小的仍有效记录，也不得回退进度。
+        var expired = historyEvent(room, 103, high.messageId(), high.content(), Instant.now().minus(Duration.ofHours(24)));
+        jdbc.update("UPDATE room_messages SET sent_at = ? WHERE room_id = ? AND room_seq = 103",
+                java.time.LocalDateTime.ofInstant(Instant.parse(expired.sentAt()), java.time.ZoneOffset.UTC), room);
+        var beforeCleanup = roomResponse(browser.sendPath("GET", path, null, bearer, false), 200);
+        assertThat(beforeCleanup.get("items").size()).isEqualTo(2);
+        history.clean(() -> false);
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM room_messages WHERE room_id = ?", Integer.class, room))
-                .isEqualTo(2);
-        jdbc.update("UPDATE room_messages SET stored_at = UTC_TIMESTAMP(3) - INTERVAL 25 HOUR WHERE room_id = ? AND room_seq = 1", room);
+                .isEqualTo(3);
         history.clean(() -> true);
-        history.append(List.of(one), null); // 过期事件重放不能令已清理的前缀复活。
-        var gap = browser.sendPath("GET", path + "?afterSeq=0", null, bearer, false);
-        failure(gap, 409, "ROOM_HISTORY_GAP");
-        var metadata = json.readTree(gap.body());
-        assertThat(metadata.get("earliestSeq").asString()).isEqualTo("2");
-        assertThat(metadata.get("storedThrough").asString()).isEqualTo("2");
-        var fork = new Accepted(1, room, "2", UUID.randomUUID(), two.userId(), username, "冲突", timestamp);
-        String group = MESSAGE_TEST_NAMESPACE + ".liveflow-room-message-history-v1";
-        try {
-            assertThrows(IllegalStateException.class, () -> history.append(List.of(fork), null));
-            failure(browser.sendPath("GET", path, null, bearer, false), 503, "ROOM_MESSAGES_UNAVAILABLE");
-            assertThat(jdbc.queryForObject("SELECT content FROM room_messages WHERE room_id = ? AND room_seq = 2",
-                    String.class, room)).isEqualTo("乙");
-            assertThat(jdbc.queryForObject("""
-                    SELECT reason FROM room_message_processing_blocks WHERE consumer_group = ? AND room_id = ?
-                    """, String.class, group, room)).isEqualTo("HISTORY_SEQUENCE_CONFLICT");
-        } finally {
-            // 持久阻断跨测试保留。移除本用例制造的故障，允许后续用例继续共用同一 Kafka 分区。
-            jdbc.update("DELETE FROM room_message_processing_blocks WHERE consumer_group = ? AND room_id = ?",
-                    group, room);
+        assertThat(history.append(List.of(new HistoryRecord(expired, 4))).inserted()).isEmpty();
+        var oldCursor = roomResponse(browser.sendPath("GET", path + "?afterSeq=0", null, bearer, false), 200);
+        assertThat(oldCursor.get("items").size()).isEqualTo(2);
+        assertThat(oldCursor.get("latestStoredSeq").asString()).isEqualTo("103");
+        jdbc.update("UPDATE room_messages SET sent_at = UTC_TIMESTAMP(3) - INTERVAL 25 HOUR WHERE room_id = ?", room);
+        history.clean(() -> true);
+        var fullyExpired = roomResponse(browser.sendPath("GET", path, null, bearer, false), 200);
+        assertThat(fullyExpired.get("items").size()).isZero();
+        assertThat(fullyExpired.get("latestStoredSeq").asString()).isEqualTo("103");
+    }
+
+    @Test
+    void historyProgressOnlyNotifiesIncreasesAndRespectsPartitionBlocks() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        String path = messagePath(room, "messages");
+        String topic = MESSAGE_TEST_NAMESPACE + ".liveflow.room-message.accepted.v1";
+        try (var socket = readyRoom(browser, bearer, room)) {
+            var high = historyEvent(room, 103, UUID.randomUUID(), "先到", Instant.now());
+            var late = historyEvent(room, 101, UUID.randomUUID(), "晚到", Instant.now());
+            history.append(List.of(new HistoryRecord(high, 0)));
+            sockets.notifyHistoryProgress();
+            var frame = socket.next();
+            assertThat(frame.get("type").asString()).isEqualTo("history_progress");
+            assertThat(frame.get("latestStoredSeq").asString()).isEqualTo("103");
+            history.append(List.of(new HistoryRecord(late, 1)));
+            sockets.notifyHistoryProgress();
+            assertThat(socket.frames.poll(200, TimeUnit.MILLISECONDS)).isNull();
+
+            jdbc.update("""
+                    INSERT INTO room_message_processing_blocks
+                        (consumer_group, topic_name, partition_no, reason, observed_offset, reported_by, updated_at)
+                    VALUES (?, ?, ?, 'OFFSET_OUT_OF_RANGE', 0, 'fixture', UTC_TIMESTAMP(3))
+                    """, historyGroup(), topic, partition(room));
+            try {
+                failure(browser.sendPath("GET", path, null, bearer, false), 503, "ROOM_MESSAGES_UNAVAILABLE");
+                assertThat(history.progress(List.of(room))).isEmpty();
+            } finally {
+                jdbc.update("DELETE FROM room_message_processing_blocks WHERE consumer_group = ? AND topic_name = ?"
+                        + " AND partition_no = ? AND room_id = ''", historyGroup(), topic, partition(room));
+            }
         }
+    }
+
+    @Test
+    void historySkipsSingleConflictsWithoutPausingEitherRoom() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        String secondRoom = matchingRoom(room, true);
+        String account = registrationName("Hist_");
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?", account, userId);
+        long owner = jdbc.queryForObject("SELECT id FROM users WHERE username = ?", Long.class, account);
+        jdbc.update("INSERT INTO rooms (room_uuid, owner_user_id, title, created_at) VALUES (?, ?, ?, UTC_TIMESTAMP(3))",
+                secondRoom, owner, "同分区房间");
+
+        Instant now = Instant.now();
+        var original = historyEvent(room, 103, UUID.randomUUID(), "原值", now);
+        var bySequence = historyEvent(room, 103, UUID.randomUUID(), "序号冲突", now);
+        var byId = historyEvent(room, 104, original.messageId(), "消息 ID 冲突", now);
+        var differentContent = historyEvent(room, 103, original.messageId(), "同键异文", now);
+        var valid = historyEvent(room, 105, UUID.randomUUID(), "A 继续", now);
+        var anotherRoom = historyEvent(secondRoom, 1, UUID.randomUUID(), "B 继续", now);
+        var batchConflict = historyEvent(room, 107, UUID.randomUUID(), "批内先到", now);
+        var batchLate = historyEvent(room, 107, UUID.randomUUID(), "批内后到", now);
+        var batch = history.append(List.of(new HistoryRecord(batchConflict, 2), new HistoryRecord(batchLate, 5)));
+        assertThat(batch.inserted()).containsExactly(batchConflict);
+        assertThat(batch.conflicts()).singleElement().satisfies(conflict -> {
+            assertThat(conflict.record().offset()).isEqualTo(5);
+            assertThat(conflict.sequenceMatch()).isEqualTo(batchConflict.messageId().toString());
+        });
+        try (var producer = historyProducer()) {
+            for (var event : List.of(original, original, bySequence, byId, differentContent, valid, anotherRoom)) {
+                publishHistory(producer, event);
+            }
+        }
+        var storedB = awaitJson(browser, bearer, messagePath(secondRoom, "messages"),
+                page -> "1".equals(page.get("latestStoredSeq").asString()));
+        assertThat(storedB.get("items").get(0).get("content").asString()).isEqualTo("B 继续");
+        var storedA = roomResponse(browser.sendPath("GET", messagePath(room, "messages"), null, bearer, false), 200);
+        assertThat(storedA.get("items").size()).isEqualTo(3);
+        assertThat(storedA.get("items").get(0).get("messageId").asString()).isEqualTo(original.messageId().toString());
+        assertThat(storedA.get("items").get(1).get("content").asString()).isEqualTo("A 继续");
+        assertThat(storedA.get("items").get(2).get("content").asString()).isEqualTo("批内先到");
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM room_message_processing_blocks WHERE consumer_group = ?"
+                + " AND partition_no = ?", Integer.class, historyGroup(), partition(room))).isZero();
+    }
+
+    @Test
+    void concurrentHistoryBatchesRespectTheGlobalMessageId() throws Exception {
+        String room = UUID.randomUUID().toString();
+        String otherPartition = matchingRoom(room, false);
+        UUID messageId = UUID.randomUUID();
+        var first = historyEvent(room, 1, messageId, "甲", Instant.now());
+        var second = historyEvent(otherPartition, 2, messageId, "乙", Instant.now());
+        var barrier = new CyclicBarrier(2);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var a = executor.submit(() -> {
+                barrier.await(3, TimeUnit.SECONDS);
+                return history.append(List.of(new HistoryRecord(first, 0)));
+            });
+            var b = executor.submit(() -> {
+                barrier.await(3, TimeUnit.SECONDS);
+                return history.append(List.of(new HistoryRecord(second, 0)));
+            });
+            var results = List.of(a.get(6, TimeUnit.SECONDS), b.get(6, TimeUnit.SECONDS));
+            assertThat(results.stream().flatMap(result -> result.inserted().stream())).hasSize(1);
+            assertThat(results.stream().flatMap(result -> result.conflicts().stream())).singleElement()
+                    .satisfies(conflict -> assertThat(conflict.messageIdMatch()).isEqualTo(messageId.toString()));
+        }
+    }
+
+    @Test
+    void historyResumesAfterFailedWriteAndLostCommitConfirmation() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        var event = historyEvent(room, 1, UUID.randomUUID(), "只落库一次", Instant.now());
+        var attempts = new java.util.concurrent.atomic.AtomicInteger();
+        var firstFailure = new java.util.concurrent.CountDownLatch(1);
+        var secondFailure = new java.util.concurrent.CountDownLatch(1);
+        var allowWrite = new java.util.concurrent.CountDownLatch(1);
+        var allowReplay = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> {
+            switch (attempts.incrementAndGet()) {
+                case 1 -> {
+                    firstFailure.countDown();
+                    throw new DataAccessResourceFailureException("模拟写入失败");
+                }
+                case 2 -> {
+                    assertThat(allowWrite.await(10, TimeUnit.SECONDS)).isTrue();
+                    call.callRealMethod();
+                    secondFailure.countDown();
+                    throw new DataAccessResourceFailureException("模拟 SQL 已提交但 Kafka 未确认");
+                }
+                default -> {
+                    assertThat(allowReplay.await(10, TimeUnit.SECONDS)).isTrue();
+                    return call.callRealMethod();
+                }
+            }
+        }).when(history).append(argThat(batch -> batch != null
+                && batch.stream().anyMatch(record -> record.event().messageId().equals(event.messageId()))));
+        try (var producer = historyProducer(); var admin = Admin.create(kafkaAdmin.getConfigurationProperties())) {
+            var position = publishHistory(producer, event);
+            var topicPartition = new TopicPartition(position.topic(), position.partition());
+            assertThat(firstFailure.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(committedHistoryOffset(admin, topicPartition)).isLessThanOrEqualTo(position.offset());
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM room_messages WHERE room_id = ?", Integer.class, room))
+                    .isZero();
+            allowWrite.countDown();
+            assertThat(secondFailure.await(10, TimeUnit.SECONDS)).isTrue();
+            assertThat(committedHistoryOffset(admin, topicPartition)).isLessThanOrEqualTo(position.offset());
+            allowReplay.countDown();
+            long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+            while (committedHistoryOffset(admin, topicPartition) <= position.offset() && System.nanoTime() < deadline) {
+                Thread.sleep(100);
+            }
+            assertThat(committedHistoryOffset(admin, topicPartition)).isGreaterThan(position.offset());
+            assertThat(attempts.get()).isEqualTo(3);
+            assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM room_messages WHERE room_id = ?", Integer.class, room))
+                    .isOne();
+        } finally {
+            allowWrite.countDown();
+            allowReplay.countDown();
+        }
+    }
+
+    private Accepted historyEvent(String room, long sequence, UUID id, String content, Instant sentAt) {
+        return new Accepted(1, room, Long.toString(sequence), id, Long.toString(userId), username, content,
+                RoomEvents.UTC_MILLIS.format(sentAt));
+    }
+
+    private KafkaProducer<String, String> historyProducer() {
+        return new KafkaProducer<>(kafkaAdmin.getConfigurationProperties(),
+                new StringSerializer(), new StringSerializer());
+    }
+
+    private org.apache.kafka.clients.producer.RecordMetadata publishHistory(
+            KafkaProducer<String, String> producer, Accepted event) throws Exception {
+        return producer.send(new ProducerRecord<>(MESSAGE_TEST_NAMESPACE + ".liveflow.room-message.accepted.v1",
+                event.roomId(), json.writeValueAsString(event))).get(5, TimeUnit.SECONDS);
+    }
+
+    private static String historyGroup() {
+        return MESSAGE_TEST_NAMESPACE + ".liveflow-room-message-history-v1";
+    }
+
+    private static long committedHistoryOffset(Admin admin, TopicPartition partition) throws Exception {
+        var offset = admin.listConsumerGroupOffsets(historyGroup()).partitionsToOffsetAndMetadata()
+                .get(5, TimeUnit.SECONDS).get(partition);
+        return offset == null ? -1 : offset.offset();
+    }
+
+    private static String matchingRoom(String reference, boolean samePartition) {
+        String id;
+        do {
+            id = UUID.randomUUID().toString();
+        } while ((partition(id) == partition(reference)) != samePartition);
+        return id;
+    }
+
+    private static int partition(String room) {
+        return Utils.toPositive(Utils.murmur2(room.getBytes(StandardCharsets.UTF_8))) % 6;
     }
 
     @Test
@@ -1235,7 +1460,7 @@ class AuthIntegrationTest {
             assertThat(nextMessage(socket)).isEqualTo(first);
             assertThat(publishCount.get()).isEqualTo(2);
             var stored = awaitJson(browser, bearer, messagePath(room, "messages"),
-                    page -> "1".equals(page.get("storedThrough").asString()));
+                    page -> "1".equals(page.get("latestStoredSeq").asString()));
             assertThat(stored.get("items").size()).isOne();
         }
     }

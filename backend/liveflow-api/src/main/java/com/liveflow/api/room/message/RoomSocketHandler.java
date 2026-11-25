@@ -367,9 +367,9 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements Smart
         }
     }
 
-    /** 批读活跃房间水位。即使没有下一条实时弹幕，客户端下载仍可发现末尾漏收。 */
+    /** 批读活跃房间的最大落库序号，帮助连接发现漏收的新消息。 */
     @Scheduled(fixedDelay = 3000)
-    public void notifyWatermarks() {
+    public void notifyHistoryProgress() {
         var active = new ArrayList<Room>();
         for (Room room : rooms.values()) {
             synchronized (room) {
@@ -379,21 +379,23 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements Smart
         for (int start = 0; start < active.size(); start += 100) {
             List<String> ids = active.subList(start, Math.min(start + 100, active.size())).stream().map(r -> r.id).toList();
             try {
-                for (var watermark : history.watermarks(ids)) {
-                    var room = rooms.get(watermark.roomId());
+                for (var progress : history.progress(ids)) {
+                    var room = rooms.get(progress.roomId());
                     if (room == null) continue;
                     synchronized (room) {
-                        var frame = text(new HistoryFrame("history_progress", Long.toString(watermark.storedThrough())));
+                        long latest = progress.latestStoredSeq();
+                        var frame = text(new HistoryFrame("history_progress", Long.toString(latest)));
                         for (var member : room.members) {
                             synchronized (member) {
-                                if (member.state == State.READY && watermark.storedThrough() > member.lastWatermark
-                                        && offer(member, frame)) member.lastWatermark = watermark.storedThrough();
+                                // 仅在成功入队后更新该连接的通知进度，迟到补写不会重复通知。
+                                if (member.state == State.READY && latest > member.lastHistoryProgress
+                                        && offer(member, frame)) member.lastHistoryProgress = latest;
                             }
                         }
                     }
                 }
             } catch (RuntimeException failure) {
-                LOG.debug("弹幕历史水位将在下一轮重查 failure={}", failure.getClass().getSimpleName());
+                LOG.debug("弹幕历史进度将在下一轮重查 failure={}", failure.getClass().getSimpleName());
             }
         }
     }
@@ -581,7 +583,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements Smart
         Binding binding;
         long lastCheck;
         long lastPing;
-        long lastWatermark;
+        long lastHistoryProgress;
         boolean awaitingPong;
         boolean checking;
         int bytes;
@@ -594,7 +596,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements Smart
 
     private record Output(WebSocketMessage<?> frame, CloseStatus closeStatus, long queuedAt, int bytes) {}
     private record RoomFrame(String type, String roomId) {}
-    private record HistoryFrame(String type, String storedThrough) {}
+    private record HistoryFrame(String type, String latestStoredSeq) {}
     private record MessageFrame(String type, String roomSeq, java.util.UUID messageId, String senderName,
             String content, String sentAt) {}
     private record ErrorFrame(String type, String code, String message) {}

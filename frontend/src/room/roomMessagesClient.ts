@@ -12,7 +12,7 @@ export interface RoomMessage {
 type RoomFrame =
   | (RoomMessage & { type: 'message' })
   | { type: 'ready' | 'resync_required'; roomId: string }
-  | { type: 'history_progress'; storedThrough: string }
+  | { type: 'history_progress'; latestStoredSeq: string }
   | { type: 'error'; code: string; message: string }
 
 interface TicketResponse { ticket: string; expiresIn: number }
@@ -34,9 +34,8 @@ export interface MessageSubmission { clientMessageId: string; content: string }
 
 export interface HistoryPage {
   items: RoomMessage[]
-  earliestSeq: string
-  storedThrough: string
-  targetThrough: string
+  latestStoredSeq: string
+  throughSeq: string
   nextAfterSeq: string | null
 }
 
@@ -111,43 +110,29 @@ export async function requestMessageReceipt(access: string, roomId: string, id: 
 }
 
 /**
+ * 获取最近 100 条历史。响应可以为空或有序号缺口。
  * @param access 当前会话的 Access Token
- * @param roomId 当前房间
- * @param range 排他的连续游标、可选固定目标。省略时查询最近窗口
- * @returns 同一数据库快照中的历史和水位
- * @throws ApiRequestError 历史无法读取、已清理或响应无效
+ * @param roomId 当前房间 UUID
+ * @returns 同一数据库快照中的消息和最大落库序号
+ * @throws ApiRequestError 历史无法读取或响应无效
  */
-export async function requestRoomHistory(access: string, roomId: string,
-  range?: { after: bigint; through?: bigint }): Promise<HistoryPage> {
-  const query = new URLSearchParams()
-  if (range) {
-    query.set('afterSeq', range.after.toString())
-    if (range.through !== undefined) query.set('throughSeq', range.through.toString())
-  }
-  const suffix = range ? `?${query}` : ''
-  const page = await requestJson<HistoryPage>(`${roomUrl(roomId)}/messages${suffix}`, { access })
+export async function requestRoomHistory(access: string, roomId: string): Promise<HistoryPage> {
+  const page = await requestJson<HistoryPage>(`${roomUrl(roomId)}/messages`, { access })
   if (!Array.isArray(page.items) || page.items.length > 100 || !page.items.every(isMessage)
-    || !isSequence(page.earliestSeq, 9223372036854775807n) || page.earliestSeq === '0'
-    || !isSequence(page.storedThrough) || !isSequence(page.targetThrough)
-    || (page.nextAfterSeq !== null && !isSequence(page.nextAfterSeq))) {
+    || !isSequence(page.latestStoredSeq) || page.throughSeq !== page.latestStoredSeq || page.nextAfterSeq !== null) {
     throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史响应无效。')
   }
-  const stored = BigInt(page.storedThrough)
-  const earliest = BigInt(page.earliestSeq)
-  const target = BigInt(page.targetThrough)
-  const last = page.items.at(-1)
-  const first = page.items[0]
-  const max = stored > target ? target : stored
-  const requiredStart = range ? range.after + 1n : earliest
-  const expectsItems = requiredStart <= max
-  const continuous = page.items.every((item, i) => i === 0
-    || BigInt(item.roomSeq) === BigInt(page.items[i - 1]!.roomSeq) + 1n)
-  if (!continuous || expectsItems !== !!first || earliest > stored + 1n || (first && (BigInt(first.roomSeq) < earliest
-    || (range && BigInt(first.roomSeq) !== range.after + 1n))) || (last && BigInt(last.roomSeq) > max)
-    || (!range && (target !== stored || page.nextAfterSeq !== null || (last && BigInt(last.roomSeq) !== stored)))
-    || (range && (target < range.after || (range.through !== undefined && range.through !== target)))
-    || (page.nextAfterSeq !== null && (last?.roomSeq !== page.nextAfterSeq || BigInt(page.nextAfterSeq) >= max))) {
-    throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史顺序无法确认。')
+  // 最近页要求升序、无重复且不超过当页上界，允许中间缺号和最后一条已过期。
+  const latest = BigInt(page.latestStoredSeq)
+  let previous = 0n
+  const ids = new Set<string>()
+  for (const item of page.items) {
+    const sequence = BigInt(item.roomSeq)
+    if (sequence <= previous || sequence > latest || ids.has(item.messageId)) {
+      throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史顺序无法确认。')
+    }
+    previous = sequence
+    ids.add(item.messageId)
   }
   return page
 }
@@ -175,8 +160,8 @@ export function decodeRoomFrame(data: unknown): RoomFrame | undefined {
   if ((frame.type === 'ready' || frame.type === 'resync_required') && isUuid(frame.roomId)) {
     return { type: frame.type, roomId: frame.roomId }
   }
-  if (frame.type === 'history_progress' && isSequence(frame.storedThrough)) {
-    return { type: 'history_progress', storedThrough: frame.storedThrough }
+  if (frame.type === 'history_progress' && isSequence(frame.latestStoredSeq)) {
+    return { type: 'history_progress', latestStoredSeq: frame.latestStoredSeq }
   }
   if (frame.type === 'error' && typeof frame.code === 'string' && typeof frame.message === 'string') {
     return { type: 'error', code: frame.code, message: frame.message }
@@ -197,11 +182,10 @@ function isMessage(value: unknown): value is RoomMessage {
 
 /**
  * @param value 原始序号
- * @param max 包含的最大值
  * @returns 格式正确且可精确比较
  */
-function isSequence(value: unknown, max = 9223372036854775806n): value is string {
-  return typeof value === 'string' && /^(0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= max
+function isSequence(value: unknown): value is string {
+  return typeof value === 'string' && /^(0|[1-9]\d{0,18})$/.test(value) && BigInt(value) <= 9223372036854775806n
 }
 
 function isUuid(value: unknown): value is string {

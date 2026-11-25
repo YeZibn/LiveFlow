@@ -7,8 +7,15 @@ import { decodeRoomFrame, openRoomSocket, requestMessageReceipt, requestRoomHist
 
 const RECONNECT_DELAYS = [500, 1200, 3000]
 const HISTORY_LIMIT = 100
-const BUFFER_LIMIT = 300
+const HISTORY_RETRY_DELAYS = [250, 500, 1000, 2000]
 const POLL_MILLIS = 10_000
+
+interface HistoryRefresh {
+  inFlight: boolean
+  queued: boolean
+  failures: number
+  timer?: number
+}
 
 interface PendingSubmission {
   body: MessageSubmission
@@ -38,15 +45,8 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   const pendingContent = computed(() => pending.value?.unknown ? pending.value.body.content : '')
   const canCheckReceipt = computed(() => pending.value?.receipt !== undefined)
   const checkingReceipt = ref(false)
-  const buffered = new Map<bigint, RoomMessage>()
-  let continuous: bigint | undefined
-  let wanted = 0n
-  let pinned: bigint | undefined
-  let forceHistory = false
-  let historyInFlight = false
-  let historyRevision = 0
-  let historyDelay = 250
-  let historyTimer: number | undefined
+  let latestSeen = 0n
+  let historyRefresh: HistoryRefresh | undefined
   let receiptTimer: number | undefined
   let receiptExpiry: number | undefined
   let cooldownTimer: number | undefined
@@ -69,8 +69,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     generation++
     window.clearTimeout(readyTimer)
     window.clearTimeout(reconnectTimer)
-    window.clearTimeout(historyTimer)
-    historyTimer = undefined
+    cancelHistory()
     window.clearTimeout(cooldownTimer)
     clearPending()
     socket?.close()
@@ -103,13 +102,9 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   /** @returns 申请票据，注册当前连接的生命周期及消息回调 */
   async function connect() {
     const attempt = ++generation
-    historyRevision++
-    window.clearTimeout(historyTimer)
-    historyTimer = undefined
+    cancelHistory()
     window.clearTimeout(readyTimer)
     window.clearTimeout(reconnectTimer)
-    pinned = undefined
-    forceHistory = true
     socket?.close()
     socket = undefined
     connectionError.value = ''
@@ -142,29 +137,27 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
         if (frame.type === 'ready') {
           window.clearTimeout(readyTimer)
           retries = 0
-          state.value = 'ready'
-          scheduleHistory(0)
+          if (state.value !== 'ready') {
+            state.value = 'ready'
+            historyRefresh = { inFlight: false, queued: false, failures: 0 }
+            refreshHistory()
+          }
         } else if (frame.type === 'error') {
           connectionError.value = frame.message
           connection.close()
         } else if (state.value === 'ready') {
           if (frame.type === 'message') {
-            buffer(frame)
-            drain()
-          } else if (frame.type === 'history_progress') {
-            wanted = max(wanted, BigInt(frame.storedThrough))
-          } else if (frame.type === 'resync_required') {
-            forceHistory = true
+            mergeMessages([frame], false)
+          } else if (frame.type === 'resync_required'
+            || (frame.type === 'history_progress' && BigInt(frame.latestStoredSeq) > latestSeen)) {
+            refreshHistory()
           }
-          if (needsHistory()) scheduleHistory(0)
         }
       }
       connection.onclose = () => {
         if (!current(attempt, connection)) return
         socket = undefined
-        historyRevision++
-        window.clearTimeout(historyTimer)
-        historyTimer = undefined
+        cancelHistory()
         window.clearTimeout(readyTimer)
         scheduleReconnect(attempt)
       }
@@ -185,136 +178,107 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     }
   }
 
-  /** 清除自动重试次数并申请新票据，保留本房间连续游标。 */
+  /** 清除自动重试次数并申请新票据，保留当前房间及会话的消息列表。 */
   function reconnect() {
     retries = 0
     void connect()
   }
 
   /**
-   * @param message 待合并消息
-   * @returns 本轮仍可继续合并时为 true
+   * 以消息 ID 和房间序号合并最近窗口，迟到弹幕只要仍在窗口内便能插入。
+   * @param incoming 当前实时帧或最近历史返回的消息
+   * @param persisted 历史记录具有权威性，可以替换冲突的实时记录
    */
-  function buffer(message: RoomMessage): boolean {
-    const number = BigInt(message.roomSeq)
-    const known = buffered.get(number) ?? (continuous !== undefined && number <= continuous
-      ? messages.value.find(item => item.roomSeq === message.roomSeq) : undefined)
-    if (known && known.messageId !== message.messageId) {
-      resetHistory('消息顺序需要重新同步，正在读取最近历史。')
-      return false
+  function mergeMessages(incoming: RoomMessage[], persisted: boolean) {
+    const bySequence = new Map(messages.value.map(message => [message.roomSeq, message]))
+    const byId = new Map(messages.value.map(message => [message.messageId, message]))
+    let changed = false
+    for (const item of incoming) {
+      const sequence = BigInt(item.roomSeq)
+      if (sequence > latestSeen) latestSeen = sequence
+      const sameSequence = bySequence.get(item.roomSeq)
+      const sameId = byId.get(item.messageId)
+      if (sameSequence || sameId) {
+        if (!persisted) continue
+        if (sameSequence === sameId && sameId?.senderName === item.senderName
+          && sameId.content === item.content && sameId.sentAt === item.sentAt) continue
+        // 一条历史消息可能同时与两个不同的实时项撞键，移除各自的两个索引。
+        for (const match of new Set([sameSequence, sameId])) {
+          if (match) {
+            bySequence.delete(match.roomSeq)
+            byId.delete(match.messageId)
+          }
+        }
+      }
+      bySequence.set(item.roomSeq, item)
+      byId.set(item.messageId, item)
+      changed = true
     }
-    if (known || (continuous !== undefined && number <= continuous)) return true
-    buffered.set(number, message)
-    if (buffered.size > BUFFER_LIMIT) {
-      resetHistory('待同步弹幕较多，正在重新读取最近历史。')
-      return false
+    if (!changed) return
+    const merged = Array.from(bySequence.values()).sort((a, b) => BigInt(a.roomSeq) < BigInt(b.roomSeq) ? -1 : 1)
+      .slice(-HISTORY_LIMIT)
+    // 窗口外的迟到项被裁剪时无需重新渲染，避免打断正在上翻的读者。
+    if (merged.length !== messages.value.length || merged.some((item, index) => item !== messages.value[index])) {
+      messages.value = merged
     }
-    return true
   }
 
-  /** 只展示紧邻当前游标且无缺口的一段，保留最新 100 条。 */
-  function drain() {
-    if (continuous === undefined) return
-    const additions: RoomMessage[] = []
-    let next = continuous + 1n
-    while (buffered.has(next)) {
-      additions.push(buffered.get(next)!)
-      buffered.delete(next)
-      continuous = next
-      next++
-    }
-    if (additions.length > 0) messages.value = [...messages.value, ...additions].slice(-HISTORY_LIMIT)
+  /** 连接换代或退出时作废计时器和在途响应，历史回调不能写入新连接。 */
+  function cancelHistory() {
+    window.clearTimeout(historyRefresh?.timer)
+    historyRefresh = undefined
+    syncing.value = false
+    syncFeedback.value = ''
   }
 
-  /** @param reason 清空旧合并状态并重读最近窗口的原因 */
-  function resetHistory(reason: string) {
-    syncFeedback.value = reason
-    historyRevision++
-    buffered.clear()
-    continuous = undefined
-    wanted = 0n
-    pinned = undefined
-    forceHistory = true
-    scheduleHistory(0)
+  /** 将多次同步提示合并成一个请求，已在途时最多保留一次后续刷新。 */
+  function refreshHistory() {
+    const refresh = historyRefresh
+    if (!refresh) return
+    if (!refresh.inFlight && refresh.timer === undefined) refresh.failures = 0
+    refresh.queued = true
+    scheduleHistory(refresh, 0)
   }
 
-  /** @returns 从实时缺口和已落库水位得到的补拉目标 */
-  function catchupTarget() {
-    let nearest: bigint | undefined
-    for (const number of buffered.keys()) if (nearest === undefined || number < nearest) nearest = number
-    return nearest === undefined ? wanted : max(wanted, nearest - 1n)
-  }
-
-  function needsHistory() {
-    return continuous === undefined || forceHistory || catchupTarget() > continuous
-  }
-
-  /** @param delay 到下一次历史查询的毫秒数 */
-  function scheduleHistory(delay: number) {
-    if (!active || state.value !== 'ready' || historyInFlight || historyTimer !== undefined) return
-    historyTimer = window.setTimeout(() => {
-      historyTimer = undefined
-      void synchronize()
+  /**
+   * @param refresh 当前连接的历史查询状态
+   * @param delay 开始下次 GET 前等待的毫秒数
+   */
+  function scheduleHistory(refresh: HistoryRefresh, delay: number) {
+    if (refresh !== historyRefresh || refresh.inFlight || refresh.timer !== undefined || !refresh.queued) return
+    refresh.timer = window.setTimeout(() => {
+      refresh.timer = undefined
+      if (refresh === historyRefresh) void synchronize(refresh)
     }, delay)
   }
 
-  /** 最近窗口建立基线。跨页固定上界，实时帧仍可在请求期间进入缓冲。 */
-  async function synchronize() {
-    if (historyInFlight || state.value !== 'ready' || !needsHistory()) return
-    historyInFlight = true
+  /** @param refresh 发起本轮查询的连接状态，用对象身份隔离迟到响应 */
+  async function synchronize(refresh: HistoryRefresh) {
+    refresh.queued = false
+    refresh.inFlight = true
     syncing.value = true
-    const revision = historyRevision
-    const after = continuous
-    const target = catchupTarget()
-    const through = after === undefined ? undefined : (pinned ?? (target > after ? target : undefined))
-    forceHistory = false
     let delay = 0
     try {
-      const page = await withAccess(access => requestRoomHistory(access, roomId,
-        after === undefined ? undefined : { after, through }))
-      if (!active || revision !== historyRevision) return
-      if (after === undefined) {
-        for (const item of page.items) {
-          const realtime = buffered.get(BigInt(item.roomSeq))
-          if (realtime && realtime.messageId !== item.messageId) {
-            resetHistory('消息顺序需要重新同步，正在读取最近历史。')
-            return
-          }
-        }
-        continuous = BigInt(page.storedThrough)
-        messages.value = page.items
-        for (const number of buffered.keys()) if (number <= continuous) buffered.delete(number)
-      } else {
-        // 每合并一条就推进能够展示的前缀，历史页不会额外挤占实时缓冲。
-        for (const item of page.items) {
-          if (!buffer(item)) return
-          drain()
-        }
-        const targetThrough = BigInt(page.targetThrough)
-        pinned = continuous !== undefined && continuous < targetThrough ? targetThrough : undefined
-        wanted = max(wanted, targetThrough)
-        if (pinned !== undefined && page.nextAfterSeq === null) {
-          delay = historyDelay
-          historyDelay = Math.min(historyDelay * 2, 3000)
-        }
-      }
-      drain()
-      if (delay === 0) historyDelay = 250
-      if (syncFeedback.value) syncFeedback.value = '已同步最近弹幕。'
-    } catch (cause) {
-      if (!active || revision !== historyRevision) return
-      if (cause instanceof ApiRequestError && cause.code === 'ROOM_HISTORY_GAP') {
-        resetHistory('部分弹幕已过保存期限，正在读取最近历史。')
-      } else {
-        if (!syncFeedback.value) syncFeedback.value = '弹幕历史暂不可用，正在重试。'
-        forceHistory = true
-        delay = historyDelay
-        historyDelay = Math.min(historyDelay * 2, 3000)
+      const page = await withAccess(access => requestRoomHistory(access, roomId))
+      if (refresh !== historyRefresh) return
+      mergeMessages(page.items, true)
+      refresh.failures = 0
+      syncFeedback.value = ''
+    } catch (failure) {
+      if (refresh !== historyRefresh) return
+      syncFeedback.value = '暂时无法读取历史弹幕，仍可接收实时消息。'
+      const transient = failure instanceof ApiRequestError && (failure.status === 0 || failure.status >= 500)
+      const retryDelay = transient ? HISTORY_RETRY_DELAYS[refresh.failures++] : undefined
+      if (retryDelay !== undefined) {
+        refresh.queued = true
+        delay = retryDelay
       }
     } finally {
-      historyInFlight = false
-      syncing.value = false
-      if (active && needsHistory()) scheduleHistory(delay)
+      if (refresh === historyRefresh) {
+        refresh.inFlight = false
+        syncing.value = false
+        scheduleHistory(refresh, delay)
+      }
     }
   }
 
@@ -483,8 +447,4 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   return { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
     syncing, syncFeedback, cooldownSeconds, showSubmissionActions, pendingContent, canCheckReceipt,
     checkingReceipt, checkReceipt, dismissSubmission }
-}
-
-function max(first: bigint, second: bigint) {
-  return first > second ? first : second
 }
