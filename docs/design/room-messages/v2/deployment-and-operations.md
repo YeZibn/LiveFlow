@@ -12,6 +12,8 @@
 
 生产 Redis 如共用认证与弹幕业务，应分别观测命令延迟和连接预算。Pub/Sub 使用独立连接，避免订阅生命周期占用普通命令连接。生产 Kafka 的认证和 Redis 环境前缀由部署配置提供。 [Kafka Topic 参数](https://kafka.apache.org/43/configuration/topic-configs/) · [Redis Pub/Sub 环境隔离](https://redis.io/docs/latest/develop/pubsub/#database--scoping) · [现有本地启动说明](../../../../README.md#本地启动)
 
+房间存在性缓存采用独立 Redis。缓存配置、回源预算、分阶段启用和故障隔离联调由房间模块定义。 [房间缓存部署与运行](../../room/deployment-and-operations.md)
+
 ## 三实例部署
 
 同一个环境部署 A、B、C 三个对等进程。三台都接收 HTTP 与 WebSocket 请求，并加入同样的后台任务组。同机联调使用独立端口和状态目录。需要承受主机失效时，将三个进程分布到不同主机，并单独配置入口和共享依赖的可用性。单 Broker、单 Redis 和单 MySQL 的联调环境用于验证应用进程退出与接管。

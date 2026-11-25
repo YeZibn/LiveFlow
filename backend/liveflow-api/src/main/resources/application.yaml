@@ -52,6 +52,26 @@ management:
 liveflow:
   instance-id: ${LIVEFLOW_INSTANCE_ID:local}
   cluster-member-ids: ${LIVEFLOW_CLUSTER_MEMBER_IDS:}
+  rooms:
+    cache:
+      # 旁路模式也执行回源预算。缓存客户端与业务 Redis 连接独立。
+      enabled: ${LIVEFLOW_ROOM_CACHE_ENABLED:false}
+      environment: ${LIVEFLOW_ROOM_CACHE_ENVIRONMENT:local}
+      redis:
+        uri: ${LIVEFLOW_ROOM_CACHE_REDIS_URI:redis://127.0.0.1:${LIVEFLOW_ROOM_CACHE_PORT:16380}}
+        connect-timeout: ${LIVEFLOW_ROOM_CACHE_CONNECT_TIMEOUT:250ms}
+        command-timeout: ${LIVEFLOW_ROOM_CACHE_COMMAND_TIMEOUT:100ms}
+      positive-ttl:
+        minimum: ${LIVEFLOW_ROOM_CACHE_POSITIVE_TTL_MIN:4m}
+        maximum: ${LIVEFLOW_ROOM_CACHE_POSITIVE_TTL_MAX:6m}
+      negative-ttl:
+        minimum: ${LIVEFLOW_ROOM_CACHE_NEGATIVE_TTL_MIN:4s}
+        maximum: ${LIVEFLOW_ROOM_CACHE_NEGATIVE_TTL_MAX:6s}
+      fill-lease: ${LIVEFLOW_ROOM_CACHE_FILL_LEASE:5s}
+      wait-timeout: ${LIVEFLOW_ROOM_CACHE_WAIT_TIMEOUT:150ms}
+      source-rate: ${LIVEFLOW_ROOM_CACHE_SOURCE_RATE:30}
+      source-burst: ${LIVEFLOW_ROOM_CACHE_SOURCE_BURST:6}
+      source-concurrency: ${LIVEFLOW_ROOM_CACHE_SOURCE_CONCURRENCY:4}
   room-messages:
     connection-limit: ${LIVEFLOW_ROOM_MESSAGES_CONNECTION_LIMIT:512}
     # 服务位于反向代理之后时，可显式配置浏览器地址。留空使用同源校验。

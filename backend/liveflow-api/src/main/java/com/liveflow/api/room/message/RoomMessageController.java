@@ -7,6 +7,7 @@ import com.liveflow.core.room.message.RoomEvents;
 import com.liveflow.core.room.message.RoomEvents.Scope;
 import com.liveflow.core.room.message.RoomHistoryService;
 import com.liveflow.core.room.message.RoomMessageFailure;
+import com.liveflow.core.room.service.RoomExistenceStore;
 import com.liveflow.core.room.message.RoomMessagePorts.Receipts;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
@@ -238,7 +239,7 @@ public class RoomMessageController {
         return businessError(new RoomMessageFailure(RoomMessageFailure.Code.INVALID_REQUEST));
     }
 
-    @ExceptionHandler({DataAccessException.class, TransactionException.class})
+    @ExceptionHandler({DataAccessException.class, TransactionException.class, RoomExistenceStore.Unavailable.class})
     ResponseEntity<Map<String, Object>> dependencyUnavailable() {
         return businessError(new RoomMessageFailure(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE));
     }

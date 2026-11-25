@@ -6,6 +6,7 @@ import com.liveflow.core.room.message.RoomEvents.Message;
 import com.liveflow.core.room.message.RoomHistoryService;
 import com.liveflow.core.room.message.RoomMessageBroadcast;
 import com.liveflow.core.room.message.RoomMessageFailure;
+import com.liveflow.core.room.service.RoomExistenceStore;
 import com.liveflow.core.room.message.RoomTicketService;
 import com.liveflow.core.room.message.RoomTicketStore.Binding;
 import io.micrometer.core.instrument.Counter;
@@ -27,6 +28,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
+import org.springframework.transaction.TransactionException;
 import org.springframework.context.SmartLifecycle;
 import org.springframework.boot.web.server.context.WebServerGracefulShutdownLifecycle;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -181,7 +183,7 @@ public class RoomSocketHandler extends AbstractWebSocketHandler implements Smart
             failAuth(connection, failure);
         } catch (JacksonException failure) {
             fail(connection, "INVALID_REQUEST", "连接消息格式无效", CloseStatus.POLICY_VIOLATION);
-        } catch (DataAccessException failure) {
+        } catch (RoomExistenceStore.Unavailable | DataAccessException | TransactionException failure) {
             fail(connection, "ROOM_MESSAGES_UNAVAILABLE", "弹幕服务暂不可用", CloseStatus.SERVER_ERROR);
         }
     }

@@ -4,6 +4,7 @@ import com.liveflow.core.profile.service.UserProfileService;
 import com.liveflow.core.resilience.RoomMessageCircuitBreaker;
 import com.liveflow.core.resilience.RoomMessageCircuitBreaker.Permit;
 import com.liveflow.core.room.RoomUuid;
+import com.liveflow.core.room.service.RoomExistenceStore;
 import com.liveflow.core.room.service.RoomService;
 import com.liveflow.core.room.message.RoomEvents.Queued;
 import com.liveflow.core.room.message.RoomEvents.Scope;
@@ -79,10 +80,14 @@ public class RoomMessageService {
                 throw new RoomMessageFailure(ROOM_NOT_FOUND);
             }
             sender = profiles.read(scope.userId()).displayName();
-        } catch (DataAccessException | TransactionException unavailable) {
-            // 资料查询期间，另一个相同请求可能已经取得 Broker 确认。
+        } catch (RoomExistenceStore.Unavailable | DataAccessException | TransactionException unavailable) {
+            // 查房或资料查询期间，另一个相同请求可能已经取得 Broker 确认。
             var concurrent = admission.findQueued(scope, clientMessageId, hash);
             if (concurrent.isPresent()) return existing(concurrent.get(), permit);
+            // 查房的等待和容量保护归还许可，只有真实存储错误进入依赖统计。
+            if (unavailable instanceof RoomExistenceStore.Unavailable) {
+                throw new RoomMessageFailure(ROOM_MESSAGES_UNAVAILABLE);
+            }
             throw RoomMessageFailure.dependency(ROOM_MESSAGES_UNAVAILABLE, MYSQL, unavailable);
         }
         // 分区预检在新预约之前。拒绝在外层归还断路器许可，不占用发送冷却。

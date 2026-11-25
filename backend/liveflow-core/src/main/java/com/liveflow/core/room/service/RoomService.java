@@ -27,14 +27,17 @@ public class RoomService {
     private static final Pattern UUID_KEY = Pattern.compile("'(?:[^']+\\.)?uk_rooms_room_uuid'$");
 
     private final RoomMapper rooms;
+    private final RoomExistenceStore existence;
     private final TransactionTemplate transaction;
 
     /**
      * @param rooms 房间数据访问 Mapper
+     * @param existence 房间存在性读取及提交后预热
      * @param transactionManager MySQL 事务管理器
      */
-    public RoomService(RoomMapper rooms, PlatformTransactionManager transactionManager) {
+    public RoomService(RoomMapper rooms, RoomExistenceStore existence, PlatformTransactionManager transactionManager) {
         this.rooms = rooms;
+        this.existence = existence;
         this.transaction = new TransactionTemplate(transactionManager);
         this.transaction.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
@@ -72,10 +75,11 @@ public class RoomService {
      * 仅检查房间是否存在，供票据和弹幕写入路径调用。
      * @param roomId 已通过格式校验的房间 UUID
      * @return 房间存在时为 true
+     * @throws RoomExistenceStore.Unavailable 超过回源或等待预算，无法确认
      * @throws DataAccessException 存储读取失败
      */
     public boolean exists(String roomId) {
-        return rooms.exists(roomId);
+        return existence.exists(roomId);
     }
 
     /**
@@ -124,15 +128,19 @@ public class RoomService {
      */
     public Room create(long ownerUserId, String title) {
         String normalized = normalizeTitle(title);
+        Room created;
         try {
-            return insertRoom(ownerUserId, normalized);
+            created = insertRoom(ownerUserId, normalized);
         } catch (DuplicateKeyException failure) {
             if (!matchesConstraint(failure, UUID_KEY)) {
                 throw failure;
             }
             // UUID 冲突的事务已经回滚。重试生成新 UUID，并开启一笔独立事务。
-            return insertRoom(ownerUserId, normalized);
+            created = insertRoom(ownerUserId, normalized);
         }
+        // TransactionTemplate 已确认提交，只有最终获胜的 UUID 可以发布正缓存。
+        existence.warmCreated(created.roomId());
+        return created;
     }
 
     /**

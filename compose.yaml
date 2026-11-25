@@ -69,6 +69,18 @@ services:
       retries: 10
       start_period: 30s
 
+  room-cache:
+    image: redis:8.2.11-alpine
+    # 房间存在性可从 MySQL 重建，缓存淘汰和业务 Redis 的状态分开管理。
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lfu"]
+    ports:
+      - "127.0.0.1:${LIVEFLOW_ROOM_CACHE_PORT:-16380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   mysql-data:
   redis-data:

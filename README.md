@@ -32,6 +32,7 @@ Spring Boot 3.5 已结束开源支持，项目使用 Spring Boot 4.1 和对应�
 - [账号注册与登录认证 V1](docs/design/auth/design.md) 涵盖账号注册、密码规则、区分大小写的账号索引、Redis 单会话和凭证轮换。
 - [个人主页 V1](docs/design/profile/design.md) 涵盖个人主页入口、昵称与头像等资料的编辑流程、本人资料接口和 MySQL 存储。
 - [直播间 V1](docs/design/room/design.md) 定义一人一房、统一列表与名称搜索、UUID 进入、观看页布局，以及对应的 HTTP 接口和数据库索引。
+- [房间存在性缓存方案](docs/design/room/design.md#房间存在性缓存) 定义三实例共享回填、创建后预热和 MySQL 回源保护。
 - [直播间弹幕 V1](docs/design/room-messages/design.md) 定义单实例分发、WebSocket Ticket、HTTP 提交、短期去重，以及显示发送者和秒级本地时间的弹幕列表。
 - [直播间弹幕 V2](docs/design/room-messages/v2/design.md) 定义 Kafka 异步受理、Redis 房间频道、MySQL 历史、发送回执和有序补拉。
 - [LiveFlow 三实例部署方案](docs/design/room-messages/v2/deployment-and-operations.md#三实例部署) 定义对等实例、分区接管、连接排空和滚动发布。本地启动仍使用下方现行流程。
@@ -61,6 +62,8 @@ java -jar liveflow-api/target/liveflow-api-0.1.0-SNAPSHOT.jar --spring.profiles.
 
 如果本机的 JDK 放在仓库的 `.devtools/jdk-21` 中，可先在仓库根目录执行 `export JAVA_HOME="$PWD/.devtools/jdk-21/Contents/Home"`。该路径适用于解压后的 macOS Temurin JDK，`.devtools` 已被 Git 忽略。
 
+联调房间存在性缓存时，在启动后端之前设置 `LIVEFLOW_ROOM_CACHE_ENABLED=true`。各应用实例共同使用独立的缓存 Redis。 [房间缓存配置](docs/design/room/deployment-and-operations.md#配置与生效)
+
 再开一个终端，从仓库根目录启动前端。
 
 ```bash
@@ -85,6 +88,7 @@ curl --fail http://127.0.0.1:18080/actuator/health
 | 前端 | `127.0.0.1:5173` |
 | MySQL | `127.0.0.1:13306` |
 | Redis | `127.0.0.1:16379` |
+| 房间缓存 Redis | `127.0.0.1:16380` |
 | Kafka | `127.0.0.1:19092` |
 
 默认端口和 MySQL 凭据用于本地开发。需要调整时复制 `.env.example` 为 `.env` 并修改。Compose 会读取 `.env`，后端和前端终端需要同时导入改动的变量，例如在仓库根目录执行 `set -a; . ./.env; set +a`。MySQL 已初始化的数据卷会保留旧的数据库和账户配置。

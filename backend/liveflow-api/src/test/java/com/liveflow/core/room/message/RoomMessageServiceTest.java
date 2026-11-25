@@ -10,6 +10,7 @@ import com.liveflow.core.room.message.RoomMessagePorts.Admission;
 import com.liveflow.core.room.message.RoomMessagePorts.Producer;
 import com.liveflow.core.room.message.RoomMessagePorts.Reservation;
 import com.liveflow.core.room.service.RoomService;
+import com.liveflow.core.room.service.RoomExistenceStore.Unavailable;
 import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
@@ -132,6 +133,45 @@ class RoomMessageServiceTest {
         verify(permit, never()).failed(any(), any());
         verify(admission, never()).claim(any(), any(), any(), any());
         verify(producer, never()).publish(any());
+    }
+
+    @Test
+    void roomLookupBudgetRejectsWithoutCooldownAndDoesNotCountAsDependencyFailure() {
+        when(rooms.exists(scope.roomId())).thenThrow(new Unavailable());
+
+        assertThatThrownBy(() -> service.send(scope, clientId, "你好"))
+                .isInstanceOfSatisfying(RoomMessageFailure.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE);
+                    assertThat(failure.dependency()).isNull();
+                });
+        verify(permit).release();
+        verify(permit, never()).failed(any(), any());
+        verify(admission, never()).claim(any(), any(), any(), any());
+        verifyNoInteractions(profiles, producer);
+    }
+
+    @Test
+    void roomLookupMysqlErrorCountsAsDependencyFailureBeforeAnyReservation() {
+        when(rooms.exists(scope.roomId())).thenThrow(new DataAccessResourceFailureException("test"));
+
+        assertThatThrownBy(() -> service.send(scope, clientId, "你好"))
+                .isInstanceOfSatisfying(RoomMessageFailure.class,
+                        failure -> assertThat(failure.dependency()).isEqualTo(RoomMessageCircuitBreaker.Dependency.MYSQL));
+        verify(permit).failed(org.mockito.ArgumentMatchers.eq(RoomMessageCircuitBreaker.Dependency.MYSQL), any());
+        verify(permit, never()).release();
+        verify(admission, never()).claim(any(), any(), any(), any());
+        verifyNoInteractions(profiles, producer);
+    }
+
+    @Test
+    void roomLookupBudgetRejectionCanStillReturnAConcurrentQueuedResult() {
+        when(rooms.exists(scope.roomId())).thenThrow(new Unavailable());
+        when(admission.findQueued(scope, clientId, hash)).thenReturn(Optional.empty(), Optional.of(reserved));
+
+        assertThat(service.send(scope, clientId, "你好").confirmation().join()).isEqualTo(reserved);
+        verify(permit).release();
+        verify(admission, never()).claim(any(), any(), any(), any());
+        verifyNoInteractions(profiles, producer);
     }
 
     @Test

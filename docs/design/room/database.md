@@ -17,7 +17,7 @@ MySQL 的 `rooms` 保存房间标识、房主、名称和创建时间。每条�
 | 名称 | 列 | 作用 |
 | --- | --- | --- |
 | `PRIMARY` | `id` | 主键，保证房间标识唯一。 |
-| `uk_rooms_room_uuid` | `room_uuid` | 唯一索引，保证对外标识唯一，支持详情等值查询。 |
+| `uk_rooms_room_uuid` | `room_uuid` | 唯一索引，保证对外标识唯一，支持详情和存在性等值查询。 |
 | `uk_rooms_owner_user_id` | `owner_user_id` | 唯一索引，保证一人一房，并覆盖按房主等值查询及外键子列。 |
 | `idx_rooms_created_at_room_uuid` | `created_at DESC, room_uuid DESC` | 支持列表浏览顺序与游标查询的排序键。 |
 | `fk_rooms_owner_user` | `owner_user_id` | 外键，引用 `users(id)`，有房间的账号禁止直接删除。 |
@@ -58,6 +58,18 @@ FROM rooms AS r
 JOIN users AS u ON u.id = r.owner_user_id
 LEFT JOIN user_profiles AS p ON p.user_id = u.id
 WHERE r.room_uuid = #{roomUuid};
+```
+
+### 按 UUID 检查房间存在性
+
+Ticket、WebSocket 兑票、发送和历史查询使用现有的存在性查询。启用缓存后，只有需要回源的请求执行该查询。在 MySQL 主库读取，直接复用 `uk_rooms_room_uuid`，这次缓存改造沿用现有表、索引和迁移。 [缓存与回源规则](storage.md#读取和跨实例回填)
+
+```sql
+SELECT EXISTS (
+    SELECT 1
+    FROM rooms
+    WHERE room_uuid = #{roomId}
+);
 ```
 
 ### 列表查询与分页
