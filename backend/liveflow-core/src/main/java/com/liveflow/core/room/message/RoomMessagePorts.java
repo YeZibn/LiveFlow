@@ -49,6 +49,11 @@ public interface RoomMessagePorts {
 
     /** 将有效的领域提交交给 Kafka。 */
     interface Producer {
+        /** @param roomId 目标房间，已通过格式验证
+         * @throws RoomMessageFailure 无法为目标分区建立新预约
+         */
+        void requireAdmission(String roomId);
+
         /**
          * @param submission 已校验的提交及首次许可信息
          * @return 仅在 Broker 确认后正常完成的异步结果

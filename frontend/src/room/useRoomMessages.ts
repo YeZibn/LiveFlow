@@ -97,7 +97,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     state.value = 'reconnecting'
     reconnectTimer = window.setTimeout(() => {
       if (current(attempt)) void connect()
-    }, delay)
+    }, delay + Math.floor(Math.random() * delay / 4))
   }
 
   /** @returns 申请票据，注册当前连接的生命周期及消息回调 */

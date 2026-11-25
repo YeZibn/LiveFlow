@@ -1181,23 +1181,33 @@ class AuthIntegrationTest {
         String timestamp = RoomEvents.UTC_MILLIS.format(Instant.now());
         var one = new Accepted(1, room, "1", UUID.randomUUID(), Long.toString(userId), username, "甲", timestamp);
         var two = new Accepted(1, room, "2", UUID.randomUUID(), Long.toString(userId), username, "乙", timestamp);
-        history.append(List.of(one, two));
-        history.append(List.of(one, two));
+        history.append(List.of(one, two), null);
+        history.append(List.of(one, two), null);
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM room_messages WHERE room_id = ?", Integer.class, room))
                 .isEqualTo(2);
         jdbc.update("UPDATE room_messages SET stored_at = UTC_TIMESTAMP(3) - INTERVAL 25 HOUR WHERE room_id = ? AND room_seq = 1", room);
-        history.clean();
-        history.append(List.of(one)); // 过期事件重放不能令已清理的前缀复活。
+        history.clean(() -> true);
+        history.append(List.of(one), null); // 过期事件重放不能令已清理的前缀复活。
         var gap = browser.sendPath("GET", path + "?afterSeq=0", null, bearer, false);
         failure(gap, 409, "ROOM_HISTORY_GAP");
         var metadata = json.readTree(gap.body());
         assertThat(metadata.get("earliestSeq").asString()).isEqualTo("2");
         assertThat(metadata.get("storedThrough").asString()).isEqualTo("2");
         var fork = new Accepted(1, room, "2", UUID.randomUUID(), two.userId(), username, "冲突", timestamp);
-        assertThrows(IllegalStateException.class, () -> history.append(List.of(fork)));
-        failure(browser.sendPath("GET", path, null, bearer, false), 503, "ROOM_MESSAGES_UNAVAILABLE");
-        assertThat(jdbc.queryForObject("SELECT content FROM room_messages WHERE room_id = ? AND room_seq = 2",
-                String.class, room)).isEqualTo("乙");
+        String group = MESSAGE_TEST_NAMESPACE + ".liveflow-room-message-history-v1";
+        try {
+            assertThrows(IllegalStateException.class, () -> history.append(List.of(fork), null));
+            failure(browser.sendPath("GET", path, null, bearer, false), 503, "ROOM_MESSAGES_UNAVAILABLE");
+            assertThat(jdbc.queryForObject("SELECT content FROM room_messages WHERE room_id = ? AND room_seq = 2",
+                    String.class, room)).isEqualTo("乙");
+            assertThat(jdbc.queryForObject("""
+                    SELECT reason FROM room_message_processing_blocks WHERE consumer_group = ? AND room_id = ?
+                    """, String.class, group, room)).isEqualTo("HISTORY_SEQUENCE_CONFLICT");
+        } finally {
+            // 持久阻断跨测试保留。移除本用例制造的故障，允许后续用例继续共用同一 Kafka 分区。
+            jdbc.update("DELETE FROM room_message_processing_blocks WHERE consumer_group = ? AND room_id = ?",
+                    group, room);
+        }
     }
 
     @Test

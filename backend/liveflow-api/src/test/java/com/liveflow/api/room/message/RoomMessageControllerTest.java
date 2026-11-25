@@ -8,7 +8,6 @@ import com.liveflow.core.room.message.RoomMessagePorts.Receipts;
 import com.liveflow.core.room.message.RoomMessageService;
 import com.liveflow.core.room.message.RoomMessageService.SendAttempt;
 import com.liveflow.core.room.message.RoomTicketService;
-import com.liveflow.infrastructure.message.RoomKafkaRuntime;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -32,7 +31,7 @@ class RoomMessageControllerTest {
     void responseTimeoutCarriesReceiptWithoutCompletingTheBrokerFuture() {
         var messages = mock(RoomMessageService.class);
         var controller = new RoomMessageController(mock(RoomTicketService.class), messages, mock(RoomHistoryService.class),
-                mock(Receipts.class), mock(RoomKafkaRuntime.class), new SimpleMeterRegistry(), JsonMapper.builder().build());
+                mock(Receipts.class), new SimpleMeterRegistry(), JsonMapper.builder().build());
         UUID session = UUID.randomUUID();
         String room = UUID.randomUUID().toString();
         String clientId = UUID.randomUUID().toString();

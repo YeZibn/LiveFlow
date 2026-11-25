@@ -8,7 +8,6 @@ import com.liveflow.core.room.message.RoomEvents.Scope;
 import com.liveflow.core.room.message.RoomHistoryService;
 import com.liveflow.core.room.message.RoomMessageFailure;
 import com.liveflow.core.room.message.RoomMessagePorts.Receipts;
-import com.liveflow.infrastructure.message.RoomKafkaRuntime;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
 import com.liveflow.core.room.message.RoomMessageService;
@@ -54,7 +53,6 @@ public class RoomMessageController {
     private final ObjectReader reader;
     private final RoomHistoryService history;
     private final Receipts receipts;
-    private final RoomKafkaRuntime kafka;
     private final io.micrometer.core.instrument.Counter unconfirmed;
     private final io.micrometer.core.instrument.Counter catchups;
     private final io.micrometer.core.instrument.Counter sendUnknown;
@@ -64,17 +62,15 @@ public class RoomMessageController {
      * @param messages 弹幕提交与生产确认服务
      * @param history 以一致性快照提供历史的服务
      * @param receipts 当前登录范围内的回执投影
-     * @param kafka 投影消费组的接入状态
      * @param metrics 无房间或账号标签的请求指标
      * @param json 应用 JSON 映射器
      */
     public RoomMessageController(RoomTicketService tickets, RoomMessageService messages, RoomHistoryService history,
-            Receipts receipts, RoomKafkaRuntime kafka, MeterRegistry metrics, JsonMapper json) {
+            Receipts receipts, MeterRegistry metrics, JsonMapper json) {
         this.tickets = tickets;
         this.messages = messages;
         this.history = history;
         this.receipts = receipts;
-        this.kafka = kafka;
         this.unconfirmed = metrics.counter("liveflow.room.messages.receipt.unconfirmed");
         this.catchups = metrics.counter("liveflow.room.messages.history.catchup");
         this.sendUnknown = metrics.counter("liveflow.room.messages.send.unknown");
@@ -148,7 +144,6 @@ public class RoomMessageController {
                 || request.getContentLengthLong() > 0 || request.getHeader(HttpHeaders.TRANSFER_ENCODING) != null) {
             throw invalid();
         }
-        if (!kafka.receiptsReady()) throw new RoomMessageFailure(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE);
         var receipt = receipts.find(scope(jwt, roomId), UUID.fromString(submissionId));
         Map<String, Object> response;
         if (receipt.isEmpty()) {
@@ -181,7 +176,6 @@ public class RoomMessageController {
         Long after = number(query.getFirst("afterSeq"), RoomEvents.MAX_SEQUENCE);
         Long through = number(query.getFirst("throughSeq"), RoomEvents.MAX_SEQUENCE);
         if (limit != null && limit == 0 || through != null && (after == null || through < after)) throw invalid();
-        if (!kafka.historyAvailable(roomId)) throw new RoomMessageFailure(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE);
         if (after != null) catchups.increment();
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .body(history.page(roomId, limit == null ? 100 : limit.intValue(), after, through));

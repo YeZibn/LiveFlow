@@ -119,6 +119,22 @@ class RoomMessageServiceTest {
     }
 
     @Test
+    void unavailablePartitionReturnsPermitBeforeClaimingCooldown() {
+        when(rooms.exists(scope.roomId())).thenReturn(true);
+        when(profiles.read(42)).thenReturn(new Profile(42, "Viewer_42", "显示名", "显示名", "default", ""));
+        doThrow(new RoomMessageFailure(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE))
+                .when(producer).requireAdmission(scope.roomId());
+
+        assertThatThrownBy(() -> service.send(scope, clientId, "你好"))
+                .isInstanceOfSatisfying(RoomMessageFailure.class,
+                        failure -> assertThat(failure.code()).isEqualTo(RoomMessageFailure.Code.ROOM_MESSAGES_UNAVAILABLE));
+        verify(permit).release();
+        verify(permit, never()).failed(any(), any());
+        verify(admission, never()).claim(any(), any(), any(), any());
+        verify(producer, never()).publish(any());
+    }
+
+    @Test
     void pendingReservationReleasesPermitAndKeepsReadOnlyReceiptMetadata() {
         when(admission.findQueued(scope, clientId, hash)).thenThrow(
                 new RoomMessageFailure(RoomMessageFailure.Code.MESSAGE_SUBMISSION_UNKNOWN).withReceipt(reserved));

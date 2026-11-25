@@ -1,18 +1,20 @@
 # 直播间弹幕 V2 设计
 
-弹幕账号冷却和发送熔断统一在单实例保护模块定义。本文的提交部分采用已确认的熔断和单次提交方案。 [业务规则与熔断范围](../../resilience/design.md) · [发布与切换](../../resilience/deployment-and-operations.md#发布与回退)
+弹幕账号冷却和发送熔断由保护模块定义。三实例共用 Redis 账号冷却，每个实例各自维护发送熔断状态。 [业务规则与熔断范围](../../resilience/design.md) · [发布与切换](../../resilience/deployment-and-operations.md#发布与回退)
 
 ## 背景、目标与范围
 
-V1 在 JVM 内完成弹幕受理、短期去重和本机广播。V2 由 Kafka 保存提交和正式弹幕，Redis Pub/Sub 转发实时事件，MySQL 提供历史查询。首轮在一个 LiveFlow 进程中运行完整链路，HTTP、Kafka 消费和 WebSocket 位于同一部署单元。按房间的消息路由允许后续增加应用实例。 [V1 设计](../design.md) · [部署与运行](deployment-and-operations.md)
+V1 在 JVM 内完成弹幕受理、短期去重和本机广播。V2 由 Kafka 保存提交和正式弹幕，Redis Pub/Sub 转发实时事件，MySQL 提供历史查询。当前交付以单个 LiveFlow 进程为基线。本轮确定三实例方案，目标是让任意实例处理 HTTP 和 WebSocket，并在一个应用进程下线后由剩余实例接管分区。 [V1 设计](../design.md) · [部署与运行](deployment-and-operations.md)
 
-本轮覆盖纯文本发送、异步回执、房间内有序广播、历史持久化和断线补拉。画面滚动弹幕、在线人数、超大房间实时采样和多应用实例部署留待后续讨论。
+三份相同的 Spring Boot 应用使用同源代理与共享 Kafka、Redis、MySQL。每份应用运行 MVC、WebSocket、Kafka Producer、Streams 和各消费组。接入和后台独立部署、Kafka 分区扩展、Redis Cluster、MySQL 历史分库分表留待后续阶段。
 
 ## 整体设计
 
 ```mermaid
 flowchart LR
-    Vue["Vue 发送"] --> MVC["Spring MVC"]
+    Vue["Vue 客户端"] --> Proxy["同源反向代理"]
+    Proxy --> MVC["任意实例的 Spring MVC"]
+    Proxy --> Socket["A / B / C 各自持有 WebSocket"]
     MVC --> Breaker["Resilience4j 发送熔断"]
     Breaker --> Lookup["发送查询和 Redis 原子预约"]
     Lookup --> Input["Kafka 提交 Topic"]
@@ -22,7 +24,7 @@ flowchart LR
     Outcomes --> Receipts["Redis 回执查询"]
     Events --> Relay["广播消费组"]
     Relay --> Channel["Redis 房间频道"]
-    Channel --> Socket["本机 WebSocket 连接"]
+    Channel --> Socket
     Socket --> Vue
     Events --> History["历史消费组"]
     History --> Database["MySQL 历史与落库进度"]
@@ -32,12 +34,19 @@ flowchart LR
 | 参与方 | 职责 |
 | --- | --- |
 | Vue 房间页 | 管理发送草稿和异步回执，合并实时和历史弹幕，按连续房间序号展示。 |
+| 同源反向代理 | 对外提供 Vue、`/api` 和 `/ws`，在可用实例间分配新请求和 WebSocket 握手。 |
 | `liveflow-api` | 提供 Spring MVC 接口和 WebSocket，使用可信 JWT 身份，按房间管理连接和入队顺序，回传历史进度。 |
 | `liveflow-core` | 维护输入校验、发送者显示名、正式接收与去重规则、历史查询及写入事务。业务依赖通过接口承接。 |
 | `liveflow-infrastructure` | 适配 Kafka Producer、Streams 处理、Kafka 消费与确认、Redis Lua、房间频道和回执投影。 |
 | Kafka | 保存提交、正式事件和终态回执。同一房间的提交按同一分区处理。 |
 | Redis 与 JVM | Redis 保存鉴权状态、提交预约、短期回执并向当前订阅者广播。JVM 保存实际连接、有界队列和房间订阅关系。 |
-| MySQL | 保存历史事件和已连续落库的水位。用户资料、房间和鉴权数据沿用各自模块定义。 |
+| MySQL | 保存历史事件、连续落库水位及跨实例可读的处理阻断记录。用户资料、房间和鉴权数据沿用各自模块定义。 |
+
+### 三实例间的分工
+
+任意实例都可以签发和兑换 Ticket、提交弹幕及查询回执和历史。Kafka 在实例间分配后台任务；同一房间仍由一个提交分区维护顺序。实时广播消费组每条事件发布到 Redis 房间频道，各实例订阅有本机观众的频道，并向本机连接推送。代理无需为用户、房间或会话固定上游。一个用户可在 A 申请 Ticket、经 B 建立连接、向 C 发送弹幕。共享 Redis 保证一次性 Ticket 和全局账号冷却。 [接口设计](api.md) · [分区交接](event-contract.md#三实例分区交接与接入判断)
+
+本机负责的分区数量只用于后台分工。新提交由目标分区状态及生产确认决定，回执由共享 Redis 决定，历史由已提交的 MySQL 快照及受影响范围的阻断记录决定。实例间共享短期运行状态与持久故障记录，供接入判断和接管恢复使用。 [Redis 运行状态](storage.md#三实例运行状态与定时任务) · [持久阻断记录](database.md#处理阻断记录)
 
 ## 端到端流程
 
@@ -70,6 +79,8 @@ flowchart LR
 | Redis 订阅中断或连接过慢 | 受影响连接重新同步。历史保存仍由独立的消费组推进。 |
 | MySQL 写入后消费者退出 | Kafka 可能重放该批。历史唯一键和连续进度校验保证重复写入得到相同结果。 |
 | 历史消费积压 | 实时消息仍可到达。出现缺口时客户端在连续水位后补拉；水位追平后再继续。 |
+| 单个应用实例下线 | 其余实例继续接入。Kafka 重新分配任务，受影响的观众申请新 Ticket 重连，并从原连续游标补拉。 |
+| 目标分区交接或故障 | 允许正常交接期间的短时入队。持续失去处理能力时暂停受影响范围的新提交。已确认位点越界或历史冲突时依据共享记录阻断受影响的处理。 |
 | 同一房间成为热点 | 网关按房间调度，按连接隔离慢消费者。入口有界控制在途请求，按容量拒绝新的提交。 |
 
 ## 专业文档

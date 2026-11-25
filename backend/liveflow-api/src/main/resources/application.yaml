@@ -2,8 +2,16 @@
 server:
   address: ${LIVEFLOW_BIND_ADDRESS:127.0.0.1}
   port: ${LIVEFLOW_PORT:18080}
+  shutdown: graceful
+  forward-headers-strategy: ${LIVEFLOW_FORWARD_HEADERS_STRATEGY:none}
+  tomcat:
+    remoteip:
+      # 只在配置的上游代理地址范围内接受转发头。
+      internal-proxies: ${LIVEFLOW_TRUSTED_PROXY_REGEX:127[.]0[.]0[.]1|::1|0:0:0:0:0:0:0:1}
 
 spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
   application:
     name: liveflow
   # 后端运行在宿主机，使用 Compose 映射到宿主机的端口连接 MySQL、Redis 和 Kafka。
@@ -24,7 +32,7 @@ spring:
     scheduling:
       pool:
         # 水位、心跳、清理和回执重放各自推进。
-        size: 4
+        size: 5
   kafka:
     # 可覆盖完整的 broker 地址列表，本地默认连接 Kafka 的 EXTERNAL 监听器。
     bootstrap-servers: ${LIVEFLOW_KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:${LIVEFLOW_KAFKA_PORT:19092}}
@@ -37,15 +45,24 @@ management:
         include: health
   endpoint:
     health:
+      probes:
+        enabled: true
       show-details: never
 
 liveflow:
+  instance-id: ${LIVEFLOW_INSTANCE_ID:local}
+  cluster-member-ids: ${LIVEFLOW_CLUSTER_MEMBER_IDS:}
   room-messages:
     connection-limit: ${LIVEFLOW_ROOM_MESSAGES_CONNECTION_LIMIT:512}
     # 服务位于反向代理之后时，可显式配置浏览器地址。留空使用同源校验。
     allowed-origin: ${LIVEFLOW_ROOM_MESSAGES_ALLOWED_ORIGIN:}
     v2:
       accepting: ${LIVEFLOW_ROOM_MESSAGES_ACCEPTING:true}
+      snapshot-freshness: ${LIVEFLOW_ROOM_MESSAGES_SNAPSHOT_FRESHNESS:12s}
+      handoff-grace: ${LIVEFLOW_ROOM_MESSAGES_HANDOFF_GRACE:8s}
+      group-session-millis: ${LIVEFLOW_ROOM_MESSAGES_GROUP_SESSION_MILLIS:10000}
+      group-heartbeat-millis: ${LIVEFLOW_ROOM_MESSAGES_GROUP_HEARTBEAT_MILLIS:2000}
+      backlog-limit: ${LIVEFLOW_ROOM_MESSAGES_BACKLOG_LIMIT:2m}
       replication-factor: ${LIVEFLOW_ROOM_MESSAGES_KAFKA_REPLICAS:1}
       min-insync-replicas: ${LIVEFLOW_ROOM_MESSAGES_KAFKA_MIN_ISR:1}
       state-directory: ${LIVEFLOW_ROOM_MESSAGES_STATE_DIRECTORY:/tmp/liveflow-room-streams-v2}

@@ -39,10 +39,14 @@ final class RoomMessageProcessor implements Processor<String, String, String, St
     private KeyValueStore<String, String> outcomes;
     private KeyValueStore<String, String> expirations;
     private final Timer acceptance;
+    private final RoomProcessingBlocks blocks;
+    private final RoomMessageTopology layout;
 
-    private RoomMessageProcessor(RoomEventCodec codec, Timer acceptance) {
+    private RoomMessageProcessor(RoomEventCodec codec, Timer acceptance, RoomProcessingBlocks blocks, RoomMessageTopology layout) {
         this.codec = codec;
         this.acceptance = acceptance;
+        this.blocks = blocks;
+        this.layout = layout;
     }
 
     /**
@@ -51,13 +55,15 @@ final class RoomMessageProcessor implements Processor<String, String, String, St
      * @param accepted 正式事件主题
      * @param receipts 终态回执主题
      * @param acceptance 正式接收延迟
+     * @param blocks 接任方读取的持久阻断
+     * @param layout Kafka 职责与命名
      * @return 绑定业务主题与四个可恢复状态库的拓扑
      */
     static Topology topology(RoomEventCodec codec, String submissions, String accepted, String receipts,
-            Timer acceptance) {
+            Timer acceptance, RoomProcessingBlocks blocks, RoomMessageTopology layout) {
         Topology topology = new Topology()
                 .addSource("submissions", new StringDeserializer(), new StringDeserializer(), submissions)
-                .addProcessor("admit", () -> new RoomMessageProcessor(codec, acceptance), "submissions")
+                .addProcessor("admit", () -> new RoomMessageProcessor(codec, acceptance, blocks, layout), "submissions")
                 .addSink("accepted", accepted, new StringSerializer(), new StringSerializer(), "admit")
                 .addSink("receipts", receipts, new StringSerializer(), new StringSerializer(), "admit");
         for (String store : new String[]{SEQUENCES, DEDUP, OUTCOMES, EXPIRATIONS}) {
@@ -87,8 +93,12 @@ final class RoomMessageProcessor implements Processor<String, String, String, St
         try {
             input = codec.submission(record.key(), record.value());
         } catch (RuntimeException invalid) {
-            context.recordMetadata().ifPresent(meta -> LOG.error(
-                    "弹幕提交契约无效 topic={} partition={} offset={}", meta.topic(), meta.partition(), meta.offset()));
+            context.recordMetadata().ifPresent(meta -> {
+                // 提交的 Streams 事务随异常回滚；共享阻断单独提交，接任后不再投递此分区。
+                blocks.record(layout.group("admission"), meta.topic(), meta.partition(), "",
+                        "PROCESSING_ERROR", meta.offset());
+                LOG.error("弹幕提交契约无效 topic={} partition={} offset={}", meta.topic(), meta.partition(), meta.offset());
+            });
             throw invalid;
         }
         Instant now = Instant.now().truncatedTo(ChronoUnit.MILLIS);

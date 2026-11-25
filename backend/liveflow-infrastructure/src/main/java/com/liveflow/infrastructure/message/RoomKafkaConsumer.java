@@ -1,7 +1,10 @@
 package com.liveflow.infrastructure.message;
 
 import java.time.Duration;
+import com.liveflow.core.room.message.RoomHistoryService.Conflict;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -27,11 +30,13 @@ final class RoomKafkaConsumer implements AutoCloseable {
     private final String group;
     private final String topic;
     private final BatchHandler handler;
-    private final int partitionCount;
+    private final RoomProcessingBlocks blocks;
     private final AtomicBoolean running = new AtomicBoolean(true);
     private final Map<TopicPartition, Long> resumeAt = new HashMap<>();
     private final Map<TopicPartition, Long> lastCommitted = new HashMap<>();
-    private final java.util.Set<Integer> invalidOffsets = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final Set<TopicPartition> fenced = new HashSet<>();
+    private final Map<TopicPartition, Fault> unsaved = new HashMap<>();
+    private long nextBlockCheck;
     private final Map<Integer, AtomicLong> lag = new HashMap<>();
     private final Map<Integer, AtomicLong> lagAge = new HashMap<>();
     private volatile boolean assigned;
@@ -40,15 +45,19 @@ final class RoomKafkaConsumer implements AutoCloseable {
     /**
      * @param base Kafka 连接配置
      * @param group 固定职责消费组
-     * @param topic 对应的正式事件主题
+     * @param role 监控使用的消费职责
+     * @param topic 对应的事件主题
+     * @param partitions 主题分区数
+     * @param metrics 消费进度指标
+     * @param blocks 共享处理阻断
      * @param handler 结束时已确认外部副作用的批处理
      */
     RoomKafkaConsumer(Map<String, Object> base, String group, String role, String topic, int partitions,
-            MeterRegistry metrics, BatchHandler handler) {
+            MeterRegistry metrics, RoomProcessingBlocks blocks, BatchHandler handler) {
         this.group = group;
         this.topic = topic;
         this.handler = handler;
-        this.partitionCount = partitions;
+        this.blocks = blocks;
         for (int index = 0; index < partitions; index++) {
             String partition = Integer.toString(index);
             lag.put(index, metrics.gauge("liveflow.room.messages.kafka.lag",
@@ -77,10 +86,6 @@ final class RoomKafkaConsumer implements AutoCloseable {
         return assigned && running.get();
     }
 
-    boolean retains(int partition) {
-        return ready() && !invalidOffsets.contains(partition);
-    }
-
     private void consume() {
         try {
             consumer.subscribe(List.of(topic), new ConsumerRebalanceListener() {
@@ -90,27 +95,33 @@ final class RoomKafkaConsumer implements AutoCloseable {
                     partitions.forEach(partition -> {
                         resumeAt.remove(partition);
                         lastCommitted.remove(partition);
+                        fenced.remove(partition);
+                        lag.get(partition.partition()).set(-1);
+                        lagAge.get(partition.partition()).set(0);
                     });
                 }
 
                 @Override
                 public void onPartitionsAssigned(java.util.Collection<TopicPartition> partitions) {
-                    var set = java.util.Set.copyOf(partitions);
-                    // 缺失的首次提交位置从保留起点开始。已有位置意外越界由 none 阻止跳读。
-                    consumer.committed(set, Duration.ofSeconds(3)).forEach((partition, offset) -> {
+                    // 先暂停新分区。第一次消费前确认共享阻断与 Broker 上的实际位点。
+                    consumer.pause(partitions);
+                    fenced.addAll(partitions);
+                    // Kafka 在 poll 内就会初始化位置。未提交的新分区需要明确的起点。
+                    consumer.committed(Set.copyOf(partitions), Duration.ofSeconds(2)).forEach((partition, offset) -> {
                         if (offset == null) consumer.seekToBeginning(List.of(partition));
-                        else lastCommitted.put(partition, offset.offset());
+                        else consumer.seek(partition, offset.offset());
                     });
-                    consumer.pause(set.stream().filter(partition -> invalidOffsets.contains(partition.partition())).toList());
-                    assigned = partitions.size() == partitionCount;
+                    assigned = !partitions.isEmpty() || !consumer.assignment().isEmpty();
+                    nextBlockCheck = 0;
                 }
             });
             while (running.get()) {
+                refreshBlocks();
                 var iterator = resumeAt.entrySet().iterator();
                 while (iterator.hasNext()) {
                     var entry = iterator.next();
                     if (entry.getValue() <= System.nanoTime()) {
-                        consumer.resume(List.of(entry.getKey()));
+                        if (!fenced.contains(entry.getKey())) consumer.resume(List.of(entry.getKey()));
                         iterator.remove();
                     }
                 }
@@ -159,6 +170,10 @@ final class RoomKafkaConsumer implements AutoCloseable {
             lagAge.get(partition.partition()).set(0);
         } catch (WakeupException shutdown) {
             throw shutdown;
+        } catch (Conflict failure) {
+            pause(partition);
+        } catch (InvalidEvent failure) {
+            recordBlock(partition, new Fault("PROCESSING_ERROR", failure.offset));
         } catch (RuntimeException failure) {
             long first = hasEvents ? batch.getFirst().offset() : lastCommitted.getOrDefault(partition, next.offset());
             LOG.warn("弹幕消费暂停 group={} partition={} offset={} failure={}",
@@ -171,13 +186,86 @@ final class RoomKafkaConsumer implements AutoCloseable {
 
     private void fenceExpiredOffsets(OffsetOutOfRangeException failure) {
         failure.offsetOutOfRangePartitions().forEach((partition, offset) -> {
-            LOG.error("弹幕消费位置超出保留范围，等待数据修复 group={} partition={} offset={}", group, partition, offset);
-            invalidOffsets.add(partition.partition());
-            resumeAt.remove(partition);
-            // 只将客户端内存中的位置移出非法范围。暂停该分区且从不提交这次 seek。
-            consumer.pause(List.of(partition));
+            recordBlock(partition, new Fault("OFFSET_OUT_OF_RANGE", offset));
+            // 移开客户端内存中的非法位置。解除后重新读取 Broker 位点，期间不提交替代位置。
             consumer.seekToBeginning(List.of(partition));
         });
+    }
+
+    private void refreshBlocks() {
+        long now = System.nanoTime();
+        if (now < nextBlockCheck || consumer.assignment().isEmpty() && unsaved.isEmpty()) return;
+        nextBlockCheck = now + Duration.ofSeconds(1).toNanos();
+        try {
+            var pending = unsaved.entrySet().iterator();
+            while (pending.hasNext()) {
+                var entry = pending.next();
+                storeBlock(entry.getKey(), entry.getValue());
+                pending.remove();
+            }
+            Set<Integer> blocked = blocks.partitions(group, topic);
+            var toResume = new HashSet<TopicPartition>();
+            for (var partition : consumer.assignment()) {
+                if (blocked.contains(partition.partition())) pause(partition);
+                else if (fenced.contains(partition)) toResume.add(partition);
+            }
+            if (toResume.isEmpty()) return;
+            var positions = consumer.committed(toResume, Duration.ofSeconds(2));
+            for (var partition : toResume) {
+                var offset = positions.get(partition);
+                if (offset == null) {
+                    lastCommitted.remove(partition);
+                    consumer.seekToBeginning(List.of(partition));
+                } else {
+                    lastCommitted.put(partition, offset.offset());
+                    consumer.seek(partition, offset.offset());
+                }
+            }
+            fenced.removeAll(toResume);
+            consumer.resume(toResume);
+        } catch (WakeupException shutdown) {
+            throw shutdown;
+        } catch (RuntimeException failure) {
+            LOG.warn("弹幕分区阻断检查失败 group={} failure={}", group, failure.getClass().getSimpleName());
+        }
+    }
+
+    private void pause(TopicPartition partition) {
+        consumer.pause(List.of(partition));
+        fenced.add(partition);
+        resumeAt.remove(partition);
+        lag.get(partition.partition()).set(-1);
+    }
+
+    private void recordBlock(TopicPartition partition, Fault fault) {
+        pause(partition);
+        LOG.error("弹幕分区阻断 group={} partition={} reason={} offset={}",
+                group, partition, fault.reason, fault.offset);
+        try {
+            storeBlock(partition, fault);
+        } catch (RuntimeException failure) {
+            unsaved.put(partition, fault);
+            LOG.error("弹幕分区阻断保存失败 group={} partition={}", group, partition, failure);
+        }
+    }
+
+    private void storeBlock(TopicPartition partition, Fault fault) {
+        blocks.record(group, topic, partition.partition(), "", fault.reason, fault.offset);
+    }
+
+    private record Fault(String reason, long offset) {}
+
+    /** 确定无法解析的持久事件。数据库或 Redis 的暂时故障沿用普通退避。 */
+    static final class InvalidEvent extends IllegalStateException {
+        private final long offset;
+
+        /** @param offset 无法处理的事件位点
+         * @param cause 原始事件契约错误
+         */
+        InvalidEvent(long offset, Throwable cause) {
+            super("弹幕事件契约无效", cause);
+            this.offset = offset;
+        }
     }
 
     @Override

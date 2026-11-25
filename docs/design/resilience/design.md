@@ -2,6 +2,8 @@
 
 本文定义单实例的认证限流、弹幕账号冷却和已确认的弹幕发送熔断方案。熔断覆盖所有房间的弹幕发送 POST，从发送业务入口保护 MySQL 查询、Redis 预约和 Kafka 入队。直播间页面、WebSocket 收件、历史和回执查询按各自的依赖状态提供服务。 [认证设计](../auth/design.md) · [弹幕 V2 设计](../room-messages/v2/design.md)
 
+三实例仍在各进程独立维护发送断路器、熔断窗口和半开许可。登录与注册限流、弹幕账号冷却由共享 Redis 裁决。新提交触发的分区接入拒绝属于预先拒绝，释放本次许可并避免作为一次实际依赖失败计数。来源 IP 在受信代理边界处理。 [三实例部署](../room-messages/v2/deployment-and-operations.md#三实例部署)
+
 ## 技术选型与职责
 
 沿用 Java 21、Spring Boot MVC、Spring Data Redis、Redis Lua、MySQL、Kafka 和 Vue。以 `resilience4j-circuitbreaker` 2.4.0 核心库程序化接入发送入口，由 Resilience4j 管理窗口、状态和半开许可。固定窗口与账号冷却继续使用 Redis Lua 原子裁决。 [Maven 父 POM](../../../backend/pom.xml) · [Resilience4j 2.4.0](https://github.com/resilience4j/resilience4j/releases/tag/v2.4.0)

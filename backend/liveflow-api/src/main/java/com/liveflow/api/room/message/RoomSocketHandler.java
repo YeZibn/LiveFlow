@@ -10,7 +10,6 @@ import com.liveflow.core.room.message.RoomTicketService;
 import com.liveflow.core.room.message.RoomTicketStore.Binding;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
-import jakarta.annotation.PreDestroy;
 import jakarta.websocket.Session;
 import java.io.IOException;
 import java.time.Duration;
@@ -28,6 +27,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
+import org.springframework.context.SmartLifecycle;
+import org.springframework.boot.web.server.context.WebServerGracefulShutdownLifecycle;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.BinaryMessage;
@@ -50,7 +51,7 @@ import tools.jackson.databind.json.JsonMapper;
  * Redis、MySQL 和容器网络调用均在这两层锁之外。
  */
 @Component
-public class RoomSocketHandler extends AbstractWebSocketHandler {
+public class RoomSocketHandler extends AbstractWebSocketHandler implements SmartLifecycle {
     private static final Logger LOG = LoggerFactory.getLogger(RoomSocketHandler.class);
     private static final long HEARTBEAT_INTERVAL = Duration.ofSeconds(20).toNanos();
     private static final long HEARTBEAT_TIMEOUT = Duration.ofSeconds(10).toNanos();
@@ -395,8 +396,26 @@ public class RoomSocketHandler extends AbstractWebSocketHandler {
         }
     }
 
+    /** @return 先等待容器排空 HTTP，再关闭连接，最后停止 Kafka。 */
+    @Override
+    public int getPhase() {
+        return WebServerGracefulShutdownLifecycle.SMART_LIFECYCLE_PHASE - 1;
+    }
+
+    /** 允许接收房间连接。 */
+    @Override
+    public void start() {
+        stopped = false;
+    }
+
+    /** @return 当前实例尚未进入连接关闭阶段 */
+    @Override
+    public boolean isRunning() {
+        return !stopped;
+    }
+
     /** 停止接受连接，撤销订阅并逐条关闭已有连接。 */
-    @PreDestroy
+    @Override
     public void stop() {
         stopped = true;
         connections.values().forEach(connection -> close(connection, CloseStatus.GOING_AWAY, null));

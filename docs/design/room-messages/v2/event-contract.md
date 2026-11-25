@@ -101,6 +101,22 @@ Kafka Value 采用 UTF-8 JSON，字段名使用小驼峰。时间为三位小数
 3. 房间末序号、判重与终态变更、正式事件、回执事件和输入进度使用 `exactly_once_v2` 一并提交。两个输出 Topic 的消费组使用 `read_committed`。业务去重状态自正式接收起保留 30 分钟，预约终态保留到该预约的查询截止。进程重启或任务迁移时先从 changelog 恢复，再继续处理。
 4. `roomSeq` 为各房间独立的业务序号，按 Broker 追加顺序分配。展示时间只用于阅读。重复、冲突和逾期命令均不占用序号。不同房间各自编号。 [Kafka Streams 状态与事务](https://kafka.apache.org/43/streams/core-concepts/#processing-guarantees) · [Kafka 事务隔离](https://kafka.apache.org/43/design/design/#using-transactions)
 
+## 三实例分区交接与接入判断
+
+三个实例沿用同一 Streams 应用 ID，各输出消费组也沿用各自的 Group ID。Kafka 分配和转移各分区的处理权。接任实例从 changelog 恢复本地正式接收状态，输出消费者从已提交位置恢复。实例数变化时保留原 Topic、分区和位点。 [Kafka Streams 任务迁移](https://kafka.apache.org/43/streams/architecture/)
+
+发送入口在创建新预约前根据目标提交分区判断能否接入。已有预约沿用原幂等语义。
+
+| 目标分区状态 | 新提交 |
+| --- | --- |
+| 有新鲜的可处理状态 | 允许建立预约并提交，由当前 HTTP 实例的 Producer 等待 Broker 确认。 |
+| 近期确认可处理，正在正常交接 | 在交接宽限内允许短时入队，仍需受本机生产上限与待处理提交年龄约束。 |
+| 首次启动尚未恢复、无可用新鲜状态且超过宽限、已持久阻断 | 对该分区返回 `503 ROOM_MESSAGES_UNAVAILABLE`，在创建预约前结束。 |
+
+运行状态用于接入判定，处理权和事务提交仍由 Kafka 管理。交接宽限和积压收紧阈值由故障演练确定，积压保护须为既有 12 分钟正式接收期限留出恢复时间。各实例使用共享快照的采集时间判断新鲜度。发送入口按受影响分区拒绝，其他分区按各自状态处理。 [运行状态存储](storage.md#三实例运行状态与定时任务) · [接口错误语义](api.md#http-错误)
+
+Streams 未捕获异常处理收敛到 `SHUTDOWN_CLIENT`，让健康实例继续处理和接管。对明确的持久分区错误，记录具有定位信息的阻断并保留原处理进度。未定位到分区的本机错误先停本机客户端并告警，接管后若相同任务反复失败，按可复现的分区证据定位处理，恢复前保留故障位置。 [Kafka Streams 异常策略](https://kafka.apache.org/documentation/streams/developer-guide/running-app/#uncaught-exception-handler) · [处理阻断记录](database.md#处理阻断记录)
+
 ## 三个输出消费组
 
 | 消费组 | 确认点 | 失败和重放 |
@@ -110,3 +126,5 @@ Kafka Value 采用 UTF-8 JSON，字段名使用小驼峰。时间为三位小数
 | 回执投影 | Redis 已保存不可变终态，或终态已到查询截止后，才提交该分区的连续进度。 | Redis 失败时保留位置退避重试。投影可从 Kafka 回执 Topic 重建，旧记录遵守事件绝对截止时间。 [Redis 回执投影](storage.md#回执投影) |
 
 消费者关闭自动提交。遇到无法解码或版本不受支持的持久化事件时暂停对应分区，记录 Topic、分区、offset 和版本，修复后从原位置恢复。Kafka 保留期之外的进度丢失需要通过明确的历史恢复流程处理。涉及 Redis 和 MySQL 的副作用分别按各自确认边界处理。
+
+输出消费者被撤销分区后停止开启该分区的新批次。接任实例在处理分区前读取共享阻断记录，已阻断的分区保持暂停。交接过程中如果外部副作用已发生而 offset 尚未提交，按原位置重放，继续使用 MySQL 幂等校验、不可变回执和客户端序号去重。 [处理阻断记录](database.md#处理阻断记录)

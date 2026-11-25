@@ -85,6 +85,8 @@ public class RoomMessageService {
             if (concurrent.isPresent()) return existing(concurrent.get(), permit);
             throw RoomMessageFailure.dependency(ROOM_MESSAGES_UNAVAILABLE, MYSQL, unavailable);
         }
+        // 分区预检在新预约之前。拒绝在外层归还断路器许可，不占用发送冷却。
+        producer.requireAdmission(scope.roomId());
         var reservation = admission.claim(scope, clientMessageId, hash, sender);
         var queued = reservation.queued();
         if (reservation.leaseId() == null) {
