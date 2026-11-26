@@ -112,8 +112,8 @@ liveflow:
     rate-limit:
       login:
         window-seconds: 60
-        account-max-attempts: 10
-        source-max-attempts: 60
+        account-max-attempts: 5
+        source-max-attempts: 15
       registration:
         # 注册计数仍针对通过字段校验的来源 IP。
         max-attempts: ${LIVEFLOW_REGISTRATION_MAX_ATTEMPTS:10}

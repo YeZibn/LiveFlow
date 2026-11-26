@@ -467,26 +467,32 @@ class AuthIntegrationTest {
         browser.csrf();
         String account = "liveflow:auth:{login}:account:" + username;
         String otherCase = "liveflow:auth:{login}:account:" + username.toUpperCase(Locale.ROOT);
-        redis.opsForValue().set(account, "10", Duration.ofSeconds(8));
-        redis.opsForValue().set(LOGIN_SOURCE, "60", Duration.ofSeconds(37));
+        redis.opsForValue().set(account, "5", Duration.ofSeconds(8));
+        redis.opsForValue().set(LOGIN_SOURCE, "15", Duration.ofSeconds(37));
         var bothLimited = browser.send("POST", "login", credentials(password), null, true);
         failure(bothLimited, 429, "AUTH_RATE_LIMITED");
         assertThat(Integer.parseInt(bothLimited.headers().firstValue("Retry-After").orElseThrow())).isBetween(36, 37);
-        assertThat(redis.opsForValue().get(account)).isEqualTo("10");
-        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("60");
+        assertThat(redis.opsForValue().get(account)).isEqualTo("5");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("15");
         assertThat(redis.getExpire(account, TimeUnit.MILLISECONDS)).isBetween(1L, 8000L);
         assertThat(redis.getExpire(LOGIN_SOURCE, TimeUnit.MILLISECONDS)).isBetween(1L, 37000L);
 
-        var sourceLimited = browser.send("POST", "login", credentials(username.toUpperCase(Locale.ROOT), password), null, true);
+        String otherCredentials = credentials(username.toUpperCase(Locale.ROOT), password);
+        // 来源计数为 14 时仍允许密码校验，到 15 后的下一次才拒绝。
+        redis.opsForValue().set(LOGIN_SOURCE, "14", Duration.ofSeconds(30));
+        failure(browser.send("POST", "login", otherCredentials, null, true), 401, "AUTH_INVALID_CREDENTIALS");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("15");
+        var sourceLimited = browser.send("POST", "login", otherCredentials, null, true);
         failure(sourceLimited, 429, "AUTH_RATE_LIMITED");
-        assertThat(redis.hasKey(otherCase)).isFalse();
+        assertThat(redis.opsForValue().get(otherCase)).isEqualTo("1");
+        assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("15");
         redis.opsForValue().set(LOGIN_SOURCE, "1", Duration.ofSeconds(30));
         var accountLimited = browser.send("POST", "login", credentials(password), null, true);
         failure(accountLimited, 429, "AUTH_RATE_LIMITED");
         assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("1");
-        failure(browser.send("POST", "login", credentials(username.toUpperCase(Locale.ROOT), password), null, true),
+        failure(browser.send("POST", "login", otherCredentials, null, true),
                 401, "AUTH_INVALID_CREDENTIALS");
-        assertThat(redis.opsForValue().get(otherCase)).isEqualTo("1");
+        assertThat(redis.opsForValue().get(otherCase)).isEqualTo("2");
         assertThat(redis.opsForValue().get(LOGIN_SOURCE)).isEqualTo("2");
         assertThat(redis.getExpire(LOGIN_SOURCE, TimeUnit.MILLISECONDS)).isBetween(1L, 30000L);
 
@@ -502,7 +508,7 @@ class AuthIntegrationTest {
         var browser = new Browser();
         String access = access(browser.login());
         browser.csrf();
-        for (int attempt = 0; attempt < 9; attempt++) {
+        for (int attempt = 0; attempt < 4; attempt++) {
             failure(browser.send("POST", "login", credentials("wrong"), null, true), 401,
                     "AUTH_INVALID_CREDENTIALS");
         }

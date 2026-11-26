@@ -9,8 +9,8 @@
 | 参数 | 默认值 | 含义 |
 | --- | ---: | --- |
 | `login.window-seconds` | 60 | 登录固定窗口时长 |
-| `login.account-max-attempts` | 10 | 账号窗口上限 |
-| `login.source-max-attempts` | 60 | 来源 IP 窗口上限 |
+| `login.account-max-attempts` | 5 | 账号窗口上限 |
+| `login.source-max-attempts` | 15 | 来源 IP 窗口上限 |
 | `registration.window-seconds` | 600 | 注册固定窗口时长，继续支持 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` |
 | `registration.max-attempts` | 10 | 注册来源上限，继续支持 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` |
 | `room-messages.cooldown-millis` | 10000 | 同账号两次新预约的最短间隔 |

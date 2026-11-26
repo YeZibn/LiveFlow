@@ -1,8 +1,11 @@
 package com.liveflow.api.config;
 
-import com.liveflow.core.auth.session.AuthSessionStore;
 import com.liveflow.api.auth.security.AuthSecurityErrors;
+import com.liveflow.api.auth.security.CsrfProtection;
+import com.liveflow.api.auth.security.SessionCsrfFilter;
+import com.liveflow.core.auth.session.AuthSessionStore;
 import com.liveflow.core.auth.service.AccessTokenService;
+import com.liveflow.core.auth.service.AuthService;
 import jakarta.servlet.DispatcherType;
 import java.util.List;
 import java.util.UUID;
@@ -11,14 +14,12 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
 import org.springframework.http.HttpMethod;
-import org.springframework.security.config.ObjectPostProcessor;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
 import org.springframework.security.web.SecurityFilterChain;
-import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
-import org.springframework.security.web.csrf.CsrfFilter;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.security.web.util.matcher.AndRequestMatcher;
 import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatcher;
@@ -31,22 +32,14 @@ import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatche
 class SecurityConfiguration {
 
     /**
-     * 为同源 SPA 提供可读取的 CSRF Cookie，以便写请求将值回传到请求头。
-     * @return 与认证控制器和安全过滤链共用的 Cookie 仓储
-     */
-    @Bean
-    CookieCsrfTokenRepository csrfTokens() {
-        return CookieCsrfTokenRepository.withHttpOnlyFalse();
-    }
-
-    /**
      * 构建并注册 Spring Security 过滤链。
      * 健康检查允许匿名访问，{@code local} profile 额外允许本地 WebSocket 测试端点的握手。
      * 认证接口根据凭证用途分别校验 CSRF、JWT 与 Redis 当前会话，其余请求由默认拒绝规则处理。
      *
      * @param http Spring Security 提供的 Web 安全构建器，用于声明授权规则
      * @param environment 当前 Spring 环境，用于判断 {@code local} profile 是否启用
-     * @param csrfTokens 同源 Vue 使用的 CSRF Cookie 仓储
+     * @param csrf 按会话和用途校验 CSRF 凭证
+     * @param auth 解析 Refresh Cookie 所指向的候选会话
      * @param decoder Access Token 的签名和声明校验器
      * @param sessions 认证会话的权威状态仓储
      * @param errors 过滤链共用的认证错误响应
@@ -55,21 +48,15 @@ class SecurityConfiguration {
      */
     @Bean
     SecurityFilterChain securityFilterChain(HttpSecurity http, Environment environment,
-            CookieCsrfTokenRepository csrfTokens, AccessTokenService decoder,
+            CsrfProtection csrf, AuthService auth, AccessTokenService decoder,
             AuthSessionStore sessions, AuthSecurityErrors errors) throws Exception {
         // 当前登录由 JWT 与 Redis 会话决定，Servlet 会话无需保存认证状态或待恢复请求。
         return http.sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .requestCache(AbstractHttpConfigurer::disable)
                 .logout(AbstractHttpConfigurer::disable)
-                .csrf(csrf -> csrf.spa().csrfTokenRepository(csrfTokens)
-                        .withObjectPostProcessor(new ObjectPostProcessor<CsrfFilter>() {
-                            @Override
-                            public <F extends CsrfFilter> F postProcess(F filter) {
-                                // Resource Server 默认豁免 Bearer 请求。本站的浏览器写接口仍需校验 CSRF。
-                                filter.setRequireCsrfProtectionMatcher(CsrfFilter.DEFAULT_CSRF_MATCHER);
-                                return filter;
-                            }
-                        }))
+                // 会话绑定校验需要可信的 Bearer 身份，由会话感知过滤器统一处理。
+                .csrf(AbstractHttpConfigurer::disable)
+                .addFilterAfter(new SessionCsrfFilter(csrf, auth, errors), BearerTokenAuthenticationFilter.class)
                 .exceptionHandling(exceptions -> exceptions.authenticationEntryPoint(errors).accessDeniedHandler(errors))
                 .oauth2ResourceServer(resource -> resource.authenticationEntryPoint(errors)
                         .jwt(jwt -> jwt.decoder(decoder).jwtAuthenticationConverter(token -> {

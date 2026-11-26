@@ -102,7 +102,7 @@ curl --fail http://127.0.0.1:18080/actuator/health
 
 手动联调时，先请求 `GET /api/v1/auth/csrf?scope=pre-auth`，提交注册或登录时将匿名 CSRF Cookie 值作为 `X-XSRF-TOKEN`。登录成功后改用认证态 CSRF Cookie。该 Cookie 缺失时，可用当前 Refresh Cookie 请求 `GET /api/v1/auth/csrf?scope=session` 补领。生产和回环 HTTP 的名称见 [Cookie 契约](docs/design/auth/api.md#cookie-与-csrf)。
 
-登录限流采用 60 秒固定窗口，每个原样账号 10 次，每个连接来源 60 次。注册独立计数，默认每个来源 600 秒内 10 次。两个入口超限都返回 `Retry-After`。可用 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` 和 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` 配置注册额度。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
+登录限流采用 60 秒固定窗口，每个原样账号 5 次，每个连接来源 15 次。注册独立计数，默认每个来源 600 秒内 10 次。两个入口超限都返回 `Retry-After`。可用 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` 和 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` 配置注册额度。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
 
 在本地 Compose 依赖健康时，可从仓库根目录运行认证集成测试。测试会创建并清理专用账号，连接配置沿用后端的本地默认值或当前终端覆盖值，Redis 使用测试数据库 15。
 
