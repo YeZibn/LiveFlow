@@ -161,7 +161,7 @@ public class RoomMessageController {
     }
 
     /**
-     * 读取最近窗口或指定序号范围内仍在保留期的消息。
+     * 读取最近一页、向上翻页或按序号范围补拉仍在保留期的消息。
      * @param roomId 已认证客户端读取的房间
      * @param query 分页参数，每个名称只允许出现一次
      * @return 包含最大落库序号、实际读取上限及分页游标的不可缓存历史页
@@ -170,16 +170,19 @@ public class RoomMessageController {
     @GetMapping("/messages")
     public ResponseEntity<RoomHistoryService.Page> history(@PathVariable("roomId") String roomId,
             @RequestParam MultiValueMap<String, String> query) {
-        if (!Set.of("limit", "afterSeq", "throughSeq").containsAll(query.keySet())
+        if (!Set.of("limit", "beforeSeq", "afterSeq", "throughSeq").containsAll(query.keySet())
                 || query.values().stream().anyMatch(values -> values.size() != 1)) throw invalid();
         if (!RoomUuid.isCanonical(roomId)) throw invalid();
         Long limit = number(query.getFirst("limit"), 100);
+        Long before = number(query.getFirst("beforeSeq"), RoomEvents.MAX_SEQUENCE);
         Long after = number(query.getFirst("afterSeq"), RoomEvents.MAX_SEQUENCE);
         Long through = number(query.getFirst("throughSeq"), RoomEvents.MAX_SEQUENCE);
-        if (limit != null && limit == 0 || through != null && (after == null || through < after)) throw invalid();
+        if (limit != null && limit == 0) throw invalid();
+        if (before != null && (before == 0 || after != null || through != null)) throw invalid();
+        if (through != null && (after == null || through < after)) throw invalid();
         if (after != null) catchups.increment();
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
-                .body(history.page(roomId, limit == null ? 100 : limit.intValue(), after, through));
+                .body(history.page(roomId, limit == null ? 100 : limit.intValue(), before, after, through));
     }
 
     private static RoomMessageFailure invalid() {

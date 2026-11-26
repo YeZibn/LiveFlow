@@ -2,7 +2,7 @@
 
 ## 数据归属与访问场景
 
-历史消费组将 Kafka 正式事件写入 MySQL。历史接口读取同一房间最近一页或指定序号范围内的可用记录，按 `room_seq` 定位与排序。房间历史状态保存已经成功落库的最大序号，序号之间允许有缺口。房间和发送者资料依照现有模块归属，历史保留消息受理时的显示名快照。 [事件契约](event-contract.md#正式弹幕事件) · [历史接口](api.md#查询历史) · [房间数据库](../../room/database.md)
+历史消费组将 Kafka 正式事件写入 MySQL。历史接口支持最近一页、按序号向前回看和按范围补拉，均按同一房间的 `room_seq` 定位与排序。房间历史状态保存已经成功落库的最大序号，序号之间允许有缺口。房间和发送者资料依照现有模块归属，历史保留消息受理时的显示名快照。 [事件契约](event-contract.md#正式弹幕事件) · [历史接口](api.md#查询历史) · [房间数据库](../../room/database.md)
 
 ### 发送熔断的数据边界
 
@@ -117,13 +117,21 @@ CREATE TABLE room_message_processing_blocks (
 目标分区存在历史持久阻断时返回不可用。切换期间仍尊重尚未处置的旧历史阻断记录。正常交接、落库延迟及序号缺口继续返回快照内的可读页。WebSocket 历史进度通知采用相同阻断范围。 [阻断记录](#处理阻断记录) · [历史接口](api.md#查询历史)
 
 ```sql
--- 新进房读取最近一段。查询倒序返回，接口在内存反转成升序。
+-- 新进房读取最近一段。查询倒序返回，服务层截取本页后转成升序。
 SELECT room_seq, message_id, sender_name, content, sent_at
 FROM room_messages
 WHERE room_id = :roomId AND room_seq <= :latestStoredSeq
   AND sent_at > :cutoff
 ORDER BY room_seq DESC
-LIMIT :limit;
+LIMIT :fetchSize;
+
+-- 向上翻页，排除客户端已有的边界弹幕。
+SELECT room_seq, message_id, sender_name, content, sent_at
+FROM room_messages
+WHERE room_id = :roomId AND room_seq < :beforeSeq
+  AND room_seq <= :latestStoredSeq AND sent_at > :cutoff
+ORDER BY room_seq DESC
+LIMIT :fetchSize;
 
 -- 范围分页。读上限取请求指定上限与本次最大落库序号中的较小者。
 SELECT room_seq, message_id, sender_name, content, sent_at
@@ -134,7 +142,9 @@ ORDER BY room_seq ASC
 LIMIT :fetchSize;
 ```
 
-范围分页读取 `limit + 1` 行判断当前是否还有下一页。游标经过已清理的序号时直接扫描仍未到期的记录。若两次请求之间有迟到记录落在已读游标之前，下一次重新读取最近窗口或该序号范围时可以查到。 [历史接口字段](api.md#查询历史)
+三种查询的 `fetchSize` 均为 `limit + 1`，最多向服务层返回 101 行。服务层保留排序后的前 `limit` 行，额外一行只用于判断该方向还有记录。最近页和向上页截取后再转成升序，并用结果中最小的 `room_seq` 生成 `nextBeforeSeq`。范围页仍用结果中最大的 `room_seq` 推进 `nextAfterSeq`。
+
+向上翻页沿 `(room_id, room_seq)` 主键对同一房间做倒序范围扫描，使用同一次请求的 UTC 截止时间过滤过期记录，扫描会越过缺号或已删除的序号。每页各自读取一致性快照。若迟到记录在某个范围已读完后才落库，重新查询覆盖该序号的范围可以读到它。此项设计复用现有表和索引，无需 Flyway 迁移或历史回填。 [历史接口字段](api.md#查询历史)
 
 ## 保留和迁移
 

@@ -90,9 +90,9 @@ public interface RoomHistoryMapper {
 
     /**
      * @param roomId 房间 UUID
-     * @param through 快照的最大落库序号
+     * @param through 包含的上界，由快照进度和向上游标共同确定
      * @param cutoff 受理时间小于或等于该值的记录已过期
-     * @param size 最大返回条数
+     * @param size 最大返回条数，包含用于判断是否还有更早页的额外一条
      * @return 序号倒序的最近历史
      */
     @Select("SELECT " + ROW + " FROM room_messages WHERE room_id = #{roomId} AND room_seq <= #{through}"

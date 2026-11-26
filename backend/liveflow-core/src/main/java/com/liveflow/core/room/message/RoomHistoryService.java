@@ -118,12 +118,13 @@ public class RoomHistoryService {
      * 在同一读快照中核对分区阻断、最大落库序号和当前历史页。
      * @param roomId 规范房间 UUID
      * @param size 请求的历史条数
-     * @param after 可选的排他游标，省略时读取最近窗口
+     * @param before 可选的向上排他游标，已由接口验证为正数且与向后范围参数互斥
+     * @param after 可选的范围补拉排他下界，两个游标均省略时读取最近窗口
      * @param through 可选的请求上界，由接口验证与游标的关系
      * @return 按房间序号升序的公开历史页
      * @throws RoomMessageFailure 房间无效、缺失或历史无法读取
      */
-    public Page page(String roomId, int size, Long after, Long through) {
+    public Page page(String roomId, int size, Long before, Long after, Long through) {
         if (!RoomUuid.isCanonical(roomId)) throw new RoomMessageFailure(INVALID_REQUEST);
         if (!rooms.exists(roomId)) throw new RoomMessageFailure(ROOM_NOT_FOUND);
         LocalDateTime cutoff = retentionCutoff();
@@ -134,17 +135,22 @@ public class RoomHistoryService {
             State state = mapper.state(roomId);
             long latest = state == null ? 0 : state.latestStoredSeq();
             long readThrough = through == null ? latest : Math.min(through, latest);
-            List<Row> rows;
+            String latestText = Long.toString(latest);
             if (after == null) {
-                rows = mapper.latest(roomId, readThrough, cutoff, size).reversed();
-            } else if (after < readThrough) {
-                rows = mapper.range(roomId, after, readThrough, cutoff, size + 1);
-            } else {
-                rows = List.of();
+                // 序号是整数，排他上界可转换成同一个主键查询使用的包含上界。
+                long upper = before == null ? readThrough : Math.min(readThrough, before - 1);
+                var rows = mapper.latest(roomId, upper, cutoff, size + 1);
+                boolean hasEarlier = rows.size() > size;
+                // 先从倒序结果中剔除探测行，再将本页转成展示用的升序。
+                var page = rows.subList(0, Math.min(rows.size(), size)).reversed();
+                String nextBefore = hasEarlier ? Long.toString(page.getFirst().roomSeq()) : null;
+                return new Page(page.stream().map(RoomHistoryService::message).toList(),
+                        latestText, latestText, nextBefore, null);
             }
-            String next = rows.size() > size ? Long.toString(rows.get(size - 1).roomSeq()) : null;
+            var rows = after < readThrough ? mapper.range(roomId, after, readThrough, cutoff, size + 1) : List.<Row>of();
+            String nextAfter = rows.size() > size ? Long.toString(rows.get(size - 1).roomSeq()) : null;
             return new Page(rows.stream().limit(size).map(RoomHistoryService::message).toList(),
-                    Long.toString(latest), Long.toString(readThrough), next);
+                    latestText, Long.toString(readThrough), null, nextAfter);
         });
     }
 
@@ -218,8 +224,10 @@ public class RoomHistoryService {
     /**
      * @param items 同一快照内按序号升序排列的消息
      * @param latestStoredSeq 该房间曾成功写入的最大序号
-     * @param throughSeq 本页的实际读取上限
+     * @param throughSeq 范围补拉的实际读取上限，其余模式为最大落库序号
+     * @param nextBeforeSeq 最近页或向上页还有更早记录时，本页最小序号，否则为 null
      * @param nextAfterSeq 范围模式仍有下一页时的排他游标，否则为 null
      */
-    public record Page(List<Message> items, String latestStoredSeq, String throughSeq, String nextAfterSeq) {}
+    public record Page(List<Message> items, String latestStoredSeq, String throughSeq,
+            String nextBeforeSeq, String nextAfterSeq) {}
 }

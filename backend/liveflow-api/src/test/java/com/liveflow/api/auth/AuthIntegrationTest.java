@@ -42,6 +42,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.IntStream;
 import javax.crypto.spec.SecretKeySpec;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -1246,6 +1247,63 @@ class AuthIntegrationTest {
     }
 
     @Test
+    void historyPagesBackwardAcrossMissingAndExpiredSequences() throws Exception {
+        var browser = new Browser();
+        String bearer = access(browser.login());
+        String room = createRoomFor(browser, bearer);
+        var otherBrowser = new Browser();
+        String otherName = registrationName("History_");
+        jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
+                + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?", otherName, userId);
+        String otherRoom = createRoomFor(otherBrowser, access(otherBrowser.login(otherName)));
+        String path = messagePath(room, "messages");
+        Instant now = Instant.now();
+        var records = IntStream.rangeClosed(1, 203).filter(seq -> seq != 102)
+                .mapToObj(seq -> new HistoryRecord(historyEvent(room, seq, UUID.randomUUID(), "本房间", now), seq))
+                .toList();
+        history.append(records);
+        history.append(List.of(new HistoryRecord(historyEvent(otherRoom, 1, UUID.randomUUID(), "其他房间", now), 1)));
+        jdbc.update("UPDATE room_messages SET sent_at = UTC_TIMESTAMP(3) - INTERVAL 24 HOUR"
+                + " WHERE room_id = ? AND room_seq = 1", room);
+
+        var recent = roomResponse(browser.sendPath("GET", path, null, bearer, false), 200);
+        assertThat(recent.get("items").size()).isEqualTo(100);
+        assertThat(recent.get("items").get(0).get("roomSeq").asString()).isEqualTo("104");
+        assertThat(recent.get("items").get(99).get("roomSeq").asString()).isEqualTo("203");
+        assertThat(recent.get("nextBeforeSeq").asString()).isEqualTo("104");
+        assertThat(recent.get("nextAfterSeq").isNull()).isTrue();
+
+        var older = roomResponse(browser.sendPath("GET", path + "?beforeSeq=104", null, bearer, false), 200);
+        assertThat(older.get("items").size()).isEqualTo(100);
+        var actual = IntStream.range(0, 100)
+                .mapToObj(i -> older.get("items").get(i).get("roomSeq").asString()).toList();
+        var expected = IntStream.rangeClosed(3, 103).filter(seq -> seq != 102).mapToObj(Integer::toString).toList();
+        assertThat(actual).containsExactlyElementsOf(expected);
+        assertThat(older.get("nextBeforeSeq").asString()).isEqualTo("3");
+        assertThat(older.get("throughSeq").asString()).isEqualTo("203");
+        assertThat(older.get("latestStoredSeq").asString()).isEqualTo("203");
+        assertThat(older.get("nextAfterSeq").isNull()).isTrue();
+
+        var last = roomResponse(browser.sendPath("GET", path + "?beforeSeq=3&limit=1", null, bearer, false), 200);
+        assertThat(last.get("items").size()).isOne();
+        assertThat(last.get("items").get(0).get("roomSeq").asString()).isEqualTo("2");
+        assertThat(last.get("nextBeforeSeq").isNull()).isTrue();
+        for (String boundary : List.of("1", "2")) {
+            var empty = roomResponse(browser.sendPath("GET", path + "?beforeSeq=" + boundary, null, bearer, false), 200);
+            assertThat(empty.get("items").size()).isZero();
+            assertThat(empty.get("nextBeforeSeq").isNull()).isTrue();
+            assertThat(empty.get("nextAfterSeq").isNull()).isTrue();
+        }
+        var gap = roomResponse(browser.sendPath("GET", path + "?beforeSeq=102&limit=1", null, bearer, false), 200);
+        assertThat(gap.get("items").get(0).get("roomSeq").asString()).isEqualTo("101");
+        for (String query : List.of("?beforeSeq=0", "?beforeSeq=-1", "?beforeSeq=01", "?beforeSeq=abc",
+                "?beforeSeq=9223372036854775807", "?beforeSeq=3&beforeSeq=4",
+                "?beforeSeq=3&afterSeq=0", "?beforeSeq=3&throughSeq=10", "?beforeSeq=3&limit=101")) {
+            failure(browser.sendPath("GET", path + query, null, bearer, false), 400, "INVALID_REQUEST");
+        }
+    }
+
+    @Test
     void historyProgressOnlyNotifiesIncreasesAndRespectsPartitionBlocks() throws Exception {
         var browser = new Browser();
         String bearer = access(browser.login());
@@ -1271,6 +1329,8 @@ class AuthIntegrationTest {
                     """, historyGroup(), topic, partition(room));
             try {
                 failure(browser.sendPath("GET", path, null, bearer, false), 503, "ROOM_MESSAGES_UNAVAILABLE");
+                failure(browser.sendPath("GET", path + "?beforeSeq=103", null, bearer, false), 503,
+                        "ROOM_MESSAGES_UNAVAILABLE");
                 assertThat(history.progress(List.of(room))).isEmpty();
             } finally {
                 jdbc.update("DELETE FROM room_message_processing_blocks WHERE consumer_group = ? AND topic_name = ?"

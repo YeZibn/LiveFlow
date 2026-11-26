@@ -32,10 +32,13 @@ export type MessageReceipt =
 
 export interface MessageSubmission { clientMessageId: string; content: string }
 
+export type HistoryCursor = { beforeSeq: string } | { afterSeq: string; throughSeq?: string }
+
 export interface HistoryPage {
   items: RoomMessage[]
   latestStoredSeq: string
   throughSeq: string
+  nextBeforeSeq: string | null
   nextAfterSeq: string | null
 }
 
@@ -110,25 +113,47 @@ export async function requestMessageReceipt(access: string, roomId: string, id: 
 }
 
 /**
- * 获取最近 100 条历史。响应可以为空或有序号缺口。
+ * 读取一页历史，允许空页和序号缺口。省略游标时读取最近一页。
  * @param access 当前会话的 Access Token
  * @param roomId 当前房间 UUID
- * @returns 同一数据库快照中的消息和最大落库序号
+ * @param cursor 可选的向上排他游标或向后补拉范围
+ * @returns 同一快照中的消息、最大落库序号和对应方向的下一页游标
  * @throws ApiRequestError 历史无法读取或响应无效
  */
-export async function requestRoomHistory(access: string, roomId: string): Promise<HistoryPage> {
-  const page = await requestJson<HistoryPage>(`${roomUrl(roomId)}/messages`, { access })
-  if (!Array.isArray(page.items) || page.items.length > 100 || !page.items.every(isMessage)
-    || !isSequence(page.latestStoredSeq) || page.throughSeq !== page.latestStoredSeq || page.nextAfterSeq !== null) {
+export async function requestRoomHistory(access: string, roomId: string, cursor?: HistoryCursor): Promise<HistoryPage> {
+  const params = new URLSearchParams()
+  const before = cursor && 'beforeSeq' in cursor ? cursor.beforeSeq : undefined
+  const range = cursor && 'afterSeq' in cursor ? cursor : undefined
+  if (before !== undefined) params.set('beforeSeq', before)
+  if (range) {
+    params.set('afterSeq', range.afterSeq)
+    if (range.throughSeq !== undefined) params.set('throughSeq', range.throughSeq)
+  }
+  const path = `${roomUrl(roomId)}/messages`
+  const page = await requestJson<HistoryPage>(cursor ? `${path}?${params}` : path, { access })
+  if (!isObject(page) || !Array.isArray(page.items) || page.items.length > 100 || !page.items.every(isMessage)
+    || !isSequence(page.latestStoredSeq) || !isSequence(page.throughSeq)) {
     throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史响应无效。')
   }
-  // 最近页要求升序、无重复且不超过当页上界，允许中间缺号和最后一条已过期。
   const latest = BigInt(page.latestStoredSeq)
-  let previous = 0n
+  const requestedUpper = range?.throughSeq === undefined ? latest : BigInt(range.throughSeq)
+  const upper = BigInt(page.throughSeq)
+  const first = page.items[0]?.roomSeq
+  const last = page.items.at(-1)?.roomSeq
+  if (upper !== (requestedUpper < latest ? requestedUpper : latest)
+    || (page.nextBeforeSeq !== null && (range || page.items.length !== 100 || page.nextBeforeSeq !== first))
+    || (page.nextAfterSeq !== null && (!range || page.items.length !== 100 || page.nextAfterSeq !== last))) {
+    throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史分页游标无效。')
+  }
+
+  // 页内序号严格递增。向上边界独立于快照上界，应排除客户端已有的边界消息。
+  const exclusiveUpper = before === undefined ? undefined : BigInt(before)
+  let previous = range ? BigInt(range.afterSeq) : 0n
   const ids = new Set<string>()
   for (const item of page.items) {
     const sequence = BigInt(item.roomSeq)
-    if (sequence <= previous || sequence > latest || ids.has(item.messageId)) {
+    if (sequence <= previous || sequence > upper || (exclusiveUpper !== undefined && sequence >= exclusiveUpper)
+      || ids.has(item.messageId)) {
       throw new ApiRequestError(0, 'RESPONSE_INVALID', '历史顺序无法确认。')
     }
     previous = sequence

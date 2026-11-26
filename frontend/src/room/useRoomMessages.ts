@@ -1,4 +1,4 @@
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
 import { authClient } from '../auth/authClient'
 import type { WithAccess } from '../auth/useAuth'
@@ -17,6 +17,15 @@ interface HistoryRefresh {
   timer?: number
 }
 
+interface ReadingHistory {
+  messages: RoomMessage[]
+  /** 回看开始时最晚的一条。更晚的消息只进入最近窗口。 */
+  head: bigint
+  before: string | null
+  status: 'idle' | 'loading' | 'error' | 'end'
+  loadedOlder: boolean
+}
+
 interface PendingSubmission {
   body: MessageSubmission
   draftRevision: number
@@ -32,7 +41,16 @@ interface PendingSubmission {
 export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   const state = ref<'connecting' | 'ready' | 'reconnecting' | 'offline'>('connecting')
   const connectionError = ref('')
-  const messages = ref<RoomMessage[]>([])
+  const recent = shallowRef<RoomMessage[]>([])
+  const reading = shallowRef<ReadingHistory>()
+  const messages = computed(() => reading.value?.messages ?? recent.value)
+  const isReading = computed(() => reading.value !== undefined)
+  const olderStatus = computed(() => reading.value?.status ?? 'idle')
+  const hasNewMessages = computed(() => {
+    const latest = recent.value.at(-1)
+    return !!reading.value && !!latest && BigInt(latest.roomSeq) > reading.value.head
+  })
+  const canFollowFromBottom = computed(() => !!reading.value && !reading.value.loadedOlder && !hasNewMessages.value)
   const content = ref('')
   const submitting = ref(false)
   const feedback = ref('')
@@ -70,6 +88,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     window.clearTimeout(readyTimer)
     window.clearTimeout(reconnectTimer)
     cancelHistory()
+    endReading()
     window.clearTimeout(cooldownTimer)
     clearPending()
     socket?.close()
@@ -147,7 +166,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
           connection.close()
         } else if (state.value === 'ready') {
           if (frame.type === 'message') {
-            mergeMessages([frame], false)
+            receiveMessages([frame], false)
           } else if (frame.type === 'resync_required'
             || (frame.type === 'history_progress' && BigInt(frame.latestStoredSeq) > latestSeen)) {
             refreshHistory()
@@ -185,17 +204,80 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
   }
 
   /**
-   * 以消息 ID 和房间序号合并最近窗口，迟到弹幕只要仍在窗口内便能插入。
-   * @param incoming 当前实时帧或最近历史返回的消息
-   * @param persisted 历史记录具有权威性，可以替换冲突的实时记录
+   * 将实时帧和最近历史合入跟随窗口，同时纠正回看范围内的记录。
+   * @param incoming 最新收到的实时帧或最近历史
+   * @param persisted 是否来自已落库的历史查询
    */
-  function mergeMessages(incoming: RoomMessage[], persisted: boolean) {
-    const bySequence = new Map(messages.value.map(message => [message.roomSeq, message]))
-    const byId = new Map(messages.value.map(message => [message.messageId, message]))
+  function receiveMessages(incoming: RoomMessage[], persisted: boolean) {
+    const view = reading.value
+    if (view) {
+      const first = BigInt(view.messages[0].roomSeq)
+      const visibleRange = incoming.filter(item => {
+        const sequence = BigInt(item.roomSeq)
+        return sequence >= first && sequence <= view.head
+      })
+      view.messages = mergeMessages(view.messages, visibleRange, persisted)
+    }
+    const last = incoming.at(-1)
+    if (last && BigInt(last.roomSeq) > latestSeen) latestSeen = BigInt(last.roomSeq)
+    recent.value = mergeMessages(recent.value, incoming, persisted, HISTORY_LIMIT)
+  }
+
+  /** 冻结当前列表的阅读范围，首次向上查询用实际显示的最小序号。 */
+  function beginReading() {
+    if (reading.value || recent.value.length === 0) return
+    const displayed = recent.value
+    reading.value = shallowReactive<ReadingHistory>({
+      messages: displayed,
+      head: BigInt(displayed.at(-1)!.roomSeq),
+      before: displayed[0].roomSeq,
+      status: 'idle',
+      loadedOlder: false,
+    })
+  }
+
+  /** 释放当前回看和它的请求身份，使迟到结果失效。 */
+  function endReading() {
+    reading.value = undefined
+  }
+
+  /**
+   * 读取并合并更早一页。失败时保留游标，供用户重试。
+   * @returns 本次加载结束或无可用游标时完成
+   */
+  async function loadOlder() {
+    beginReading()
+    const view = reading.value
+    if (!view || view.before === null || view.status === 'loading') return
+    const beforeSeq = view.before
+    view.status = 'loading'
+    try {
+      const page = await withAccess(access => requestRoomHistory(access, roomId, { beforeSeq }))
+      // 连接重建不影响历史 GET，只有退出回看或更换房间会作废本次结果。
+      if (view !== reading.value) return
+      view.messages = mergeMessages(view.messages, page.items, true)
+      view.before = page.nextBeforeSeq
+      if (page.items.length > 0) view.loadedOlder = true
+      view.status = view.before === null ? 'end' : 'idle'
+    } catch {
+      if (view === reading.value) view.status = 'error'
+    }
+  }
+
+  /**
+   * 以消息 ID 和房间序号合并，保持两种唯一标识与房间顺序。
+   * @param existing 当前窗口或回看的消息
+   * @param incoming 当前实时帧或历史返回的消息
+   * @param persisted 历史记录具有权威性，可以替换冲突的实时记录
+   * @param limit 最近窗口的条数上限，回看累积用户主动加载的页
+   * @returns 合并后的升序列表，无可见变化时复用原列表
+   */
+  function mergeMessages(existing: RoomMessage[], incoming: RoomMessage[], persisted: boolean, limit?: number) {
+    if (incoming.length === 0) return existing
+    const bySequence = new Map(existing.map(message => [message.roomSeq, message]))
+    const byId = new Map(existing.map(message => [message.messageId, message]))
     let changed = false
     for (const item of incoming) {
-      const sequence = BigInt(item.roomSeq)
-      if (sequence > latestSeen) latestSeen = sequence
       const sameSequence = bySequence.get(item.roomSeq)
       const sameId = byId.get(item.messageId)
       if (sameSequence || sameId) {
@@ -214,13 +296,13 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
       byId.set(item.messageId, item)
       changed = true
     }
-    if (!changed) return
+    if (!changed) return existing
     const merged = Array.from(bySequence.values()).sort((a, b) => BigInt(a.roomSeq) < BigInt(b.roomSeq) ? -1 : 1)
-      .slice(-HISTORY_LIMIT)
+    const visible = limit === undefined ? merged : merged.slice(-limit)
     // 窗口外的迟到项被裁剪时无需重新渲染，避免打断正在上翻的读者。
-    if (merged.length !== messages.value.length || merged.some((item, index) => item !== messages.value[index])) {
-      messages.value = merged
-    }
+    return visible.length !== existing.length || visible.some((item, index) => item !== existing[index])
+      ? visible
+      : existing
   }
 
   /** 连接换代或退出时作废计时器和在途响应，历史回调不能写入新连接。 */
@@ -261,7 +343,7 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
     try {
       const page = await withAccess(access => requestRoomHistory(access, roomId))
       if (refresh !== historyRefresh) return
-      mergeMessages(page.items, true)
+      receiveMessages(page.items, true)
       refresh.failures = 0
       syncFeedback.value = ''
     } catch (failure) {
@@ -446,5 +528,6 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
 
   return { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
     syncing, syncFeedback, cooldownSeconds, showSubmissionActions, pendingContent, canCheckReceipt,
-    checkingReceipt, checkReceipt, dismissSubmission }
+    checkingReceipt, checkReceipt, dismissSubmission, isReading, olderStatus, hasNewMessages,
+    canFollowFromBottom, beginReading, endReading, loadOlder }
 }

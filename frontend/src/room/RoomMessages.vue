@@ -10,37 +10,69 @@ const props = defineProps<{
 
 const { state, connectionError, messages, content, submitting, canSend, feedback, failed, reconnect, send,
   syncing, syncFeedback, cooldownSeconds, showSubmissionActions, pendingContent, canCheckReceipt,
-  checkingReceipt, checkReceipt, dismissSubmission } =
+  checkingReceipt, checkReceipt, dismissSubmission, isReading, olderStatus, hasNewMessages,
+  canFollowFromBottom, beginReading, endReading, loadOlder } =
   useRoomMessages(props.roomId, props.withAccess)
 const log = ref<HTMLElement>()
-const hasNewMessages = ref(false)
+const LOAD_EARLIER_DISTANCE = 48
+let lastScrollTop = 0
 const formatter = new Intl.DateTimeFormat('zh-CN', {
   hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
 })
 const stateName = { connecting: '连接中', ready: '已连接', reconnecting: '正在重连', offline: '连接已断开' }
 
-// 先从更新前的 DOM 取可见位置，等 Vue 渲染后再应用跟随或阅读锚点。
+// 先读取更新前的可见项位置，插入上页后再恢复同一个阅读锚点。
 watch(messages, async updated => {
   const node = log.value
   if (!node) return
-  const following = isNearBottom(node)
-  const top = node.getBoundingClientRect().top
-  // 记录仍保留的首个可见项，以便顶部裁剪后恢复它原来的屏幕位置。
-  const retained = new Set(updated.map(item => item.messageId))
-  const anchor = following ? undefined : Array.from(node.querySelectorAll<HTMLElement>('li[data-message-id]'))
-    .find(row => retained.has(row.dataset.messageId ?? '') && row.getBoundingClientRect().bottom > top)
-  const priorTop = anchor?.getBoundingClientRect().top
-  if (!following) hasNewMessages.value = true
+  const anchors = isReading.value ? visibleAnchors(node) : []
   await nextTick()
-  if (log.value !== node) return
-  if (following) {
-    jumpToLatest()
-  } else if (anchor && priorTop !== undefined) {
-    node.scrollTop += anchor.getBoundingClientRect().top - priorTop
-  } else {
-    node.scrollTop = 0
+  if (log.value !== node || messages.value !== updated) return
+  if (!isReading.value) {
+    scrollTo(node, node.scrollHeight)
+    return
   }
+
+  const rendered = Array.from(node.querySelectorAll<HTMLElement>('li[data-message-id]'))
+  for (const anchor of anchors) {
+    // 持久记录纠正消息 ID 时，优先把同一序号留在原位，其次保留相邻可见项。
+    const row = rendered.find(item => item.dataset.messageId === anchor.id)
+      ?? rendered.find(item => item.dataset.roomSeq === anchor.sequence)
+    if (row) {
+      const offset = row.getBoundingClientRect().top - node.getBoundingClientRect().top
+      scrollTo(node, node.scrollTop + offset - anchor.offset)
+      return
+    }
+  }
+  lastScrollTop = node.scrollTop
 })
+
+/**
+ * @param node 独立滚动的弹幕容器
+ * @returns 按展示顺序记录的可见消息和它们相对容器的顶部偏移
+ */
+function visibleAnchors(node: HTMLElement) {
+  const { top, bottom } = node.getBoundingClientRect()
+  const anchors = []
+  for (const row of Array.from(node.querySelectorAll<HTMLElement>('li[data-message-id]'))) {
+    const bounds = row.getBoundingClientRect()
+    if (bounds.top >= bottom) break
+    if (bounds.bottom > top) {
+      anchors.push({ id: row.dataset.messageId, sequence: row.dataset.roomSeq, offset: bounds.top - top })
+    }
+  }
+  return anchors
+}
+
+/**
+ * 写入程序滚动位置并同步比较基准，后续 scroll 事件不会被视为用户上翻。
+ * @param node 弹幕滚动容器
+ * @param top 目标位置，浏览器会将其限制在可滚动范围内
+ */
+function scrollTo(node: HTMLElement, top: number) {
+  node.scrollTop = top
+  lastScrollTop = node.scrollTop
+}
 
 /**
  * 判断阅读位置是否在列表底部附近，容许行高和像素取整带来的少量偏差。
@@ -51,15 +83,28 @@ function isNearBottom(node: HTMLElement) {
   return node.scrollHeight - node.clientHeight - node.scrollTop <= 24
 }
 
-/** 用户滚回底部后，清除新消息提示。 */
+/** 只在用户向上移动并接近顶部时自动加载。失败后的重试由按钮触发。 */
 function onScroll() {
-  if (log.value && isNearBottom(log.value)) hasNewMessages.value = false
+  const node = log.value
+  if (!node || node.scrollTop === lastScrollTop) return
+  const movingUp = node.scrollTop < lastScrollTop
+  lastScrollTop = node.scrollTop
+  if (isNearBottom(node)) {
+    if (canFollowFromBottom.value) endReading()
+    return
+  }
+  beginReading()
+  if (movingUp && node.scrollTop <= LOAD_EARLIER_DISTANCE && olderStatus.value === 'idle') void loadOlder()
 }
 
 /** 将列表恢复到跟随最新消息的位置。 */
-function jumpToLatest() {
-  if (log.value) log.value.scrollTop = log.value.scrollHeight
-  hasNewMessages.value = false
+async function jumpToLatest() {
+  endReading()
+  await nextTick()
+  const node = log.value
+  if (!node) return
+  scrollTo(node, node.scrollHeight)
+  node.focus({ preventScroll: true })
 }
 
 /**
@@ -91,18 +136,31 @@ function handleEnter(event: KeyboardEvent) {
     </header>
 
     <div class="message-area">
-      <div ref="log" class="message-log" role="log" aria-label="直播间弹幕" tabindex="0" @scroll="onScroll">
+      <div ref="log" class="message-log" role="log" aria-label="直播间弹幕"
+        :aria-live="isReading ? 'off' : 'polite'" tabindex="0" @scroll="onScroll">
         <p v-if="messages.length === 0" class="empty">
           {{ state === 'ready' ? '还没有弹幕' : '连接后即可接收弹幕' }}
         </p>
-        <ol v-else>
-          <li v-for="item in messages" :key="item.messageId" :data-message-id="item.messageId">
-            <time :datetime="item.sentAt">{{ formatter.format(new Date(item.sentAt)) }}</time>
-            <span class="line"><strong>{{ item.senderName }}</strong>：{{ item.content }}</span>
-          </li>
-        </ol>
+        <template v-else>
+          <div class="older">
+            <p v-if="olderStatus === 'end'" class="feedback" role="status">没有更早的弹幕</p>
+            <button v-else type="button" class="ui-button reconnect" :disabled="olderStatus === 'loading'"
+              @click="loadOlder">
+              {{ olderStatus === 'loading' ? '正在加载…' : olderStatus === 'error' ? '重试加载更早弹幕' : '加载更早' }}
+            </button>
+          </div>
+          <ol>
+            <li v-for="item in messages" :key="item.messageId" :data-message-id="item.messageId"
+              :data-room-seq="item.roomSeq">
+              <time :datetime="item.sentAt">{{ formatter.format(new Date(item.sentAt)) }}</time>
+              <span class="line"><strong>{{ item.senderName }}</strong>：{{ item.content }}</span>
+            </li>
+          </ol>
+        </template>
       </div>
-      <button v-if="hasNewMessages" class="ui-button latest" type="button" @click="jumpToLatest">查看新消息</button>
+      <button v-if="isReading" class="ui-button latest" type="button" @click="jumpToLatest">
+        {{ hasNewMessages ? '查看新消息' : '回到最新' }}
+      </button>
     </div>
 
     <footer class="composer">
@@ -161,6 +219,7 @@ h2 { margin: 0; font-size: 1rem; }
 .message-area { position: relative; min-height: 0; }
 .message-log { height: 100%; overflow-y: auto; overflow-anchor: none; overscroll-behavior: contain; padding: 0.65rem 0.9rem; }
 .message-log:focus-visible { outline-offset: -3px; }
+.older { display: grid; place-items: center; min-height: 2.4rem; padding-block: 0.2rem; }
 .message-log ol { list-style: none; padding: 0; margin: 0; }
 .message-log li { display: grid; grid-template-columns: 8ch minmax(0, 1fr); gap: 0.4rem; padding: 0.35rem 0; font-size: 0.875rem; line-height: 1.5; }
 .message-log time { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
