@@ -54,6 +54,7 @@ docker compose ps
 ```bash
 # 首次本地启动时生成密钥。需要跨重启保留凭证时，从私有配置注入同一密钥。
 export LIVEFLOW_JWT_SIGNING_KEY="$(openssl rand -base64 32)"
+export LIVEFLOW_CSRF_SIGNING_KEY="$(openssl rand -base64 32)"
 export LIVEFLOW_LOCAL_SECURE_COOKIE=false
 cd backend
 ./mvnw -pl liveflow-api -am package
@@ -97,7 +98,9 @@ curl --fail http://127.0.0.1:18080/actuator/health
 
 启动前后端后，打开 Vue 登录页，点击「注册」，输入账号和两次一致的密码。注册成功后页面预填账号名，使用刚设置的密码登录。账号严格区分大小写。新密码为 10–25 个可见 ASCII 字符，并同时包含大写字母、小写字母、数字和符号。使用旧测试数据的环境可按重建流程切换。 [注册接口](docs/design/auth/api.md#注册) · [测试数据重建](docs/design/auth/database.md#开发与测试数据重建)
 
-同一账号的新登录会替换原会话。可以用两个独立浏览器会话观察替换行为，用同一个浏览器的两个标签页观察刷新与退出协调。生产环境以 HTTPS 部署并注入独立的 Base64 随机签名密钥。回环 HTTP 覆盖只适用于 `local` profile。
+同一账号的新登录会替换原会话。可以用两个独立浏览器会话观察替换行为，用同一个浏览器的两个标签页观察刷新与退出协调。生产环境使用 HTTPS，分别注入 JWT 与 CSRF 的 Base64 随机签名密钥，并配置 `LIVEFLOW_CSRF_ALLOWED_ORIGINS`。回环 HTTP 覆盖只适用于 `local` profile。 [签发、配置和切换](docs/design/auth/security.md#生产配置与切换)
+
+手动联调时，先请求 `GET /api/v1/auth/csrf?scope=pre-auth`，提交注册或登录时将匿名 CSRF Cookie 值作为 `X-XSRF-TOKEN`。登录成功后改用认证态 CSRF Cookie。该 Cookie 缺失时，可用当前 Refresh Cookie 请求 `GET /api/v1/auth/csrf?scope=session` 补领。生产和回环 HTTP 的名称见 [Cookie 契约](docs/design/auth/api.md#cookie-与-csrf)。
 
 登录限流采用 60 秒固定窗口，每个原样账号 10 次，每个连接来源 60 次。注册独立计数，默认每个来源 600 秒内 10 次。两个入口超限都返回 `Retry-After`。可用 `LIVEFLOW_REGISTRATION_WINDOW_SECONDS` 和 `LIVEFLOW_REGISTRATION_MAX_ATTEMPTS` 配置注册额度。当前来源以服务端看到的连接地址为准。反向代理部署时，应按实际受信代理边界配置来源地址解析。
 

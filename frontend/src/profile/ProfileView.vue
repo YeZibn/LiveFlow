@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
-import { authClient } from '../auth/authClient'
 import MyRoom from '../room/MyRoom.vue'
 import { avatarOptions, readProfile, saveProfile, type ProfileForm, type UserProfile } from './profileClient'
 
@@ -91,10 +90,6 @@ async function submitProfile() {
       fieldErrors.value = cause.fieldErrors ?? {}
       uncertain.value = cause.status === 0 || cause.code === 'PROFILE_SERVICE_UNAVAILABLE' || cause.code === 'HTTP_ERROR'
       error.value = uncertain.value ? '无法确认资料是否已保存，可以先读取当前资料。' : cause.message
-      if (cause.code === 'AUTH_CSRF_INVALID') {
-        // 只重新获取 CSRF。保存由用户再次提交，保留此次失败的表单。
-        await authClient.csrf().catch(() => undefined)
-      }
     } else {
       error.value = '保存资料失败，请重试。'
     }

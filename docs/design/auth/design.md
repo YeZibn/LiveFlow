@@ -52,12 +52,12 @@ Controller 异常处理和 Spring Security 过滤器错误处理共用 [错误�
 
 1. Vue 获取 CSRF Cookie，提交账号密码。登录按账号和请求来源限流，凭证校验失败使用统一提示。
 2. 后端按原样用户名查询 MySQL，使用 Argon2id 校验密码。认证通过后生成新会话，由 Redis 原子替换当前会话。
-3. Redis 写入确认后，后端返回 Access Token 和 Refresh Cookie。Vue 将 Access Token 留在内存中。
+3. Redis 写入确认后，后端返回 Access Token、Refresh Cookie 和绑定新会话的认证态 CSRF Cookie，并清除匿名 Cookie。Vue 将 Access Token 留在内存中。
 4. 调用受保护接口时，Spring Security 先验证 JWT，再查 Redis 当前会话。身份验证通过后交给 MVC。当前用户接口按该身份的用户 ID 查询 MySQL。
 
 ### 页面恢复与刷新
 
-1. Vue 重新打开页面时先初始化 CSRF，再通过浏览器携带的 Refresh Cookie 尝试恢复登录。Access Token 到期时也走同一个刷新入口。
+1. Vue 重新打开页面或 Access Token 到期时，通过浏览器携带的 Refresh Cookie 续期。已有认证态 CSRF Cookie 时直接刷新，缺失时先只读补领。
 2. 服务端校验凭证所属会话仍然有效，在 Redis 中原子轮换 Refresh Token。刷新保留原登录期限。
 3. 轮换成功后返回新的 Access Token 和 Refresh Cookie。到达原登录期限后，用户需重新登录。
 
@@ -65,7 +65,7 @@ Controller 异常处理和 Spring Security 过滤器错误处理共用 [错误�
 
 1. Vue 提交页面正在操作的 `sessionId`，由浏览器携带 Refresh Cookie。Access Token 到期后仍可使用属于该会话的可识别 Refresh Token 退出。
 2. 后端确认退出目标、Cookie 和 Redis 当前会话一致，再原子删除会话。
-3. 删除确认后返回退出成功并清除 Refresh Cookie。Vue 清理与退出目标对应的内存状态。
+3. 删除确认后返回退出成功并清除 Refresh 和认证态 CSRF Cookie。Vue 清理与退出目标对应的内存状态。
 
 ## 失败与并发
 
@@ -80,6 +80,10 @@ Controller 异常处理和 Spring Security 过滤器错误处理共用 [错误�
 
 首版暂缓自助重设。未来可在个人主页提供邮箱绑定，用户预先验证邮箱后可凭该邮箱重设密码。重设成功后撤销原有登录会话。
 
+## 公网部署加固
+
+会话绑定 CSRF 使用签名双提交。登录前以短期匿名预会话保护注册和登录，登录后复用 Redis 当前会话的 `sessionId`，刷新沿用原绑定，重新登录时绑定到新会话。签发、校验位置、重放检测及发布规则见 [CSRF 生产加固设计](security.md)。
+
 ## 开发环境切换
 
 本次以旧账号和关联资料均为可重建的开发、测试数据为前提。执行 [测试账号重建流程](database.md#开发与测试数据重建) 后，通过新的注册入口创建账号。登录和注册直接使用同一套精确匹配规则。
@@ -91,3 +95,4 @@ Controller 异常处理和 Spring Security 过滤器错误处理共用 [错误�
 | [HTTP 接口](api.md) | 路由、请求与响应字段、Cookie、CSRF、错误码及前端处理 |
 | [MySQL 用户表](database.md) | `users` 字段、索引及查询路径 |
 | [凭证与 Redis 会话](session.md) | JWT Claims、Refresh Token 格式、Redis 字段、原子操作及状态转换 |
+| [CSRF 生产加固](security.md) | 匿名预会话、认证态签发、请求校验顺序、重放检测和部署切换 |

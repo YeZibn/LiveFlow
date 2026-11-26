@@ -13,7 +13,8 @@
 
 | 方法与路径 | 输入与凭证 | 成功响应 | 服务端行为 |
 | --- | --- | --- | --- |
-| `GET /api/v1/auth/csrf` | 匿名，无请求体 | `204` | 确保浏览器取得 `XSRF-TOKEN` Cookie |
+| `GET /api/v1/auth/csrf?scope=pre-auth` | 匿名，无请求体 | `204` | 初始化或复用匿名预会话与匿名 CSRF Cookie |
+| `GET /api/v1/auth/csrf?scope=session` | Bearer 或当前 Refresh Cookie，无请求体 | `204` | 为已确认的当前会话补领认证态 CSRF Cookie |
 | `POST /api/v1/auth/register` | 匿名，`RegisterRequest`，CSRF | `201`，`CurrentUserResponse` | 创建账号并返回原样账号名 |
 | `POST /api/v1/auth/login` | `LoginRequest`，CSRF | `200`，`TokenResponse`，设置 `lf_refresh` | 校验密码并原子替换 Redis 当前会话 |
 | `POST /api/v1/auth/refresh` | `lf_refresh` Cookie，CSRF，无请求体 | `200`，`TokenResponse`，替换 `lf_refresh` | 在当前会话内轮换 Refresh Token，沿用原截止时间 |
@@ -24,7 +25,7 @@
 
 ### 初始化 CSRF
 
-匿名调用 `GET /api/v1/auth/csrf`。请求体为空。返回 `204`，确保浏览器已取得 `XSRF-TOKEN` Cookie。Vue 在首次进入页面、登录成功和退出成功后调用。
+`scope` 必填，且只能出现一次。两个用途均返回不可缓存的 `204`。登录前用 `pre-auth` 初始化。恢复登录时如已持有认证态 CSRF Cookie，直接刷新，缺失时用 `session` 补领。补领只读验证调用身份，不变更会话。 [签发与校验顺序](security.md#http-接口与校验顺序)
 
 ### 注册
 
@@ -118,12 +119,16 @@
 
 ## Cookie 与 CSRF
 
+Cookie 的用途及签名边界见 [CSRF 安全设计](security.md#http-接口与校验顺序)。
+
 | Cookie | 配置及用法 |
 | --- | --- |
 | `lf_refresh` | `HttpOnly`、`Secure`、`SameSite=Lax`、`Path=/api/v1/auth`，省略 `Domain`。`Max-Age` 为会话剩余秒数。退出成功使用相同名称、范围和 `Max-Age=0` 清除。正式环境使用 HTTPS，本地回环 HTTP 开发环境可显式覆盖 `Secure`。 |
-| `XSRF-TOKEN` | 由 Spring Security 为同源 SPA 提供，Vue 读取后通过 `X-XSRF-TOKEN` 回传。它用于 CSRF 校验。 |
+| `__Host-lf_pre` | 短期匿名预会话，`HttpOnly`。 |
+| `__Host-lf_csrf_pre` | Vue 可读，绑定匿名预会话。用于注册与登录。 |
+| `__Host-lf_csrf` | Vue 可读，绑定已登录的 `sessionId`。用于业务写请求、刷新和退出。 |
 
-页面初始化时获取 CSRF Cookie，再执行注册、登录或尝试续期。登录或退出成功后，前端再次调用 CSRF 接口，为后续 POST 获取有效的 CSRF Cookie。注册、登录、刷新和退出均验证 CSRF。Cookie 中的会话 ID 和退出请求的目标 ID 不一致时，响应 `409`，保留浏览器当前 Cookie。 [Spring Security SPA CSRF](https://docs.spring.io/spring-security/reference/7.1/servlet/exploits/csrf.html#csrf-integration-javascript-spa) · [HTTP Cookie 规范](https://www.rfc-editor.org/rfc/rfc6265.html)
+三种 CSRF 相关 Cookie 在生产均使用 `Secure`、`Path=/`、`SameSite=Lax`，省略 `Domain`。显式启用的 `local` 回环 HTTP 使用去掉 `__Host-` 的名称。Vue 将当前操作对应的 CSRF Cookie 值通过 `X-XSRF-TOKEN` 回传。登录成功后服务端随响应签发认证态 CSRF 并清除匿名 Cookie。退出确认后清除 Refresh 和认证态 CSRF。认证态 CSRF 校验通过后，若 Refresh Cookie 指向的会话与退出目标不同，返回 `409` 并保留浏览器当前 Cookie。
 
 ## 错误响应
 
@@ -147,7 +152,7 @@
 | `401` | `AUTH_SESSION_REPLACED` | 通过 JWT 校验后发现该账号当前会话的 ID 不同，清理对应本地状态 |
 | `401` | `AUTH_REFRESH_INVALID` | Refresh Token 格式错误、摘要未知、会话过期或已替换，提示重新登录 |
 | `401` | `AUTH_REFRESH_REUSED` | 刷新命中当前会话的已消费摘要，该会话已撤销，提示重新登录 |
-| `403` | `AUTH_CSRF_INVALID` | CSRF Cookie 或请求头缺失或不匹配，重新获取 CSRF 凭证 |
+| `403` | `AUTH_CSRF_INVALID` | 来源、Cookie、请求头、签名或会话绑定校验失败。补领合适的 CSRF 凭证后，由调用方决定是否重新提交 |
 | `409` | `AUTH_USERNAME_ALREADY_EXISTS` | 注册时发现完全相同的账号名，提示更换账号名或登录 |
 | `409` | `AUTH_SESSION_CHANGED` | 退出请求目标与浏览器 Refresh Cookie 所属会话不同，保留新会话 |
 | `429` | `AUTH_RATE_LIMITED` | 触发限流，登录和注册按 `Retry-After` 提示等待时间 |

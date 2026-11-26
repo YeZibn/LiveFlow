@@ -1,5 +1,5 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { ApiRequestError } from '../api/requestJson'
+import { ApiRequestError, readCsrfCookie } from '../api/requestJson'
 import { authClient, type CurrentUser, type TokenResponse } from './authClient'
 
 const lockName = 'liveflow:auth:write'
@@ -106,7 +106,17 @@ export function useAuth() {
       throw sessionChanged()
     }
 
-    await authClient.csrf()
+    if (!readCsrfCookie('session')) {
+      try {
+        await authClient.csrf('session')
+      } catch (cause) {
+        if (cause instanceof ApiRequestError && terminalErrors.has(cause.code)) {
+          localStorage.removeItem(sessionMarker)
+        }
+        // 补领是只读请求，结果不确定时不会消费 Refresh Token。
+        throw cause
+      }
+    }
     let next: TokenResponse
     try {
       next = await authClient.refresh()
@@ -126,6 +136,19 @@ export function useAuth() {
       throw sessionChanged()
     }
     return next
+  }
+
+  /**
+   * 只为仍属于本页的会话补领 CSRF。原写操作的错误由调用方处理。
+   * @param expected 本页发起原请求时的会话 ID
+   * @returns 补领成功或保留原错误后完成
+   */
+  async function recoverCsrf(expected: string) {
+    await withSessionLock(async () => {
+      if (token.value?.sessionId === expected && localStorage.getItem(sessionMarker) === expected) {
+        await authClient.csrf('session')
+      }
+    }).catch(() => undefined)
   }
 
   /**
@@ -207,6 +230,9 @@ export function useAuth() {
       }
       return result
     } catch (cause) {
+      if (version === generation && cause instanceof ApiRequestError && cause.code === 'AUTH_CSRF_INVALID') {
+        await recoverCsrf(previous.sessionId)
+      }
       if (version === generation && cause instanceof ApiRequestError
           && (terminalErrors.has(cause.code) || cause.code === 'AUTH_REFRESH_UNCERTAIN'
             || cause.code === 'AUTH_SESSION_CHANGED')) {
@@ -258,12 +284,11 @@ export function useAuth() {
     restoreFailed.value = false
     try {
       await withSessionLock(async () => {
-        await authClient.csrf()
+        await authClient.csrf('pre-auth')
         const next = await authClient.login(username, password)
         clearSession()
         localStorage.setItem(sessionMarker, next.sessionId)
         token.value = next
-        await authClient.csrf()
       })
       user.value = await withAccess(authClient.me)
     } catch (cause) {
@@ -279,7 +304,7 @@ export function useAuth() {
   }
 
   /**
-   * 退出页面当时所见的会话，并为后续登录重新初始化 CSRF。
+   * 退出页面当时所见的会话，成功后由服务端清除认证态 CSRF。
    * @returns 退出响应处理后完成
    */
   async function logout() {
@@ -295,11 +320,11 @@ export function useAuth() {
         if (localStorage.getItem(sessionMarker) !== target) {
           throw sessionChanged()
         }
+        if (!readCsrfCookie('session')) await authClient.csrf('session')
         await authClient.logout(target)
         // 服务端确认撤销后再通知其他标签页清理会话。
         localStorage.removeItem(sessionMarker)
         clearSession(target)
-        await authClient.csrf()
       })
     } catch (cause) {
       if (cause instanceof ApiRequestError && (terminalErrors.has(cause.code)
@@ -307,11 +332,7 @@ export function useAuth() {
         clearSession(target)
       }
       if (cause instanceof ApiRequestError && cause.code === 'AUTH_CSRF_INVALID') {
-        try {
-          await authClient.csrf()
-        } catch {
-          // 保留原退出错误，让用户决定是否重试。
-        }
+        await recoverCsrf(target)
       }
       error.value = messageFor(cause)
     } finally {

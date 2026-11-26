@@ -1,6 +1,5 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowReactive, shallowRef, watch } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
-import { authClient } from '../auth/authClient'
 import type { WithAccess } from '../auth/useAuth'
 import { decodeRoomFrame, openRoomSocket, requestMessageReceipt, requestRoomHistory, requestRoomTicket, sendRoomMessage,
   unknownSubmissionReceipt, type MessageSubmission, type RoomMessage, type SubmissionReceiptReference } from './roomMessagesClient'
@@ -184,7 +183,6 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
       if (!current(attempt)) return
       if (cause instanceof ApiRequestError) {
         connectionError.value = cause.message
-        if (cause.code === 'AUTH_CSRF_INVALID') await authClient.csrf().catch(() => undefined)
         if (!current(attempt)) return
         if ([400, 401, 404].includes(cause.status)) {
           state.value = 'offline'
@@ -410,7 +408,6 @@ export function useRoomMessages(roomId: string, withAccess: WithAccess) {
             ? '弹幕暂未发送，服务暂时不可用。' : cause.message
         }
         clearPending()
-        if (cause.code === 'AUTH_CSRF_INVALID') await authClient.csrf().catch(() => undefined)
       }
     } finally {
       if (active) submitting.value = false

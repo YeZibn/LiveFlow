@@ -4,7 +4,7 @@
 
 调用方为 LiveFlow 同源 Vue 客户端。四个接口均要求 `Authorization: Bearer <accessToken>`。后端从已通过签名与 Redis 当前会话校验的 JWT `sub` 取得账号 ID。创建和本人查询按账号归属操作。统一列表和房间详情向所有有效登录会话开放。成功响应为 `application/json`，携带 `Cache-Control: no-store`。 [直播间设计](design.md) · [认证公共约定](../auth/api.md#公共约定)
 
-创建请求发送 `Content-Type: application/json`，沿用 `XSRF-TOKEN` Cookie 和 `X-XSRF-TOKEN` 请求头。查询请求无请求体。 [Cookie 与 CSRF](../auth/api.md#cookie-与-csrf)
+创建请求发送 `Content-Type: application/json`，沿用 认证态 CSRF Cookie 和 `X-XSRF-TOKEN` 请求头。查询请求无请求体。 [Cookie 与 CSRF](../auth/api.md#cookie-与-csrf)
 
 ## 路由
 

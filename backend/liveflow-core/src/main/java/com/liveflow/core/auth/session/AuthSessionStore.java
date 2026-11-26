@@ -16,6 +16,15 @@ public interface AuthSessionStore {
     void requireCurrent(long userId, UUID sessionId);
 
     /**
+     * @param userId 可信账号 ID，或由 Refresh Token 定位的候选账号
+     * @param sessionId 待核对的会话 ID
+     * @param refreshDigest Refresh 补领时提交的摘要。Bearer 补领不传
+     * @return 同一次读取确认的当前会话截止时间
+     * @throws AuthFailure 会话不匹配、Refresh 已失效或存储不可用
+     */
+    Instant currentExpiry(long userId, UUID sessionId, String refreshDigest);
+
+    /**
      * 替换账号的当前会话和历史摘要。
      * @param userId 用户 ID
      * @param sessionId 新会话 ID

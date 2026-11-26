@@ -4,7 +4,7 @@
 
 调用方为 LiveFlow 同源 Vue 客户端。两条路由都要求 `Authorization: Bearer <accessToken>`。安全过滤链验证 JWT 和 Redis 当前会话，Controller 从可信 JWT 的 `sub` 取得账号 ID。接口只访问本人的资料。成功响应使用 `application/json`，并带有 `Cache-Control: no-store`。 [模块设计](design.md) · [认证公共约定](../auth/api.md#公共约定)
 
-更新请求发送 `Content-Type: application/json`，沿用 `XSRF-TOKEN` Cookie 和 `X-XSRF-TOKEN` 请求头。前端请求层应支持 `PUT` 并附加 CSRF 请求头。登录身份的建立和页面恢复继续使用现有 `/auth/me` 流程。 [Cookie 与 CSRF](../auth/api.md#cookie-与-csrf)
+更新请求发送 `Content-Type: application/json`，沿用 认证态 CSRF Cookie 和 `X-XSRF-TOKEN` 请求头。前端请求层应支持 `PUT` 并附加 CSRF 请求头。登录身份的建立和页面恢复继续使用现有 `/auth/me` 流程。 [Cookie 与 CSRF](../auth/api.md#cookie-与-csrf)
 
 ## 路由
 

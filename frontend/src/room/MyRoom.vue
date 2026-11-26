@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ApiRequestError } from '../api/requestJson'
-import { authClient } from '../auth/authClient'
 import { createRoom, readRoom, type Room } from './roomClient'
 
 const props = defineProps<{
@@ -96,10 +95,6 @@ async function submit() {
       } else {
         titleError.value = cause.fieldErrors?.title ?? ''
         createError.value = cause.message
-        if (cause.code === 'AUTH_CSRF_INVALID') {
-          // 只重新获取 CSRF，保留用户输入，由用户决定何时再提交。
-          await authClient.csrf().catch(() => undefined)
-        }
       }
     } else {
       createError.value = '创建直播间失败，请重试。'

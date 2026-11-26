@@ -93,6 +93,11 @@ class AuthIntegrationTest {
     private static final String ROOM_CREATE_PATH = "/api/v1/rooms";
     private static final String ROOM_READ_PATH = "/api/v1/users/me/room";
     private static final byte[] KEY = new SecureRandom().generateSeed(32);
+    private static final byte[] CSRF_KEY = new SecureRandom().generateSeed(32);
+    private static final String PRE_SESSION = "__Host-lf_pre";
+    private static final String PRE_CSRF = "__Host-lf_csrf_pre";
+    private static final String SESSION_CSRF = "__Host-lf_csrf";
+    private static final String PUBLIC_ORIGIN = "https://liveflow.example";
     private static final HttpClient HTTP = HttpClient.newHttpClient();
     private static final String MESSAGE_TEST_NAMESPACE = "v2-it-" + UUID.randomUUID().toString().substring(0, 8);
     private static final String STREAMS_TEST_DIRECTORY = java.nio.file.Path.of(
@@ -101,7 +106,8 @@ class AuthIntegrationTest {
     @DynamicPropertySource
     static void settings(DynamicPropertyRegistry registry) {
         registry.add("liveflow.auth.signing-key", () -> Base64.getEncoder().encodeToString(KEY));
-        registry.add("liveflow.auth.secure-cookie", () -> false);
+        registry.add("liveflow.auth.csrf.signing-key", () -> Base64.getEncoder().encodeToString(CSRF_KEY));
+        registry.add("liveflow.auth.csrf.allowed-origins", () -> PUBLIC_ORIGIN);
         registry.add("spring.data.redis.database", () -> 15);
         registry.add("liveflow.resilience.rate-limit.registration.max-attempts", () -> 10);
         registry.add("liveflow.resilience.rate-limit.registration.window-seconds", () -> 600);
@@ -286,7 +292,16 @@ class AuthIntegrationTest {
         var browser = new Browser();
         failure(browser.send("GET", "me", null, null, false), 401, "AUTH_REQUIRED");
         failure(browser.send("POST", "login", credentials(password), null, false), 403, "AUTH_CSRF_INVALID");
-        assertThat(browser.send("GET", "csrf", null, null, false).statusCode()).isEqualTo(204);
+        failure(browser.send("GET", "csrf", null, null, false), 400, "INVALID_REQUEST");
+        var bootstrap = browser.send("GET", "csrf?scope=pre-auth", null, null, false);
+        assertThat(bootstrap.statusCode()).isEqualTo(204);
+        assertThat(bootstrap.headers().firstValue("Cache-Control")).contains("no-store");
+        assertThat(bootstrap.headers().allValues("Set-Cookie")).anySatisfy(cookie ->
+                assertThat(cookie).startsWith(PRE_SESSION + "=").contains("Secure", "HttpOnly", "SameSite=Lax", "Path=/")
+                        .doesNotContain("Domain="));
+        assertThat(bootstrap.headers().allValues("Set-Cookie")).anySatisfy(cookie ->
+                assertThat(cookie).startsWith(PRE_CSRF + "=").contains("Secure", "SameSite=Lax", "Path=/")
+                        .doesNotContain("HttpOnly", "Domain="));
         failure(browser.send("POST", "login", "{}", null, true), 400, "INVALID_REQUEST");
         failure(browser.send("POST", "login", credentials("wrong"), null, true), 401, "AUTH_INVALID_CREDENTIALS");
 
@@ -302,7 +317,11 @@ class AuthIntegrationTest {
         assertThat(json.readTree(me.body()).get("userId").asString()).isEqualTo(Long.toString(userId));
 
         String session = token.get("sessionId").asString();
-        browser.csrf();
+        assertThat(browser.cookies).containsKey(SESSION_CSRF).doesNotContainKeys(PRE_SESSION, PRE_CSRF);
+        assertThat(response.headers().allValues("Set-Cookie")).anySatisfy(cookie ->
+                assertThat(cookie).startsWith(SESSION_CSRF + "=").contains("Secure", "SameSite=Lax", "Path=/")
+                        .doesNotContain("HttpOnly", "Domain="));
+        String originalCsrf = browser.cookies.get(SESSION_CSRF);
         failure(browser.send("GET", "me", null, expiredToken(session), false), 401, "AUTH_ACCESS_EXPIRED");
         failure(browser.send("GET", "me", null, "invalid", false), 401, "AUTH_ACCESS_INVALID");
 
@@ -311,11 +330,80 @@ class AuthIntegrationTest {
         JsonNode renewed = json.readTree(refresh.body());
         assertThat(renewed.get("sessionId")).isEqualTo(token.get("sessionId"));
         assertThat(renewed.get("sessionExpiresAt")).isEqualTo(token.get("sessionExpiresAt"));
+        assertThat(browser.cookies.get(SESSION_CSRF)).isEqualTo(originalCsrf);
 
         var logout = browser.send("POST", "logout", logoutBody(session), null, true);
         assertThat(logout.statusCode()).isEqualTo(204);
-        assertThat(browser.cookies).doesNotContainKey("lf_refresh");
+        assertThat(browser.cookies).doesNotContainKeys("lf_refresh", SESSION_CSRF);
         failure(browser.send("GET", "me", null, access(renewed), false), 401, "AUTH_SESSION_INACTIVE");
+    }
+
+    @Test
+    void csrfScopeOriginAndSessionBindingRejectBeforeSideEffects() throws Exception {
+        var browser = new Browser();
+        for (String query : List.of("csrf?scope=other", "csrf?scope=session&scope=pre-auth", "csrf?scope=pre-auth&extra=1")) {
+            failure(browser.send("GET", query, null, null, false), 400, "INVALID_REQUEST");
+        }
+        var rejectedOrigin = browser.sendPath("GET", "/api/v1/auth/csrf?scope=pre-auth", null, null, false,
+                Map.of("Origin", "https://other.example"));
+        failure(rejectedOrigin, 403, "AUTH_CSRF_INVALID");
+        assertThat(rejectedOrigin.headers().allValues("Set-Cookie")).isEmpty();
+        browser.csrf();
+        String anonymous = browser.cookies.get(PRE_CSRF);
+        browser.csrf();
+        assertThat(browser.cookies.get(PRE_CSRF)).isEqualTo(anonymous);
+        JsonNode old = browser.login();
+        String oldCsrf = browser.cookies.get(SESSION_CSRF);
+        var oldDevice = new Browser();
+        oldDevice.cookies.putAll(browser.cookies);
+        JsonNode current = browser.login();
+        String bearer = access(current);
+        String sessionCsrf = browser.cookies.get(SESSION_CSRF);
+        String body = profileBody("会话边界", "blue", "");
+
+        for (String invalid : List.of(anonymous, oldCsrf, "invalid")) {
+            browser.cookies.put(SESSION_CSRF, invalid);
+            failure(browser.sendPath("PUT", PROFILE_PATH, body, bearer, true), 403, "AUTH_CSRF_INVALID");
+        }
+        browser.cookies.put(SESSION_CSRF, sessionCsrf);
+        failure(browser.sendPath("PUT", PROFILE_PATH, body, bearer, false,
+                Map.of("X-XSRF-TOKEN", "mismatch")), 403, "AUTH_CSRF_INVALID");
+        failure(browser.sendPath("PUT", PROFILE_PATH, body, bearer, true,
+                Map.of("Origin", "null", "Referer", PUBLIC_ORIGIN + "/profile")), 403, "AUTH_CSRF_INVALID");
+        failure(browser.sendPath("PUT", PROFILE_PATH, body, bearer, true,
+                Map.of("Referer", "https://other.example/profile")), 403, "AUTH_CSRF_INVALID");
+        assertThat(profileCount(userId)).isZero();
+        failure(oldDevice.send("POST", "refresh", null, null, true), 401, "AUTH_REFRESH_INVALID");
+        failure(oldDevice.send("GET", "me", null, access(old), false), 401, "AUTH_SESSION_REPLACED");
+        assertThat(browser.sendPath("PUT", PROFILE_PATH, body, bearer, true,
+                Map.of("Referer", PUBLIC_ORIGIN + "/profile")).statusCode()).isEqualTo(200);
+    }
+
+    @Test
+    void csrfReissueIsReadOnlyAndPreservesReplayRevocation() throws Exception {
+        var browser = new Browser();
+        JsonNode login = browser.login();
+        String bearer = access(login);
+        String refresh = browser.cookies.get("lf_refresh");
+        String originalCsrf = browser.cookies.remove(SESSION_CSRF);
+        failure(browser.send("GET", "csrf?scope=session", null, "invalid", false), 401, "AUTH_ACCESS_INVALID");
+        assertThat(browser.cookies).doesNotContainKey(SESSION_CSRF);
+        browser.sessionCsrf(null);
+        assertThat(browser.cookies.get("lf_refresh")).isEqualTo(refresh);
+        var accepted = browser.send("POST", "refresh", null, null, true);
+        assertThat(accepted.statusCode()).isEqualTo(200);
+        assertThat(browser.cookies.get("lf_refresh")).isNotEqualTo(refresh);
+
+        var replay = new Browser();
+        replay.cookies.put("lf_refresh", refresh);
+        var reissue = replay.send("GET", "csrf?scope=session", null, null, false);
+        failure(reissue, 401, "AUTH_REFRESH_INVALID");
+        assertThat(reissue.headers().allValues("Set-Cookie")).isEmpty();
+        failure(replay.send("POST", "refresh", null, null, true), 403, "AUTH_CSRF_INVALID");
+        assertThat(browser.send("GET", "me", null, bearer, false).statusCode()).isEqualTo(200);
+        replay.cookies.put(SESSION_CSRF, originalCsrf);
+        failure(replay.send("POST", "refresh", null, null, true), 401, "AUTH_REFRESH_REUSED");
+        failure(browser.send("GET", "me", null, bearer, false), 401, "AUTH_SESSION_INACTIVE");
     }
 
     @Test
@@ -366,12 +454,17 @@ class AuthIntegrationTest {
         doThrow(new AuthFailure(AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE)).when(sessions)
                 .requireCurrent(userId, UUID.fromString(login.get("sessionId").asString()));
         failure(browser.send("GET", "me", null, access(login), false), 503, "AUTH_SERVICE_UNAVAILABLE");
+        doThrow(new AuthFailure(AuthFailure.Code.AUTH_SERVICE_UNAVAILABLE)).when(sessions)
+                .currentExpiry(org.mockito.ArgumentMatchers.eq(userId), org.mockito.ArgumentMatchers.any(),
+                        org.mockito.ArgumentMatchers.anyString());
+        failure(browser.send("GET", "csrf?scope=session", null, null, false), 503, "AUTH_SERVICE_UNAVAILABLE");
     }
 
     @Test
     void loginChecksBothFixedWindowsAndReturnsTheLongestWait() throws Exception {
         var browser = new Browser();
         String bearer = access(browser.login());
+        browser.csrf();
         String account = "liveflow:auth:{login}:account:" + username;
         String otherCase = "liveflow:auth:{login}:account:" + username.toUpperCase(Locale.ROOT);
         redis.opsForValue().set(account, "10", Duration.ofSeconds(8));
@@ -408,6 +501,7 @@ class AuthIntegrationTest {
     void rateLimitedLoginKeepsCurrentSession() throws Exception {
         var browser = new Browser();
         String access = access(browser.login());
+        browser.csrf();
         for (int attempt = 0; attempt < 9; attempt++) {
             failure(browser.send("POST", "login", credentials("wrong"), null, true), 401,
                     "AUTH_INVALID_CREDENTIALS");
@@ -474,7 +568,7 @@ class AuthIntegrationTest {
         var firstBrowser = new Browser();
         String bearer = access(firstBrowser.login());
         var secondBrowser = new Browser();
-        secondBrowser.csrf();
+        secondBrowser.sessionCsrf(bearer);
         String otherName = username + "_other";
         jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
                 + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?",
@@ -571,7 +665,7 @@ class AuthIntegrationTest {
         var first = new Browser();
         String bearer = access(first.login());
         var second = new Browser();
-        second.csrf();
+        second.sessionCsrf(bearer);
         String otherName = username + "_room";
         jdbc.update("INSERT INTO users (username, password_hash, created_at, updated_at)"
                 + " SELECT ?, password_hash, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3) FROM users WHERE id = ?",
@@ -833,7 +927,7 @@ class AuthIntegrationTest {
                 var isolated = readyRoom(viewer, viewerBearer, otherRoom);
                 ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             var secondTab = new Browser();
-            secondTab.csrf();
+            secondTab.sessionCsrf(bearer);
             String id = UUID.randomUUID().toString();
             String path = messagePath(room, "messages");
             var start = new CyclicBarrier(2);
@@ -1698,14 +1792,19 @@ class AuthIntegrationTest {
             csrf();
             String body = credentials(name, suppliedPassword);
             var response = send("POST", "login", body, null, true);
-            assertThat(response.statusCode()).isEqualTo(200);
-            csrf();
+            assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
+            assertThat(cookies).containsKey(SESSION_CSRF);
             return json.readTree(response.body());
         }
 
         void csrf() throws Exception {
-            assertThat(send("GET", "csrf", null, null, false).statusCode()).isEqualTo(204);
-            assertThat(cookies).containsKey("XSRF-TOKEN");
+            assertThat(send("GET", "csrf?scope=pre-auth", null, null, false).statusCode()).isEqualTo(204);
+            assertThat(cookies).containsKeys(PRE_SESSION, PRE_CSRF);
+        }
+
+        void sessionCsrf(String bearer) throws Exception {
+            assertThat(send("GET", "csrf?scope=session", null, bearer, false).statusCode()).isEqualTo(204);
+            assertThat(cookies).containsKey(SESSION_CSRF);
         }
 
         HttpResponse<String> send(String method, String path, String body, String bearer, boolean csrf)
@@ -1715,13 +1814,21 @@ class AuthIntegrationTest {
 
         HttpResponse<String> sendPath(String method, String path, String body, String bearer, boolean csrf)
                 throws Exception {
+            return sendPath(method, path, body, bearer, csrf, Map.of());
+        }
+
+        HttpResponse<String> sendPath(String method, String path, String body, String bearer, boolean csrf,
+                Map<String, String> headers) throws Exception {
             var request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + path));
+            headers.forEach(request::header);
             if (!cookies.isEmpty()) {
                 request.header("Cookie", String.join("; ", cookies.entrySet().stream()
                         .map(entry -> entry.getKey() + "=" + entry.getValue()).toList()));
             }
             if (csrf) {
-                request.header("X-XSRF-TOKEN", cookies.get("XSRF-TOKEN"));
+                boolean anonymousWrite = path.equals("/api/v1/auth/login") || path.equals("/api/v1/auth/register");
+                String value = cookies.get(anonymousWrite ? PRE_CSRF : SESSION_CSRF);
+                if (value != null) request.header("X-XSRF-TOKEN", value);
             }
             if (bearer != null) {
                 request.header("Authorization", "Bearer " + bearer);

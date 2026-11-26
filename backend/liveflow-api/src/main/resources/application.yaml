@@ -90,6 +90,11 @@ liveflow:
     # 使用部署环境注入的 Base64 随机密钥，解码后至少 32 字节。
     signing-key: ${LIVEFLOW_JWT_SIGNING_KEY:}
     secure-cookie: true
+    csrf:
+      key-id: ${LIVEFLOW_CSRF_KEY_ID:primary}
+      signing-key: ${LIVEFLOW_CSRF_SIGNING_KEY:}
+      verification-keys: ${LIVEFLOW_CSRF_VERIFICATION_KEYS:}
+      allowed-origins: ${LIVEFLOW_CSRF_ALLOWED_ORIGINS:}
   resilience:
     circuit-breaker:
       room-messages:

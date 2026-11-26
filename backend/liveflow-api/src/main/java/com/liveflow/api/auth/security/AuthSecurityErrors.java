@@ -2,6 +2,8 @@ package com.liveflow.api.auth.security;
 
 import com.liveflow.api.auth.AuthHttpError;
 import com.liveflow.core.auth.AuthFailure;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
@@ -25,10 +27,13 @@ import static com.liveflow.core.auth.AuthFailure.Code.*;
 public class AuthSecurityErrors implements AuthenticationEntryPoint, AccessDeniedHandler {
 
     private final JsonMapper json;
+    private final Counter dependencyUnavailable;
 
-    /** @param json 应用统一配置的 JSON 序列化器 */
-    public AuthSecurityErrors(JsonMapper json) {
+    /** @param json 应用统一配置的 JSON 序列化器
+     *  @param meters 与 MVC 错误处理共享的指标注册表 */
+    public AuthSecurityErrors(JsonMapper json, MeterRegistry meters) {
         this.json = json;
+        dependencyUnavailable = meters.counter("liveflow.auth.dependency.unavailable");
     }
 
     /**
@@ -83,6 +88,7 @@ public class AuthSecurityErrors implements AuthenticationEntryPoint, AccessDenie
      * @throws IOException 无法写入响应流
      */
     private void write(HttpServletResponse response, AuthFailure.Code code) throws IOException {
+        if (code == AUTH_SERVICE_UNAVAILABLE) dependencyUnavailable.increment();
         response.setStatus(AuthHttpError.status(code).value());
         response.setContentType(MediaType.APPLICATION_JSON_VALUE);
         response.setCharacterEncoding("UTF-8");

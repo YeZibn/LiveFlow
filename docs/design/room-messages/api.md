@@ -2,7 +2,7 @@
 
 ## 公共约定
 
-两个 POST 都要求 `Authorization: Bearer <accessToken>`、`XSRF-TOKEN` Cookie 及 `X-XSRF-TOKEN` 请求头。后端从已验证的 JWT 取得账号和登录会话，按房间 UUID 定位房间。有效登录用户可向存在的房间发送并申请接收连接。成功响应为 JSON，携带 `Cache-Control: no-store`。房间路径参数沿用详情接口的标准小写 UUID v4。 [弹幕设计](design.md) · [房间 UUID 约定](../room/api.md#查询房间详情) · [Cookie 与 CSRF](../auth/api.md#cookie-与-csrf)
+两个 POST 都要求 `Authorization: Bearer <accessToken>`、认证态 CSRF Cookie 及 `X-XSRF-TOKEN` 请求头。后端从已验证的 JWT 取得账号和登录会话，按房间 UUID 定位房间。有效登录用户可向存在的房间发送并申请接收连接。成功响应为 JSON，携带 `Cache-Control: no-store`。房间路径参数沿用详情接口的标准小写 UUID v4。 [弹幕设计](design.md) · [房间 UUID 约定](../room/api.md#查询房间详情) · [Cookie 与 CSRF](../auth/api.md#cookie-与-csrf)
 
 | 方法与路径 | 请求 | 成功结果 |
 | --- | --- | --- |

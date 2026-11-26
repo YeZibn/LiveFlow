@@ -15,10 +15,22 @@ export class ApiRequestError extends Error {
   }
 }
 
+export type CsrfScope = 'pre-auth' | 'session'
+
+/**
+ * @param scope 匿名写请求或认证态写请求使用的凭证用途
+ * @returns 浏览器可读的对应 CSRF 值，凭证缺失时为空
+ */
+export function readCsrfCookie(scope: CsrfScope): string | undefined {
+  const prefix = window.location.protocol === 'https:' ? '__Host-' : ''
+  const name = prefix + (scope === 'pre-auth' ? 'lf_csrf_pre' : 'lf_csrf') + '='
+  return document.cookie.split(';').map(cookie => cookie.trim()).find(cookie => cookie.startsWith(name))?.slice(name.length)
+}
+
 /**
  * 调用同源 JSON 接口。写请求附带 CSRF，受保护的请求由调用方提供 Bearer。
  * @param path 以 /api/ 开头的接口路径
- * @param options HTTP 方法、正文和可选的 Access Token
+ * @param options HTTP 方法、正文、可选的 Access Token 和写请求的 CSRF 用途
  * @returns 成功响应的数据，204 时返回 undefined
  * @throws ApiRequestError HTTP 失败、响应无效或网络错误
  */
@@ -26,6 +38,7 @@ export async function requestJson<T>(path: string, options: {
   method?: 'GET' | 'POST' | 'PUT'
   body?: object
   access?: string
+  csrfScope?: CsrfScope
 } = {}): Promise<T> {
   const headers = new Headers({ Accept: 'application/json' })
   if (options.body) {
@@ -33,10 +46,8 @@ export async function requestJson<T>(path: string, options: {
   }
   if (options.method === 'POST' || options.method === 'PUT') {
     // Refresh Cookie 由浏览器自动发送，脚本只读取可访问的 CSRF Cookie。
-    const cookie = document.cookie.split('; ').find(value => value.startsWith('XSRF-TOKEN='))
-    if (cookie) {
-      headers.set('X-XSRF-TOKEN', decodeURIComponent(cookie.slice('XSRF-TOKEN='.length)))
-    }
+    const token = readCsrfCookie(options.csrfScope ?? 'session')
+    if (token) headers.set('X-XSRF-TOKEN', token)
   }
   if (options.access) {
     headers.set('Authorization', `Bearer ${options.access}`)

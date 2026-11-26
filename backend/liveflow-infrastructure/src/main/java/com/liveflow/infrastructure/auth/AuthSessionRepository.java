@@ -2,6 +2,8 @@ package com.liveflow.infrastructure.auth;
 
 import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.auth.session.AuthSessionStore;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
@@ -45,6 +47,40 @@ public class AuthSessionRepository implements AuthSessionStore {
         if (!sessionId.toString().equals(current)) {
             throw new AuthFailure(AUTH_SESSION_REPLACED);
         }
+    }
+
+    /** {@inheritDoc} 使用同一份 Hash 字段快照，读取过程不会写回或消费凭证。 */
+    @Override
+    public Instant currentExpiry(long userId, UUID sessionId, String refreshDigest) {
+        List<Object> fields;
+        try {
+            fields = redis.opsForHash().multiGet(key(userId), List.of("sessionId", "expiresAtMs", "refreshHash"));
+        } catch (DataAccessException failure) {
+            throw new AuthFailure(AUTH_SERVICE_UNAVAILABLE);
+        }
+        if (fields.get(0) == null) {
+            throw new AuthFailure(refreshDigest == null ? AUTH_SESSION_INACTIVE : AUTH_REFRESH_INVALID);
+        }
+        if (!sessionId.toString().equals(fields.get(0))) {
+            throw new AuthFailure(refreshDigest == null ? AUTH_SESSION_REPLACED : AUTH_REFRESH_INVALID);
+        }
+        if (!(fields.get(1) instanceof String expiry) || !(fields.get(2) instanceof String currentDigest)) {
+            throw new AuthFailure(AUTH_SERVICE_UNAVAILABLE);
+        }
+        Instant expiresAt;
+        try {
+            expiresAt = Instant.ofEpochMilli(Long.parseLong(expiry));
+        } catch (NumberFormatException failure) {
+            throw new AuthFailure(AUTH_SERVICE_UNAVAILABLE);
+        }
+        if (!expiresAt.isAfter(Instant.now())) {
+            throw new AuthFailure(refreshDigest == null ? AUTH_SESSION_INACTIVE : AUTH_REFRESH_INVALID);
+        }
+        if (refreshDigest != null && !MessageDigest.isEqual(refreshDigest.getBytes(StandardCharsets.US_ASCII),
+                currentDigest.getBytes(StandardCharsets.US_ASCII))) {
+            throw new AuthFailure(AUTH_REFRESH_INVALID);
+        }
+        return expiresAt;
     }
 
     /** {@inheritDoc} Lua 在一次执行中写入新会话和绝对到期时间。 */

@@ -1,13 +1,14 @@
 package com.liveflow.api.auth.controller;
 
+import com.liveflow.api.auth.security.CsrfProtection;
 import com.liveflow.core.auth.AuthFailure;
 import com.liveflow.core.auth.service.AuthService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.servlet.http.HttpServletRequest;
-import jakarta.servlet.http.HttpServletResponse;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
 import org.springframework.http.CacheControl;
 import org.springframework.http.HttpHeaders;
@@ -17,13 +18,12 @@ import org.springframework.http.ResponseCookie;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.oauth2.jwt.Jwt;
-import org.springframework.security.web.csrf.CsrfToken;
-import org.springframework.security.web.csrf.CsrfTokenRepository;
-import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 
@@ -32,33 +32,58 @@ import tools.jackson.databind.JsonNode;
 @RequestMapping("/api/v1/auth")
 public class AuthController {
 
-    private static final String COOKIE = "lf_refresh";
     private final AuthService auth;
-    private final CsrfTokenRepository csrfTokens;
-    private final boolean secureCookie;
+    private final CsrfProtection csrf;
+    private final Counter csrfIssuanceFailed;
 
     /**
      * @param auth 认证业务入口
-     * @param csrfTokens 与过滤链共享的 SPA CSRF 仓储
-     * @param secureCookie 是否限制刷新 Cookie 只在安全传输中发送
+     * @param csrf 签发各用途的 CSRF Cookie
+     * @param meters 应用指标注册表
      */
-    public AuthController(AuthService auth, CsrfTokenRepository csrfTokens,
-            @Value("${liveflow.auth.secure-cookie}") boolean secureCookie) {
+    public AuthController(AuthService auth, CsrfProtection csrf, MeterRegistry meters) {
         this.auth = auth;
-        this.csrfTokens = csrfTokens;
-        this.secureCookie = secureCookie;
+        this.csrf = csrf;
+        csrfIssuanceFailed = meters.counter("liveflow.auth.csrf.issuance.failed");
     }
 
     /**
-     * 解析延迟生成的 CSRF Token，确保响应携带可供 SPA 读取的 Cookie。
-     * @param csrf 当前请求的延迟 CSRF Token
-     * @return 无正文的 204 响应
+     * 按请求用途初始化匿名凭证，或补领已确认会话的 CSRF。
+     * @param query 只允许出现一次的 scope 枚举
+     * @param request 包含对应的预会话或 Refresh Cookie
+     * @param jwt 由安全链校验的可选 Bearer
+     * @return 不缓存的 204 响应及适用的 Set-Cookie
+     * @throws AuthFailure 参数无效或无法确认补领资格
      */
     @GetMapping("/csrf")
-    public ResponseEntity<Void> csrf(CsrfToken csrf) {
-        // 即使响应没有正文，也要取出延迟令牌，首次请求才会生成 CSRF Cookie。
-        csrf.getToken();
-        return ResponseEntity.noContent().cacheControl(CacheControl.noStore()).build();
+    public ResponseEntity<Void> csrf(@RequestParam MultiValueMap<String, String> query,
+            HttpServletRequest request, @AuthenticationPrincipal Jwt jwt) {
+        try {
+            return issueCsrf(query, request, jwt);
+        } catch (AuthFailure failure) {
+            csrfIssuanceFailed.increment();
+            throw failure;
+        }
+    }
+
+    private ResponseEntity<Void> issueCsrf(MultiValueMap<String, String> query, HttpServletRequest request, Jwt jwt) {
+        var scope = query.get("scope");
+        if (query.size() != 1 || scope == null || scope.size() != 1) {
+            throw new AuthFailure(AuthFailure.Code.INVALID_REQUEST);
+        }
+        var response = ResponseEntity.noContent().cacheControl(CacheControl.noStore());
+        switch (scope.getFirst()) {
+            case "pre-auth" -> csrf.anonymousCookies(request).forEach(cookie -> response.header(HttpHeaders.SET_COOKIE, cookie));
+            case "session" -> {
+                // Bearer 已经由安全链验证。无 Bearer 时只读核对本次刷新会用的当前摘要。
+                var session = jwt == null ? auth.currentRefreshSession(CsrfProtection.refreshCookie(request))
+                        : auth.currentAccessSession(Long.parseLong(jwt.getSubject()),
+                                UUID.fromString(jwt.getClaimAsString("sid")));
+                response.header(HttpHeaders.SET_COOKIE, csrf.sessionCookie(session.sessionId(), session.expiresAt()));
+            }
+            default -> throw new AuthFailure(AuthFailure.Code.INVALID_REQUEST);
+        }
+        return response.build();
     }
 
     /**
@@ -84,49 +109,46 @@ public class AuthController {
     /**
      * 登录并在提交成功后交付新凭证。
      * @param input 用户名与原始密码
-     * @param request 用于读取可信来源地址与清除旧 CSRF 状态
-     * @param response 用于清除旧 CSRF Cookie
+     * @param request 用于读取可信来源地址
      * @return Access Token 正文及 Refresh Cookie
      * @throws AuthFailure 输入无效、凭证错误、登录限流或会话无法确认
      * @throws DataAccessException 账号存储不可用
      */
     @PostMapping("/login")
     public ResponseEntity<TokenResponse> login(@RequestBody LoginRequest input,
-            HttpServletRequest request, HttpServletResponse response) {
+            HttpServletRequest request) {
         var credentials = auth.login(input.username(), input.password(), request.getRemoteAddr());
-        // 登录成功后清除旧 CSRF Cookie，客户端在下一次写请求前重新初始化。
-        csrfTokens.saveToken(null, request, response);
-        return tokenResponse(credentials);
+        var response = tokenResponse(credentials);
+        response.header(HttpHeaders.SET_COOKIE, csrf.sessionCookie(credentials.sessionId(), credentials.expiresAt()));
+        csrf.clearAnonymous().forEach(cookie -> response.header(HttpHeaders.SET_COOKIE, cookie));
+        return response.body(tokenBody(credentials));
     }
 
     /**
      * 轮换刷新凭证，保留原登录会话。
-     * @param cookie 浏览器附带的当前刷新凭证
+     * @param request 包含已通过 CSRF 绑定校验的 Refresh Cookie
      * @return Access Token 正文及新的 Refresh Cookie
      * @throws AuthFailure Cookie 缺失、无效、被重放或会话存储不可用
      */
     @PostMapping("/refresh")
-    public ResponseEntity<TokenResponse> refresh(@CookieValue(name = COOKIE, required = false) String cookie) {
-        return tokenResponse(auth.refresh(cookie));
+    public ResponseEntity<TokenResponse> refresh(HttpServletRequest request) {
+        var credentials = auth.refresh(CsrfProtection.refreshCookie(request));
+        return tokenResponse(credentials).body(tokenBody(credentials));
     }
 
     /**
      * 只撤销指定会话。清除 Cookie 之前必须确认服务端已经撤销。
      * @param input 页面所见的会话 ID
-     * @param cookie 浏览器附带的刷新凭证
-     * @param request 当前请求
-     * @param response 用于清除旧 CSRF Cookie
-     * @return 写入过期 Refresh Cookie 的 204 响应
+     * @param request 包含已通过 CSRF 绑定校验的 Refresh Cookie
+     * @return 清除 Refresh 与认证态 CSRF Cookie 的 204 响应
      * @throws AuthFailure 目标不匹配、Cookie 无效或撤销无法确认
      */
     @PostMapping("/logout")
-    public ResponseEntity<Void> logout(@RequestBody LogoutRequest input,
-            @CookieValue(name = COOKIE, required = false) String cookie,
-            HttpServletRequest request, HttpServletResponse response) {
-        // 撤销失败会在这里抛出，保留浏览器当前的 Cookie。
-        auth.logout(input.sessionId(), cookie);
-        csrfTokens.saveToken(null, request, response);
-        return ResponseEntity.noContent().header(HttpHeaders.SET_COOKIE, refreshCookie("", 0)).build();
+    public ResponseEntity<Void> logout(@RequestBody LogoutRequest input, HttpServletRequest request) {
+        // 撤销失败时保留 Cookie，迟到的旧页退出不能清除新登录。
+        auth.logout(input.sessionId(), CsrfProtection.refreshCookie(request));
+        return ResponseEntity.noContent().cacheControl(CacheControl.noStore())
+                .header(HttpHeaders.SET_COOKIE, refreshCookie("", 0), csrf.clearSession()).build();
     }
 
     /**
@@ -142,20 +164,22 @@ public class AuthController {
         return new CurrentUserResponse(Long.toString(account.id()), account.username());
     }
 
-    /**
-     * 为登录和刷新构造统一响应，并将两种凭证写入各自的交付渠道。
-     * @param credentials 业务层已确认的凭证和会话期限
-     * @return 带 no-store、Access Token 正文和刷新 Cookie 的响应
-     */
-    private ResponseEntity<TokenResponse> tokenResponse(AuthService.Credentials credentials) {
+    /** @param credentials 已提交的会话凭证
+     *  @return 附 Refresh Cookie 和缓存控制的响应构建器 */
+    private ResponseEntity.BodyBuilder tokenResponse(AuthService.Credentials credentials) {
+        // 刷新 Cookie 只使用会话的剩余秒数，轮换不延长登录。
+        long remaining = Math.max(0, Duration.between(Instant.now(), credentials.expiresAt()).toSeconds());
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
+                .header(HttpHeaders.SET_COOKIE, refreshCookie(credentials.refreshToken(), remaining));
+    }
+
+    /** @param credentials 已提交的会话凭证
+     *  @return 只包含可由页面读取的短期凭证和会话摘要 */
+    private TokenResponse tokenBody(AuthService.Credentials credentials) {
         Jwt jwt = credentials.access();
         long expiresIn = Duration.between(jwt.getIssuedAt(), jwt.getExpiresAt()).toSeconds();
-        // 刷新 Cookie 只使用会话的剩余时间，轮换不会延长这次登录。
-        long remaining = Math.max(0, Duration.between(Instant.now(), credentials.expiresAt()).toSeconds());
-        var body = new TokenResponse(jwt.getTokenValue(), "Bearer", expiresIn,
+        return new TokenResponse(jwt.getTokenValue(), "Bearer", expiresIn,
                 credentials.sessionId(), credentials.expiresAt());
-        return ResponseEntity.ok().cacheControl(CacheControl.noStore())
-                .header(HttpHeaders.SET_COOKIE, refreshCookie(credentials.refreshToken(), remaining)).body(body);
     }
 
     /**
@@ -165,7 +189,7 @@ public class AuthController {
      * @return 可直接写入 Set-Cookie 的值
      */
     private String refreshCookie(String value, long maxAgeSeconds) {
-        return ResponseCookie.from(COOKIE, value).httpOnly(true).secure(secureCookie)
+        return ResponseCookie.from(CsrfProtection.REFRESH_COOKIE, value).httpOnly(true).secure(csrf.secureCookies())
                 .sameSite("Lax").path("/api/v1/auth").maxAge(maxAgeSeconds).build().toString();
     }
 

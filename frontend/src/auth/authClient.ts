@@ -1,4 +1,4 @@
-import { requestJson } from '../api/requestJson'
+import { requestJson, type CsrfScope } from '../api/requestJson'
 
 const base = '/api/v1/auth'
 
@@ -23,17 +23,19 @@ export interface CurrentUser {
  * @throws ApiRequestError 校验、重复账号、限流、依赖或传输失败。超限时提供等待秒数。
  */
 async function register(username: string, password: string): Promise<CurrentUser> {
-  await authClient.csrf()
-  return requestJson<CurrentUser>(`${base}/register`, { method: 'POST', body: { username, password } })
+  await authClient.csrf('pre-auth')
+  return requestJson<CurrentUser>(`${base}/register`,
+    { method: 'POST', csrfScope: 'pre-auth', body: { username, password } })
 }
 
 export const authClient = {
   /**
    * 取得供后续写请求使用的 CSRF Cookie。
+   * @param scope 请求初始化的凭证用途
    * @returns 初始化完成后的空结果
    * @throws ApiRequestError 初始化失败
    */
-  csrf: () => requestJson<void>(`${base}/csrf`),
+  csrf: (scope: CsrfScope) => requestJson<void>(`${base}/csrf?scope=${scope}`),
   register,
   /**
    * 以原样账号名和密码建立当前浏览器的登录会话。
@@ -43,7 +45,7 @@ export const authClient = {
    * @throws ApiRequestError 凭证错误、限流、依赖或传输失败
    */
   login: (username: string, password: string) =>
-    requestJson<TokenResponse>(`${base}/login`, { method: 'POST', body: { username, password } }),
+    requestJson<TokenResponse>(`${base}/login`, { method: 'POST', csrfScope: 'pre-auth', body: { username, password } }),
   /**
    * 使用浏览器附带的 Refresh Cookie 轮换会话凭证。
    * @returns 新的访问凭证和原会话元数据

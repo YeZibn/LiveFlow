@@ -133,6 +133,40 @@ public class AuthService {
     }
 
     /**
+     * @param cookie 浏览器提交的刷新凭证
+     * @return 仅供计算 CSRF 绑定的候选会话 ID
+     * @throws AuthFailure 凭证缺失或格式无效
+     */
+    public UUID refreshSessionHint(String cookie) {
+        return RefreshToken.parse(cookie).sessionId();
+    }
+
+    /**
+     * @param cookie 用于补领 CSRF 的刷新凭证
+     * @return 只读确认的会话 ID 和截止时间
+     * @throws AuthFailure 无法确认当前刷新摘要或会话
+     */
+    public CsrfSession currentRefreshSession(String cookie) {
+        var refresh = RefreshToken.parse(cookie);
+        return new CsrfSession(refresh.sessionId(),
+                sessions.currentExpiry(refresh.userId(), refresh.sessionId(), refresh.digest()));
+    }
+
+    /**
+     * @param userId 已经通过 Bearer 鉴权的账号 ID
+     * @param sessionId 已经通过 Bearer 鉴权的会话 ID
+     * @return 只读确认的会话 ID 和截止时间
+     * @throws AuthFailure 无法确认当前会话
+     */
+    public CsrfSession currentAccessSession(long userId, UUID sessionId) {
+        return new CsrfSession(sessionId, sessions.currentExpiry(userId, sessionId, null));
+    }
+
+    /** @param sessionId 当前会话 ID
+     *  @param expiresAt 当前会话的绝对截止 */
+    public record CsrfSession(UUID sessionId, Instant expiresAt) {}
+
+    /**
      * 撤销页面明确指向的登录会话。
      * @param target 页面正在操作的会话 ID
      * @param cookie 浏览器当前 Refresh Cookie 值
